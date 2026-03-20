@@ -4837,7 +4837,7 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self.quiet_mode:
                         self._vprint(f"  {cute_msg}")
-            elif self.quiet_mode and not self._has_stream_consumers():
+            elif self.quiet_mode:
                 face = random.choice(KawaiiSpinner.KAWAII_WAITING)
                 emoji = _get_tool_emoji(function_name)
                 preview = _build_tool_preview(function_name, function_args) or function_name
@@ -6552,7 +6552,13 @@ class AIAgent:
                     )
 
                     assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
-                    
+
+                    # Signal streaming display that this was an intermediate turn.
+                    # Content may have been streamed (opening the response box) before
+                    # tool_calls were detected.  The None sentinel tells the CLI to
+                    # close any open box and reset so the final response gets a clean frame.
+                    self._fire_stream_delta(None)
+
                     # If this turn has both content AND tool_calls, capture the content
                     # as a fallback final response. Common pattern: model delivers its
                     # answer and calls memory/skill tools as a side-effect in the same

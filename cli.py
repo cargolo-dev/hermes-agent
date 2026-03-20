@@ -1511,10 +1511,22 @@ class HermesCLI:
         partial lines and emits complete lines via _cprint to work
         reliably with prompt_toolkit's patch_stdout.
 
+        A ``None`` sentinel signals that an intermediate turn (with tool
+        calls) just completed — close any open response/reasoning box
+        and reset so the final response gets a clean frame.
+
         Reasoning/thinking blocks (<REASONING_SCRATCHPAD>, <think>, etc.)
         are suppressed during streaming since they'd display raw XML tags.
         The agent strips them from the final response anyway.
         """
+        if text is None:
+            # Intermediate turn ended — discard any open box and reset
+            self._close_reasoning_box()
+            if self._stream_box_opened:
+                w = shutil.get_terminal_size().columns
+                _cprint(f"{_GOLD}╰{'─' * (w - 2)}╯{_RST}")
+            self._reset_stream_state()
+            return
         if not text:
             return
 
