@@ -1,6 +1,10 @@
 # nix/checks.nix — Build-time verification tests
+#
+# Checks are Linux-only: the full Python venv (via uv2nix) includes
+# transitive deps like onnxruntime that lack compatible wheels on
+# aarch64-darwin. The package and devShell still work on macOS.
 { inputs, ... }: {
-  perSystem = { pkgs, system, ... }:
+  perSystem = { pkgs, system, lib, ... }:
     let
       hermes-agent = inputs.self.packages.${system}.default;
       hermesVenv = pkgs.callPackage ./python.nix {
@@ -9,7 +13,7 @@
 
       configMergeScript = pkgs.callPackage ./configMergeScript.nix { };
     in {
-      checks = {
+      checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
         # Verify binaries exist and are executable
         package-contents = pkgs.runCommand "hermes-package-contents" { } ''
           set -e
