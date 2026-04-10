@@ -1,0 +1,444 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cargolo-asr-mail-history-v3",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "75894d17-3367-4af7-9beb-cc3d97db6a5a",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        576
+      ],
+      "webhookId": "cargolo-asr-mail-history-v3"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "an",
+              "value": "={{ (($json.body?.an || $json.body?.AN || $json.body?.shipment_number || '') + '').toUpperCase().match(/AN-\\d{4,5}/)?.[0] || '' }}",
+              "type": "string"
+            },
+            {
+              "name": "first_sync",
+              "value": "={{ !!($json.body?.first_sync) }}",
+              "type": "boolean"
+            },
+            {
+              "name": "since",
+              "value": "={{ $json.body?.since || '' }}",
+              "type": "string"
+            },
+            {
+              "name": "mailbox",
+              "value": "={{ $json.body?.mailbox || 'asr@cargolo.com' }}",
+              "type": "string"
+            },
+            {
+              "name": "include_attachments",
+              "value": "={{ $json.body?.include_attachments !== false }}",
+              "type": "boolean"
+            },
+            {
+              "name": "include_html",
+              "value": "={{ $json.body?.include_html === true }}",
+              "type": "boolean"
+            },
+            {
+              "name": "search_text",
+              "value": "={{ (($json.body?.an || $json.body?.AN || $json.body?.shipment_number || '') + '').toUpperCase().match(/AN-\\d{4,5}/)?.[0] || '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "bae37954-a5d1-431a-86d0-3bd58bd11d1f",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1280,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.an}}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "0e228257-a11f-4615-9cdf-fb5d9b742118",
+      "name": "AN Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1520,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "output": "raw",
+        "filtersUI": {
+          "values": {
+            "filters": {
+              "custom": "=contains(subject, '{{$node[\"Normalize Input\"].json[\"search_text\"]}}')"
+            }
+          }
+        },
+        "options": {}
+      },
+      "id": "f582ccd7-9f7d-463c-9606-4194438cd088",
+      "name": "Outlook Get Matching Messages",
+      "type": "n8n-nodes-base.microsoftOutlook",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        432
+      ],
+      "webhookId": "7f1bc6a0-d201-41cc-9cd2-f282a94f4cf0",
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "REPLACE_WITH_N8N_CREDENTIAL_ID",
+          "name": "REPLACE_WITH_ASR_MAILBOX_CREDENTIAL"
+        }
+      },
+      "notes": "Use Outlook credentials for asr@cargolo.com. This node should query only messages matching the AN search text."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "first-sync-check",
+              "leftValue": "={{$item(0).$node[\"Normalize Input\"].json.first_sync}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c5401208-0507-4a52-be0f-78461f2381fc",
+      "name": "First Sync?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2032,
+        448
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "since-present-check",
+              "leftValue": "={{$item(0).$node[\"Normalize Input\"].json.since}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "edbbfeac-4d69-44d9-b6b9-96ab5d6211ce",
+      "name": "After Since?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2176,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "message_id",
+              "value": "={{$json.internetMessageId || $json.id || ''}}",
+              "type": "string"
+            },
+            {
+              "name": "graph_id",
+              "value": "={{$json.id || ''}}",
+              "type": "string"
+            },
+            {
+              "name": "conversation_id",
+              "value": "={{$json.conversationId || ''}}",
+              "type": "string"
+            },
+            {
+              "name": "subject",
+              "value": "={{$json.subject || ''}}",
+              "type": "string"
+            },
+            {
+              "name": "from",
+              "value": "={{$json.from?.emailAddress?.address || $json.from || ''}}",
+              "type": "string"
+            },
+            {
+              "name": "from_name",
+              "value": "={{$json.from?.emailAddress?.name || ''}}",
+              "type": "string"
+            },
+            {
+              "name": "to",
+              "value": "={{($json.toRecipients || []).map(r => r.emailAddress?.address).filter(Boolean)}}",
+              "type": "array"
+            },
+            {
+              "name": "cc",
+              "value": "={{($json.ccRecipients || []).map(r => r.emailAddress?.address).filter(Boolean)}}",
+              "type": "array"
+            },
+            {
+              "name": "received_at",
+              "value": "={{$json.receivedDateTime || ''}}",
+              "type": "string"
+            },
+            {
+              "name": "sent_at",
+              "value": "={{$json.sentDateTime || ''}}",
+              "type": "string"
+            },
+            {
+              "name": "body_text",
+              "value": "={{$json.bodyPreview || ''}}",
+              "type": "string"
+            },
+            {
+              "name": "body_html",
+              "value": "={{$item(0).$node['Normalize Input'].json.include_html ? ($json.body?.content || '') : ''}}",
+              "type": "string"
+            },
+            {
+              "name": "body_preview",
+              "value": "={{$json.bodyPreview || ''}}",
+              "type": "string"
+            },
+            {
+              "name": "has_attachments",
+              "value": "={{!!$json.hasAttachments}}",
+              "type": "boolean"
+            },
+            {
+              "name": "attachment_count",
+              "value": "={{Array.isArray($json.attachments) ? $json.attachments.length : 0}}",
+              "type": "number"
+            },
+            {
+              "name": "attachments",
+              "value": "={{($item(0).$node['Normalize Input'].json.include_attachments && Array.isArray($json.attachments)) ? $json.attachments.map(a => ({ filename: a.name || '', mime_type: a.contentType || '', size: a.size || 0, content_base64: a.contentBytes || '' })) : []}}",
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b666746c-1786-4397-b59c-c1a346f33760",
+      "name": "Normalize Message",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2480,
+        496
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $item(0).$node['Normalize Input'].json;\nconst rows = $input.all().map(i => i.json).sort((a,b) => String(a.received_at || '').localeCompare(String(b.received_at || '')));\nreturn [{ json: { an: cfg.an, mailbox: cfg.mailbox, first_sync: cfg.first_sync, since: cfg.since || null, count: rows.length, messages: rows } }];"
+      },
+      "id": "97a4d3e4-35c6-4bcf-beaf-cd2d57b95c62",
+      "name": "Build Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2720,
+        496
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {}
+      },
+      "id": "e9e3bdd9-d7b5-49c3-95b7-3b7f8cf077b0",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2960,
+        496
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ok\":false,\"error\":\"Missing or invalid AN. Expected AN-1234 or AN-12345\"}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "7a038d76-9d84-4b49-bfaa-b61a66840230",
+      "name": "Respond Invalid AN",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1760,
+        704
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "AN Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AN Valid?": {
+      "main": [
+        [
+          {
+            "node": "Outlook Get Matching Messages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Invalid AN",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Outlook Get Matching Messages": {
+      "main": [
+        [
+          {
+            "node": "First Sync?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "First Sync?": {
+      "main": [
+        [
+          {
+            "node": "Normalize Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "After Since?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "After Since?": {
+      "main": [
+        [
+          {
+            "node": "Normalize Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Message": {
+      "main": [
+        [
+          {
+            "node": "Build Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Response": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1f4cae859e42a28ffa94aad41acf6bc14efce5a19bb8912f3561ec1fe0197879"
+  }
+}

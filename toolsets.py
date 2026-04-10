@@ -60,6 +60,8 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Business ops / CARGOLO ASR
+    "cargolo_asr_process_event", "cargolo_asr_mail_history", "cargolo_asr_daily_report",
 ]
 
 
@@ -201,6 +203,11 @@ TOOLSETS = {
         "includes": []
     },
 
+    "business_ops": {
+        "description": "Deterministic business operations helpers for order-folder processing, mail history sync, and reporting",
+        "tools": ["cargolo_asr_process_event", "cargolo_asr_mail_history", "cargolo_asr_daily_report"],
+        "includes": ["file"]
+    },
 
     # Scenario-specific toolsets
     

@@ -1,0 +1,162 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "output": "raw",
+        "filters": {
+          "foldersToInclude": [
+            "AQMkADQ4OWE1ZmQ4LTJmYTYtNDFlMS1hZjQ5LWQyYjJiZGFjM2ZmAGUALgAAA0douR3EL8pJjs2y_nXobgwBALnjKOq5_CBDmOzdduzLxVMAAAIBDAAAAA=="
+          ]
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "id": "adff476c-5e04-4c4c-bb11-1297586dc926",
+      "name": "Microsoft Outlook Trigger",
+      "type": "n8n-nodes-base.microsoftOutlookTrigger",
+      "typeVersion": 1,
+      "position": [
+        592,
+        96
+      ],
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "REPLACE_WITH_N8N_CREDENTIAL_ID",
+          "name": "REPLACE_WITH_ASR_MAILBOX_CREDENTIAL"
+        }
+      },
+      "notes": "Configure credentials for mailbox asr@cargolo.com"
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $json;\nconst subject = src.subject || '';\nconst preview = src.bodyPreview || '';\nconst body = src.body?.content || src.body || '';\nconst joined = `${subject}\\n${preview}\\n${body}`;\nconst match = joined.match(/AN-\\d{4,5}/i);\nconst an = match ? match[0].toUpperCase() : null;\n\nreturn [{\n  json: {\n    mailbox: 'asr@cargolo.com',\n    an,\n    trigger_message_id: src.internetMessageId || null,\n    trigger_graph_id: src.id || null,\n    trigger_conversation_id: src.conversationId || null,\n    source_mail: src\n  },\n  binary: $binary\n}];"
+      },
+      "id": "8430493b-c6b6-40d0-9857-691747c38915",
+      "name": "Extract Mail Metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function getBinaryAttachments(binary) {\n  if (!binary) return [];\n\n  return Object.entries(binary).map(([key, file]) => ({\n    field_name: key,\n    filename: file.fileName || null,\n    mime_type: file.mimeType || null,\n    size: file.fileSize || null,\n    content_base64: file.data || null,\n  }));\n}\n\nfunction htmlToText(html) {\n  if (!html || typeof html !== 'string') return '';\n\n  return html\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<head[\\s\\S]*?<\\/head>/gi, ' ')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<\\/p>/gi, '\\n')\n    .replace(/<\\/div>/gi, '\\n')\n    .replace(/<\\/tr>/gi, '\\n')\n    .replace(/<\\/td>/gi, ' ')\n    .replace(/<li>/gi, '- ')\n    .replace(/<\\/li>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/&lt;/gi, '<')\n    .replace(/&gt;/gi, '>')\n    .replace(/&quot;/gi, '\"')\n    .replace(/&#39;/gi, \"'\")\n    .replace(/\\r/g, '')\n    .replace(/[ \\t]+\\n/g, '\\n')\n    .replace(/\\n[ \\t]+/g, '\\n')\n    .replace(/[ \\t]{2,}/g, ' ')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .trim();\n}\n\nfunction cleanMailText(text) {\n  if (!text || typeof text !== 'string') return '';\n\n  let cleaned = text;\n\n  cleaned = cleaned.replace(\n    /^ACHTUNG:\\sDiese Mail wurde von extern empfangen\\.[\\s\\S]?Hartmann IT-Wiki\\s*/i,\n    ''\n  );\n\n  cleaned = cleaned.replace(\n    /\\n\\sBei Fragen erreichen Sie uns unter[\\s\\S]$/i,\n    ''\n  );\n\n  cleaned = cleaned.replace(\n    /\\n\\swww\\.cargolo\\.com[\\s\\S]$/i,\n    ''\n  );\n\n  cleaned = cleaned.replace(\n    /\\n\\sCARGOLO GmbH[\\s\\S]$/i,\n    ''\n  );\n\n  cleaned = cleaned.replace(/https?:\\/\\/\\S+/gi, (url) => {\n    if (/pstmrk\\.it|shorturl\\.at/i.test(url)) return '';\n    return url;\n  });\n\n  cleaned = cleaned\n    .replace(/[ \\t]+\\n/g, '\\n')\n    .replace(/\\n[ \\t]+/g, '\\n')\n    .replace(/[ \\t]{2,}/g, ' ')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .trim();\n\n  return cleaned;\n}\n\nconst item = $input.first();\nconst seed = item.json;\nconst mail = seed.source_mail || {};\nconst attachments = getBinaryAttachments(item.binary || {});\n\nconst contentType = mail.body?.contentType || null;\nconst bodyContent = mail.body?.content || '';\n\nconst body_html = contentType === 'html' ? bodyContent : '';\nconst raw_text =\n  contentType === 'text'\n    ? bodyContent\n    : htmlToText(bodyContent);\n\nconst body_text = cleanMailText(raw_text);\n\nconst message = {\n  message_id: mail.internetMessageId || null,\n  graph_id: mail.id || null,\n  conversation_id: mail.conversationId || null,\n  subject: mail.subject || '',\n  from: mail.from?.emailAddress?.address || null,\n  from_name: mail.from?.emailAddress?.name || null,\n  to: (mail.toRecipients || []).map(r => r.emailAddress?.address).filter(Boolean),\n  cc: (mail.ccRecipients || []).map(r => r.emailAddress?.address).filter(Boolean),\n  received_at: mail.receivedDateTime || null,\n  sent_at: mail.sentDateTime || null,\n  body_text,\n  body_html,\n  body_preview: mail.bodyPreview || '',\n  has_attachments: attachments.length > 0 || !!mail.hasAttachments,\n  attachment_count: attachments.length,\n  attachments,\n};\n\nconst mailContext = [\n  `Subject: ${message.subject || ''}`,\n  `From: ${message.from_name || ''} <${message.from || ''}>`,\n  `To: ${(message.to || []).join(', ')}`,\n  `Cc: ${(message.cc || []).join(', ')}`,\n  `Received At: ${message.received_at || ''}`,\n  `Sent At: ${message.sent_at || ''}`,\n  `Has Attachments: ${message.has_attachments ? 'true' : 'false'}`,\n  `Attachment Count: ${message.attachment_count || 0}`,\n  `Body Preview: ${message.body_preview || ''}`,\n  `Body Text:\\n${message.body_text || ''}`\n].join('\\n');\n\nconst payload = {\n  event_type: 'asr_email_thread',\n  mailbox: seed.mailbox,\n  an: seed.an,\n  trigger_message_id: seed.trigger_message_id,\n  trigger_graph_id: seed.trigger_graph_id,\n  trigger_conversation_id: seed.trigger_conversation_id,\n  message_count: 1,\n  total_attachment_count: attachments.length,\n  has_any_attachments: attachments.length > 0 || !!mail.hasAttachments,\n  mail_context: mailContext,\n  messages: [message],\n};\n\nreturn [{ json: payload }];"
+      },
+      "id": "52826df1-0343-4ded-bd54-6f2e232257f4",
+      "name": "Build Hermes Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1232,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst payload = $json;\nconst rawBody = JSON.stringify(payload);\nconst secret = $env.HERMES_CARGOLO_ASR_WEBHOOK_SECRET;\nif (!secret) { throw new Error('Missing HERMES_CARGOLO_ASR_WEBHOOK_SECRET in n8n env'); }\nconst signature = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');\nreturn [{ json: { rawBody, signature } }];"
+      },
+      "id": "4ff6d9b3-352c-49c3-b841-dc0ac60835b8",
+      "name": "Compute HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1552,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.HERMES_CARGOLO_ASR_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Hub-Signature-256",
+              "value": "={{$json.signature}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.rawBody }}",
+        "options": {}
+      },
+      "id": "75e8d577-65a1-456c-8c8c-938dfe658ab7",
+      "name": "POST to Hermes ASR Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1840,
+        96
+      ],
+      "notes": "Set HERMES_CARGOLO_ASR_WEBHOOK_URL in n8n env or replace with the production HTTPS webhook URL."
+    }
+  ],
+  "connections": {
+    "Microsoft Outlook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Extract Mail Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Mail Metadata": {
+      "main": [
+        [
+          {
+            "node": "Build Hermes Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Hermes Payload": {
+      "main": [
+        [
+          {
+            "node": "Compute HMAC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute HMAC": {
+      "main": [
+        [
+          {
+            "node": "POST to Hermes ASR Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1f4cae859e42a28ffa94aad41acf6bc14efce5a19bb8912f3561ec1fe0197879"
+  }
+}

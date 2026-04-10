@@ -25,6 +25,7 @@ from gateway.config import (
 )
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
+from plugins.cargolo_ops.models import ProcessingResult
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +148,59 @@ class TestGitHubPRWebhook:
 # ===================================================================
 # Test 2: Skills injected into prompt
 # ===================================================================
+
+class TestDirectProcessor:
+
+    @pytest.mark.asyncio
+    async def test_direct_processor_runs_before_prompt_render(self):
+        routes = {
+            "asr-ingest": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["asr_email_thread"],
+                "direct_processor": "cargolo_asr_email",
+                "direct_processor_options": {"refresh_history": True, "create_task": False},
+                "prompt": (
+                    "Processed order {processor_result.order_id} | "
+                    "initialized={processor_result.initialized} | "
+                    "history={processor_result.history_sync_count}"
+                ),
+            }
+        }
+        adapter = _make_adapter(routes)
+        captured_events: list[MessageEvent] = []
+
+        async def _capture(event: MessageEvent):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+
+        fake_result = ProcessingResult(
+            status="processed",
+            order_id="AN-10874",
+            case_root="/tmp/case",
+            initialized=True,
+            history_sync_count=7,
+            message="ok",
+        )
+
+        with patch("plugins.cargolo_ops.processor.process_email_event", return_value=fake_result) as mock_process:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/asr-ingest",
+                    json={"event_type": "asr_email_thread", "an": "AN-10874"},
+                    headers={"X-GitHub-Delivery": "asr-001"},
+                )
+                assert resp.status == 202
+
+            await asyncio.sleep(0.05)
+
+            mock_process.assert_called_once()
+            assert len(captured_events) == 1
+            assert "Processed order AN-10874" in captured_events[0].text
+            assert "initialized=True" in captured_events[0].text
+            assert "history=7" in captured_events[0].text
+
 
 class TestSkillsInjection:
 

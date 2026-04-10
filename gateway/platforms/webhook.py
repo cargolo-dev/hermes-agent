@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -348,6 +349,17 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        # Optional deterministic direct processor before the agent prompt.
+        # This is ideal for business workflows that need guaranteed storage,
+        # idempotency, and case reconciliation before an LLM summarizes.
+        try:
+            processor_result = self._run_direct_processor(route_config, payload)
+        except Exception as e:
+            logger.exception("[webhook] Direct processor failed for route %s: %s", route_name, e)
+            return web.json_response({"error": f"Direct processor failed: {e}"}, status=500)
+        if processor_result is not None:
+            payload = {**payload, "processor_result": processor_result}
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
@@ -556,6 +568,35 @@ class WebhookAdapter(BasePlatformAdapter):
             else:
                 rendered[key] = value
         return rendered
+
+    def _run_direct_processor(self, route_config: dict, payload: dict) -> dict | None:
+        """Run an optional deterministic processor before creating the agent prompt.
+
+        Route config example:
+          direct_processor: cargolo_asr_email
+          direct_processor_options:
+            refresh_history: true
+            create_task: false
+            storage_root: ~/.hermes/cargolo_asr
+        """
+        processor_name = route_config.get("direct_processor")
+        if not processor_name:
+            return None
+
+        options = route_config.get("direct_processor_options", {}) or {}
+        if processor_name == "cargolo_asr_email":
+            from plugins.cargolo_ops.processor import process_email_event
+
+            storage_root = options.get("storage_root")
+            result = process_email_event(
+                payload,
+                storage_root=Path(storage_root).expanduser() if storage_root else None,
+                create_task=bool(options.get("create_task", False)),
+                refresh_history=bool(options.get("refresh_history", True)),
+            )
+            return result.model_dump(mode="json")
+
+        raise ValueError(f"Unknown direct processor: {processor_name}")
 
     # ------------------------------------------------------------------
     # Response delivery
