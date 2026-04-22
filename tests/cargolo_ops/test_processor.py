@@ -237,6 +237,13 @@ def test_build_transport_internal_note_is_human_readable():
         pending_summary={"write_now": 1, "review": 2, "not_yet_due": 0, "not_yet_knowable": 0},
         applied_summary={"applied": 1, "failed": 0, "skipped": 0},
         applied_targets=["shipment.dates.latest_delivery_date"],
+        applied_action_entries=[{
+            "action": {
+                "target": "shipment.dates.latest_delivery_date",
+                "suggested_value": "2026-05-20",
+                "reason": "ETA wurde aus der aktuellen Carrier-Information belastbar abgeleitet",
+            }
+        }],
         history_sync_count=3,
         history_sync_status="ok",
         history_sync_error=None,
@@ -248,6 +255,9 @@ def test_build_transport_internal_note_is_human_readable():
     assert "Offen sind aktuell" in note
     assert "TMS-Rückmeldung:" in note
     assert "Übernommen:" in note
+    assert "Konkret angepasst:" in note
+    assert "shipment.dates.latest_delivery_date → 2026-05-20" in note
+    assert "ETA wurde aus der aktuellen Carrier-Information belastbar abgeleitet" in note
     assert "Nächster Schritt aus operativer Sicht:" in note
 
     assert "Einschätzung:" in note

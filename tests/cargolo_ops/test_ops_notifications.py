@@ -52,6 +52,8 @@ def test_build_manual_ops_notification_body_returns_html_payload(tmp_path):
     assert body["delivered_at"] == 123.0
     assert body["message_format"] == "html"
     assert "<html><body" in body["message"]
+    assert "background:#0b1220" in body["message"]
+    assert "color:#f8fafc" in body["message"]
     assert body["payload"]["run_type"] == "process_event"
     assert body["payload"]["processor_result"]["order_id"] == "AN-12001"
 

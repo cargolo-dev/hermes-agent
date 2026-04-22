@@ -1177,6 +1177,7 @@ def _build_transport_internal_note(
     pending_summary: dict[str, Any] | None,
     applied_summary: dict[str, Any] | None,
     applied_targets: list[str] | None,
+    applied_action_entries: list[dict[str, Any]] | None = None,
     history_sync_count: int,
     history_sync_status: str | None,
     history_sync_error: str | None,
@@ -1192,6 +1193,7 @@ def _build_transport_internal_note(
     latest_subject_text = re.sub(r"\s+", " ", str(latest_subject or "").strip())[:120]
     analysis_text = re.sub(r"\s+", " ", str(analysis_summary or "").strip())[:180]
     applied_targets_list = [str(item).strip() for item in (applied_targets or []) if str(item).strip()]
+    applied_action_rows = [row for row in (applied_action_entries or []) if isinstance(row, dict)]
 
     route_text = f"{origin} → {destination}" if origin != "-" or destination != "-" else "-"
 
@@ -1245,6 +1247,21 @@ def _build_transport_internal_note(
         if len(applied_targets_list) > 4:
             pretty_targets += f" und {len(applied_targets_list) - 4} weitere"
         lines.append(f"Übernommen: {pretty_targets}.")
+
+    detailed_changes: list[str] = []
+    for row in applied_action_rows[:3]:
+        action = row.get("action") if isinstance(row.get("action"), dict) else {}
+        target = str(action.get("target") or row.get("target") or "").strip()
+        suggested_value = action.get("suggested_value")
+        reason = re.sub(r"\s+", " ", str(action.get("reason") or row.get("reason") or "").strip())
+        if not target:
+            continue
+        detail = f"{target} → {suggested_value}"
+        if reason:
+            detail += f" ({reason})"
+        detailed_changes.append(detail)
+    if detailed_changes:
+        lines.append("Konkret angepasst: " + "; ".join(detailed_changes) + ".")
 
     lines.append(f"Nächster Schritt aus operativer Sicht: {next_step}.")
     if analysis_text:
@@ -1879,6 +1896,7 @@ def bootstrap_case(
                 for row in (applied_updates_payload.get("applied_actions") or [])
                 if str((row.get("action") or {}).get("target") or "").strip()
             ],
+            applied_action_entries=applied_updates_payload.get("applied_actions") or [],
             history_sync_count=history_count,
             history_sync_status="failed" if history_sync_error else ("ok" if refresh_history else "skipped"),
             history_sync_error=history_sync_error,
@@ -2434,6 +2452,7 @@ def process_email_event(
                 for row in (applied_updates_payload.get("applied_actions") or [])
                 if str((row.get("action") or {}).get("target") or "").strip()
             ],
+            applied_action_entries=applied_updates_payload.get("applied_actions") or [],
             history_sync_count=history_count,
             history_sync_status="failed" if history_sync_error else ("ok" if refresh_history else "skipped"),
             history_sync_error=history_sync_error,

@@ -394,14 +394,14 @@ def _html_badge(text: Any, tone: str = "neutral") -> str:
 
 def _html_section(title: str, body: str, subtitle: str | None = None) -> str:
     subtitle_html = (
-        f"<div style='color:#64748b;font-size:13px;margin-top:4px;'>{_html_escape(subtitle)}</div>"
+        f"<div style='color:#cbd5e1;font-size:13px;margin-top:4px;'>{_html_escape(subtitle)}</div>"
         if subtitle
         else ""
     )
     return (
-        "<section style='background:#ffffff;border:1px solid #e5e7eb;border-radius:16px;"
-        "padding:20px;margin:18px 0;box-shadow:0 1px 2px rgba(15,23,42,0.05);'>"
-        f"<div style='font-size:20px;font-weight:800;color:#0f172a;margin-bottom:14px;'>{_html_escape(title)}</div>"
+        "<section style='background:#111827;border:1px solid #334155;border-radius:16px;"
+        "padding:20px;margin:18px 0;box-shadow:0 1px 2px rgba(15,23,42,0.35);color:#f8fafc;'>"
+        f"<div style='font-size:20px;font-weight:800;color:#f8fafc;margin-bottom:14px;'>{_html_escape(title)}</div>"
         f"{subtitle_html}{body}</section>"
     )
 
@@ -410,9 +410,9 @@ def _html_fact_grid(items: list[tuple[str, Any]]) -> str:
     cards = []
     for label, value in items:
         cards.append(
-            "<div style='background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px;padding:14px;'>"
-            f"<div style='font-size:12px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;color:#64748b;margin-bottom:6px;'>{_html_escape(label)}</div>"
-            f"<div style='font-size:16px;font-weight:700;color:#0f172a;line-height:1.35;'>{_format_html_value(value)}</div>"
+            "<div style='background:#0f172a;border:1px solid #334155;border-radius:14px;padding:14px;'>"
+            f"<div style='font-size:12px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;color:#94a3b8;margin-bottom:6px;'>{_html_escape(label)}</div>"
+            f"<div style='font-size:16px;font-weight:700;color:#f8fafc;line-height:1.35;'>{_format_html_value(value)}</div>"
             "</div>"
         )
     return (
@@ -425,19 +425,19 @@ def _html_fact_grid(items: list[tuple[str, Any]]) -> str:
 def _html_list_block(title: str, items: list[Any], *, tone: str = "neutral", empty: str = "Keine") -> str:
     clean_items = [item for item in items if item not in (None, "", [], {})]
     if not clean_items:
-        content = f"<div style='color:#64748b;'>{_html_escape(empty)}</div>"
+        content = f"<div style='color:#cbd5e1;'>{_html_escape(empty)}</div>"
     else:
         lis = []
         for item in clean_items:
             lis.append(
-                "<li style='margin:0 0 10px 0;padding-left:2px;color:#0f172a;line-height:1.5;'>"
+                "<li style='margin:0 0 10px 0;padding-left:2px;color:#f8fafc;line-height:1.5;'>"
                 f"{_format_html_value(item)}</li>"
             )
         content = f"<ul style='margin:10px 0 0 18px;padding:0;'>{''.join(lis)}</ul>"
     accent = {"neutral": "#cbd5e1", "good": "#86efac", "warn": "#fcd34d", "danger": "#fca5a5"}.get(tone, "#cbd5e1")
     return (
-        f"<div style='background:#ffffff;border:1px solid #e5e7eb;border-left:5px solid {accent};border-radius:12px;padding:14px 16px;'>"
-        f"<div style='font-size:14px;font-weight:800;color:#0f172a;'>{_html_escape(title)}</div>{content}</div>"
+        f"<div style='background:#0f172a;border:1px solid #334155;border-left:5px solid {accent};border-radius:12px;padding:14px 16px;'>"
+        f"<div style='font-size:14px;font-weight:800;color:#f8fafc;'>{_html_escape(title)}</div>{content}</div>"
     )
 
 
@@ -508,8 +508,8 @@ def _build_overview_html(run_type: str, payload: dict[str, Any], case_report: di
     review_links = _build_review_links(str(order_id or "").strip(), "next_step") if str(top_action or "").strip() else []
     if review_links:
         review_html = (
-            "<div style='margin-top:14px;padding:14px 16px;background:#ffffff;border:1px solid #dbeafe;border-radius:12px;'>"
-            "<div style='font-size:14px;font-weight:800;color:#1e3a8a;margin-bottom:8px;'>Review zum vorgeschlagenen nächsten Schritt</div>"
+            "<div style='margin-top:14px;padding:14px 16px;background:#0f172a;border:1px solid #60a5fa;border-radius:12px;'>"
+            "<div style='font-size:14px;font-weight:800;color:#dbeafe;margin-bottom:8px;'>Review zum vorgeschlagenen nächsten Schritt</div>"
             f"<div style='display:flex;gap:14px;flex-wrap:wrap;'>{''.join(review_links)}</div>"
             "</div>"
         )
@@ -536,8 +536,8 @@ def _render_case_report_sections(sections: dict[str, Any]) -> str:
             for block_name, block_value in section_body.items():
                 subtitle = block_name.replace("_", " ").strip().title()
                 body_parts.append(
-                    "<div style='margin:14px 0 0 0;padding-top:14px;border-top:1px solid #eef2f7;'>"
-                    f"<div style='font-size:15px;font-weight:800;color:#0f172a;margin-bottom:8px;'>{_html_escape(subtitle)}</div>"
+                    "<div style='margin:14px 0 0 0;padding-top:14px;border-top:1px solid #334155;'>"
+                    f"<div style='font-size:15px;font-weight:800;color:#f8fafc;margin-bottom:8px;'>{_html_escape(subtitle)}</div>"
                     f"{_format_html_value(block_value)}</div>"
                 )
         else:
@@ -568,10 +568,10 @@ def _build_message(run_type: str, payload: dict[str, Any]) -> str:
     analysis_brief = _load_analysis_brief(result.get("analysis_brief_path"))
 
     html_parts = [
-        "<html><body style='margin:0;padding:0;background:#f3f6fb;font-family:Segoe UI,Arial,sans-serif;color:#0f172a;'>",
+        "<html><body style='margin:0;padding:0;background:#0b1220;font-family:Segoe UI,Arial,sans-serif;color:#f8fafc;'>",
         "<div style='max-width:1180px;margin:0 auto;padding:24px 18px 40px 18px;'>",
         _build_overview_html(run_type, payload, case_report, analysis_brief),
-        _html_section("Webhook-Kurzfazit", f"<pre style='margin:0;white-space:pre-wrap;font-family:Consolas,Menlo,monospace;font-size:13px;color:#0f172a;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px;'>{_html_escape(summary_text)}</pre>"),
+        _html_section("Webhook-Kurzfazit", f"<pre style='margin:0;white-space:pre-wrap;font-family:Consolas,Menlo,monospace;font-size:13px;color:#f8fafc;background:#0f172a;border:1px solid #334155;border-radius:12px;padding:14px;'>{_html_escape(summary_text)}</pre>"),
         "</div></body></html>",
     ]
     return "".join(html_parts)
