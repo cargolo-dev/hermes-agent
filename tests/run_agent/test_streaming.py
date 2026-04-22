@@ -98,6 +98,39 @@ class TestStreamingAccumulator:
         assert response.usage is not None
         assert response.usage.completion_tokens == 3
 
+    def test_codex_cli_uses_non_streaming_fallback(self):
+        """codex-cli delegates through the one-shot client instead of chat stream iteration."""
+        from run_agent import AIAgent
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="OK", tool_calls=[]),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="cli://codex",
+            model="gpt-5.4",
+            provider="codex-cli",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+
+        with patch.object(agent, "_interruptible_api_call", return_value=response) as mock_nonstream, \
+             patch.object(agent, "_create_request_openai_client") as mock_stream_client:
+            got = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert got is response
+        mock_nonstream.assert_called_once_with({"messages": []})
+        mock_stream_client.assert_not_called()
+
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
     def test_tool_call_response(self, mock_close, mock_create):

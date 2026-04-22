@@ -71,6 +71,7 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_CODEX_CLI_BASE_URL = "cli://codex"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -149,6 +150,22 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "codex-cli": ProviderConfig(
+        id="codex-cli",
+        name="OpenAI Codex CLI",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CODEX_CLI_BASE_URL,
+        extra={
+            "command_env_var": "HERMES_CODEX_CLI_COMMAND",
+            "args_env_var": "HERMES_CODEX_CLI_ARGS",
+            "default_command": "codex",
+            "default_args": [],
+            "status_label": "Codex CLI",
+            "api_mode": "chat_completions",
+            "requires_auth_file": str(Path.home() / ".codex" / "auth.json"),
+            "auth_env_vars": ["OPENAI_API_KEY"],
+        },
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -2572,33 +2589,83 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _codex_cli_session_status(command: str, args: list[str] | None = None) -> Dict[str, Any]:
+    """Best-effort status check against the real Codex CLI login state."""
+    resolved_command = shutil.which(command) if command else None
+    if not resolved_command:
+        return {"available": False, "logged_in": False, "source": None}
+
+    try:
+        proc = subprocess.run(
+            [resolved_command, *(args or []), "login", "status"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=8,
+            check=False,
+            env=os.environ.copy(),
+        )
+    except Exception:
+        return {"available": True, "logged_in": False, "source": None}
+
+    output = (proc.stdout or "").strip().lower()
+    logged_in = proc.returncode == 0 and "not logged in" not in output and "error checking login status" not in output
+    return {
+        "available": True,
+        "logged_in": logged_in,
+        "source": "codex-login-status" if logged_in else None,
+        "output": proc.stdout or "",
+    }
+
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
+    extra = pconfig.extra or {}
     command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        os.getenv(str(extra.get("command_env_var") or ""), "").strip()
+        or os.getenv(str(extra.get("fallback_command_env_var") or ""), "").strip()
+        or str(extra.get("default_command") or "").strip()
+        or os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
         or "copilot"
     )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    raw_args = os.getenv(str(extra.get("args_env_var") or ""), "").strip()
+    default_args = list(extra.get("default_args") or []) if "default_args" in extra else ["--acp", "--stdio"]
+    args = shlex.split(raw_args) if raw_args else default_args
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
     resolved_command = shutil.which(command) if command else None
+    auth_env_vars = [str(v) for v in (extra.get("auth_env_vars") or []) if str(v).strip()]
+    auth_file = str(extra.get("requires_auth_file") or "").strip()
+    auth_available = any(os.getenv(name, "").strip() for name in auth_env_vars)
+    auth_source = "env" if auth_available else ""
+    if auth_file and Path(auth_file).expanduser().exists() and provider_id != "codex-cli":
+        auth_available = True
+        auth_source = auth_source or "auth_file"
+    if provider_id == "codex-cli":
+        cli_status = _codex_cli_session_status(resolved_command or command, args)
+        if cli_status.get("logged_in"):
+            auth_available = True
+            auth_source = auth_source or str(cli_status.get("source") or "codex-cli")
+
     return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "configured": bool(resolved_command or base_url.startswith("acp+tcp://") or base_url.startswith("cli://")),
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "auth_available": auth_available,
+        "auth_source": auth_source,
+        "logged_in": bool((resolved_command or base_url.startswith("acp+tcp://") or base_url.startswith("cli://")) and (auth_available or provider_id == "copilot-acp")),
     }
 
 
@@ -2613,7 +2680,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "google-gemini-cli":
         return get_gemini_oauth_auth_status()
-    if target == "copilot-acp":
+    if target == "copilot-acp" or target == "codex-cli":
         return get_external_process_provider_status(target)
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
@@ -2681,29 +2748,48 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
+    extra = pconfig.extra or {}
     command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        os.getenv(str(extra.get("command_env_var") or ""), "").strip()
+        or os.getenv(str(extra.get("fallback_command_env_var") or ""), "").strip()
+        or str(extra.get("default_command") or "").strip()
+        or os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
         or "copilot"
     )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    raw_args = os.getenv(str(extra.get("args_env_var") or ""), "").strip()
+    default_args = list(extra.get("default_args") or []) if "default_args" in extra else ["--acp", "--stdio"]
+    args = shlex.split(raw_args) if raw_args else default_args
     resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
+    if not resolved_command and not base_url.startswith("acp+tcp://") and not base_url.startswith("cli://"):
+        status_label = str(extra.get("status_label") or pconfig.name or provider_id)
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find the {status_label} command '{command}'. Install the CLI or set the configured command environment variable.",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code=f"missing_{provider_id.replace('-', '_')}_cli",
         )
+
+    api_key = provider_id if provider_id == "copilot-acp" else "***"
+    source = "process"
+    auth_env_vars = [str(v) for v in (extra.get("auth_env_vars") or []) if str(v).strip()]
+    for env_name in auth_env_vars:
+        env_value = os.getenv(env_name, "").strip()
+        if env_value:
+            api_key = env_value
+            source = f"env:{env_name}"
+            break
+    if provider_id == "codex-cli":
+        cli_status = _codex_cli_session_status(resolved_command or command, args)
+        if cli_status.get("logged_in"):
+            source = f"process:{cli_status.get('source') or 'codex-cli'}"
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": api_key,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,
-        "source": "process",
+        "source": source,
     }
 
 

@@ -1162,6 +1162,9 @@ class AIAgent:
                 if self.provider == "copilot-acp":
                     client_kwargs["command"] = self.acp_command
                     client_kwargs["args"] = self.acp_args
+                elif self.provider == "codex-cli":
+                    client_kwargs["command"] = self.acp_command
+                    client_kwargs["args"] = self.acp_args
                 effective_base = base_url
                 if base_url_host_matches(effective_base, "openrouter.ai"):
                     client_kwargs["default_headers"] = {
@@ -4429,6 +4432,17 @@ class AIAgent:
                 self._client_log_context(),
             )
             return client
+        if self.provider == "codex-cli" or str(client_kwargs.get("base_url", "")).startswith("cli://codex"):
+            from agent.codex_cli_client import CodexCLIClient
+
+            client = CodexCLIClient(**client_kwargs)
+            logger.info(
+                "Codex CLI client created (%s, shared=%s) %s",
+                reason,
+                shared,
+                self._client_log_context(),
+            )
+            return client
         if self.provider == "google-gemini-cli" or str(client_kwargs.get("base_url", "")).startswith("cloudcode-pa://"):
             from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
 
@@ -5418,6 +5432,16 @@ class AIAgent:
                 return self._interruptible_api_call(api_kwargs)
             finally:
                 self._codex_on_first_delta = None
+
+        if self.provider == "codex-cli" or str(getattr(self, "base_url", "") or "").startswith("cli://codex"):
+            # The subprocess-backed Codex CLI adapter currently exposes a
+            # one-shot chat.completions facade, not an iterable streaming
+            # interface.  Route through the non-streaming path so delegated
+            # codex-cli children still work when the parent enabled live
+            # progress callbacks (which would otherwise force the streaming
+            # codepath and crash with TypeError: SimpleNamespace is not
+            # iterable).
+            return self._interruptible_api_call(api_kwargs)
 
         # Bedrock Converse uses boto3's converse_stream() with real-time delta
         # callbacks — same UX as Anthropic and chat_completions streaming.

@@ -31,17 +31,20 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from aiohttp import web
+    from aiohttp import ClientSession, web
 
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
+    ClientSession = None  # type: ignore[assignment]
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
@@ -193,43 +196,45 @@ class WebhookAdapter(BasePlatformAdapter):
         to the ``log`` deliver type.  TTL cleanup happens on POST.
         """
         delivery = self._delivery_info.get(chat_id, {})
+        deliveries = delivery.get("deliveries") or [delivery]
+        results: list[SendResult] = []
+        errors: list[str] = []
+
+        for entry in deliveries:
+            merged_delivery = {**delivery, **entry}
+            result = await self._deliver_one(content, merged_delivery)
+            results.append(result)
+            if not result.success:
+                errors.append(result.error or f"delivery_failed:{merged_delivery.get('deliver', 'unknown')}")
+
+        if errors:
+            return SendResult(success=False, error="; ".join(errors))
+        return SendResult(success=True)
+
+    async def _deliver_one(self, content: str, delivery: dict) -> SendResult:
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
-            logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
+            logger.info("[webhook] Response for delivery=%s: %s", delivery.get("delivery_id", "?"), content[:200])
             return SendResult(success=True)
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
-        # Cross-platform delivery — any platform with a gateway adapter
+        if deliver_type == "webhook_forward":
+            return await self._deliver_webhook_forward(content, delivery)
+
         if self.gateway_runner and deliver_type in (
             "telegram",
             "discord",
             "slack",
             "signal",
             "sms",
-            "whatsapp",
-            "matrix",
-            "mattermost",
-            "homeassistant",
-            "email",
-            "dingtalk",
-            "feishu",
-            "wecom",
-            "wecom_callback",
-            "weixin",
-            "bluebubbles",
-            "qqbot",
         ):
-            return await self._deliver_cross_platform(
-                deliver_type, content, delivery
-            )
+            return await self._deliver_cross_platform(deliver_type, content, delivery)
 
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
-        return SendResult(
-            success=False, error=f"Unknown deliver type: {deliver_type}"
-        )
+        return SendResult(success=False, error=f"Unknown deliver type: {deliver_type}")
 
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL.
@@ -290,7 +295,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 ", ".join(self._dynamic_routes.keys()) or "(none)",
             )
         except Exception as e:
-            logger.error("[webhook] Failed to reload dynamic routes: %s", e)
+            logger.warning("[webhook] Failed to reload dynamic routes: %s", e)
 
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
@@ -375,6 +380,17 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"status": "ignored", "event": event_type}
             )
+
+        # Optional deterministic direct processor before the agent prompt.
+        # This is ideal for business workflows that need guaranteed storage,
+        # idempotency, and case reconciliation before an LLM summarizes.
+        try:
+            processor_result = self._run_direct_processor(route_config, payload)
+        except Exception as e:
+            logger.exception("[webhook] Direct processor failed for route %s: %s", route_name, e)
+            return web.json_response({"error": f"Direct processor failed: {e}"}, status=500)
+        if processor_result is not None:
+            payload = {**payload, "processor_result": processor_result}
 
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
@@ -501,12 +517,28 @@ class WebhookAdapter(BasePlatformAdapter):
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
         # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
-        deliver_config = {
+        primary_delivery = {
             "deliver": route_config.get("deliver", "log"),
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
+        }
+        additional_deliveries = []
+        for item in (route_config.get("deliver_additional") or []):
+            if not isinstance(item, dict):
+                continue
+            additional_deliveries.append({
+                "deliver": item.get("deliver", "log"),
+                "deliver_extra": self._render_delivery_extra(
+                    item.get("deliver_extra", {}), payload
+                ),
+            })
+        deliver_config = {
+            **primary_delivery,
+            "deliveries": [primary_delivery, *additional_deliveries],
             "payload": payload,
+            "route_name": route_name,
+            "delivery_id": delivery_id,
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
@@ -643,6 +675,36 @@ class WebhookAdapter(BasePlatformAdapter):
                 rendered[key] = value
         return rendered
 
+    def _run_direct_processor(self, route_config: dict, payload: dict) -> dict | None:
+        """Run an optional deterministic processor before creating the agent prompt.
+
+        Route config example:
+          direct_processor: cargolo_asr_email
+          direct_processor_options:
+            refresh_history: true
+            create_task: false
+            storage_root: ~/.hermes/cargolo_asr
+        """
+        processor_name = route_config.get("direct_processor")
+        if not processor_name:
+            return None
+
+        options = route_config.get("direct_processor_options", {}) or {}
+        if processor_name == "cargolo_asr_email":
+            from plugins.cargolo_ops.processor import process_email_event
+
+            storage_root = options.get("storage_root")
+            result = process_email_event(
+                payload,
+                storage_root=Path(storage_root).expanduser() if storage_root else None,
+                create_task=bool(options.get("create_task", False)),
+                refresh_history=bool(options.get("refresh_history", True)),
+                enable_subagent_analysis=bool(options.get("enable_subagent_analysis", False)),
+            )
+            return result.model_dump(mode="json")
+
+        raise ValueError(f"Unknown direct processor: {processor_name}")
+
     # ------------------------------------------------------------------
     # Response delivery
     # ------------------------------------------------------------------
@@ -728,6 +790,41 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))
+
+    async def _deliver_webhook_forward(
+        self, content: str, delivery: dict
+    ) -> SendResult:
+        """POST the final agent result plus structured webhook context to another webhook."""
+        extra = delivery.get("deliver_extra", {})
+        url = str(extra.get("url") or "").strip()
+        if not url:
+            return SendResult(success=False, error="Missing url for webhook_forward delivery")
+        if ClientSession is None:
+            return SendResult(success=False, error="aiohttp ClientSession unavailable")
+
+        method = str(extra.get("method") or "POST").strip().upper() or "POST"
+        headers = dict(extra.get("headers") or {})
+        headers.setdefault("Content-Type", "application/json")
+        body = {
+            "route": delivery.get("route_name"),
+            "delivery_id": delivery.get("delivery_id"),
+            "delivered_at": time.time(),
+            "message": content,
+            "payload": delivery.get("payload") or {},
+        }
+
+        try:
+            async with ClientSession() as session:
+                request_fn = getattr(session, method.lower(), None)
+                if request_fn is None:
+                    return SendResult(success=False, error=f"Unsupported webhook_forward method: {method}")
+                async with request_fn(url, json=body, headers=headers, timeout=30) as response:
+                    if 200 <= response.status < 300:
+                        return SendResult(success=True)
+                    response_text = await response.text()
+                    return SendResult(success=False, error=f"webhook_forward HTTP {response.status}: {response_text[:500]}")
+        except Exception as exc:
+            return SendResult(success=False, error=f"webhook_forward failed: {exc}")
 
     async def _deliver_cross_platform(
         self, platform_name: str, content: str, delivery: dict
