@@ -391,6 +391,22 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response({"error": f"Direct processor failed: {e}"}, status=500)
         if processor_result is not None:
             payload = {**payload, "processor_result": processor_result}
+            if bool(processor_result.get("suppress_delivery", False)):
+                logger.info(
+                    "[webhook] Suppressing downstream delivery for route %s due to processor_result.status=%s",
+                    route_name,
+                    processor_result.get("status"),
+                )
+                return web.json_response(
+                    {
+                        "status": "accepted",
+                        "route": route_name,
+                        "event": event_type,
+                        "suppressed": True,
+                        "processor_status": processor_result.get("status"),
+                    },
+                    status=202,
+                )
 
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
@@ -703,6 +719,15 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return result.model_dump(mode="json")
 
+        if processor_name == "cargolo_asr_review":
+            from plugins.cargolo_ops.review import process_review
+
+            storage_root = options.get("storage_root")
+            return process_review(
+                payload,
+                storage_root=Path(storage_root).expanduser() if storage_root else None,
+            )
+
         raise ValueError(f"Unknown direct processor: {processor_name}")
 
     # ------------------------------------------------------------------
@@ -805,13 +830,31 @@ class WebhookAdapter(BasePlatformAdapter):
         method = str(extra.get("method") or "POST").strip().upper() or "POST"
         headers = dict(extra.get("headers") or {})
         headers.setdefault("Content-Type", "application/json")
+        payload = delivery.get("payload") or {}
+        route_name = str(delivery.get("route_name") or "")
+        delivered_at = time.time()
         body = {
-            "route": delivery.get("route_name"),
+            "route": route_name,
             "delivery_id": delivery.get("delivery_id"),
-            "delivered_at": time.time(),
+            "delivered_at": delivered_at,
             "message": content,
-            "payload": delivery.get("payload") or {},
+            "payload": payload,
         }
+        if route_name == "cargolo-asr-ingest" and isinstance(payload.get("processor_result"), dict):
+            try:
+                from plugins.cargolo_ops.ops_notifications import build_manual_ops_notification_body
+                body = build_manual_ops_notification_body(
+                    run_type="process_event",
+                    payload={
+                        "order_id": payload.get("processor_result", {}).get("order_id") or payload.get("order_id"),
+                        "processor_result": payload.get("processor_result") or {},
+                    },
+                    route_name=route_name,
+                    delivery_id=str(delivery.get("delivery_id") or ""),
+                    delivered_at=delivered_at,
+                )
+            except Exception as exc:
+                logger.warning("[webhook] ASR teams/html render fallback for route %s failed: %s", route_name, exc)
 
         try:
             async with ClientSession() as session:
