@@ -4,6 +4,7 @@ import html as _html
 import json
 import logging
 import os
+import re
 import time
 from html import escape as _html_escape
 from pathlib import Path
@@ -140,6 +141,40 @@ def _truncate_sentence(text: Any, limit: int = 320) -> str:
         return value
     cut = value[:limit].rsplit(" ", 1)[0].rstrip(" ,;:.-")
     return cut + " …"
+
+
+def _compact_complete_sentences(text: Any, *, limit: int = 430, max_sentences: int = 4) -> str:
+    """Return a bounded summary without cutting operational text mid-sentence."""
+    value = " ".join(str(text or "").strip().split())
+    if not value or len(value) <= limit:
+        return value
+
+    sentence_re = re.compile(r".+?(?:[.!?](?=\s|$)|$)")
+    raw_sentences = [match.group(0).strip() for match in sentence_re.finditer(value) if match.group(0).strip()]
+    sentences: list[str] = []
+    for sentence in raw_sentences:
+        if sentences and re.search(r"\d{1,2}\.\d{1,2}\.$", sentences[-1]):
+            sentences[-1] = f"{sentences[-1]} {sentence}".strip()
+        else:
+            sentences.append(sentence)
+    selected: list[str] = []
+    for sentence in sentences:
+        candidate = " ".join([*selected, sentence]).strip()
+        if len(candidate) > limit or len(selected) >= max_sentences:
+            break
+        selected.append(sentence)
+
+    if selected:
+        return " ".join(selected)
+
+    words = value.split()
+    selected_words: list[str] = []
+    for word in words:
+        candidate = " ".join([*selected_words, word])
+        if len(candidate) > limit:
+            break
+        selected_words.append(word)
+    return " ".join(selected_words).rstrip(" ,;:-")
 
 
 def _run_label(run_type: str) -> str:
@@ -291,7 +326,7 @@ def _build_summary_message(run_type: str, payload: dict[str, Any]) -> str:
     internal_actions = analysis_brief.get("internal_actions") if isinstance(analysis_brief.get("internal_actions"), list) else []
 
     recommendation = _pick_next_step(analysis_brief, fallback=ops_summary or message_text or latest_subject or "Weiter beobachten")
-    recommendation = _truncate(recommendation or "Weiter beobachten", 140)
+    recommendation = _compact_complete_sentences(recommendation or "Weiter beobachten", limit=220, max_sentences=2)
 
     attention = ""
     for risk in risk_flags:
@@ -335,7 +370,7 @@ def _build_summary_message(run_type: str, payload: dict[str, Any]) -> str:
     else:
         tms_token = "TMS unverändert"
 
-    situation = _truncate(ops_summary or message_text or latest_subject or recommendation, 160)
+    situation = _compact_complete_sentences(ops_summary or message_text or latest_subject or recommendation, limit=430, max_sentences=4)
     tms_line = f"TMS-Aktion: {tms_token} | Review {review_count} | Offen {pending_total} | {history_token}"
     next_step_line = f"Nächster Schritt: {recommendation}"
     if attention:
@@ -490,11 +525,11 @@ def _build_overview_html(run_type: str, payload: dict[str, Any], case_report: di
 
     latest_subjects = _extract_section_value(case_report, "mail_history", "latest_subjects") or []
     latest_subject = str(latest_subjects[-1] if latest_subjects else result.get("latest_subject") or "").strip()
-    ops_summary = _truncate(
+    ops_summary = _compact_complete_sentences(
         analysis_brief.get("ops_summary") or result.get("analysis_summary") or result.get("message") or latest_subject or "-",
-        220,
+        limit=430,
+        max_sentences=4,
     )
-    top_risks = [_risk_short_text(risk) for risk in _pick_top_risks(risk_flags, limit=2)]
     applied_details = [str(item).strip() for item in (result.get("applied_action_details") or []) if str(item).strip()]
     failed_details = [str(item).strip() for item in (result.get("failed_action_details") or []) if str(item).strip()]
     applied_targets = applied_details or [str(item).strip() for item in (result.get("applied_action_targets") or []) if str(item).strip()]
@@ -549,10 +584,9 @@ def _build_overview_html(run_type: str, payload: dict[str, Any], case_report: di
     next_step_block = _html_list_block(
         "Nächster Schritt",
         [
-            _truncate(top_action, 160),
-            *top_risks,
+            _compact_complete_sentences(top_action, limit=220, max_sentences=2),
         ],
-        tone="danger" if top_risks else "neutral",
+        tone="neutral",
         empty="Weiter beobachten",
     )
 

@@ -1350,7 +1350,11 @@ def _build_tms_pending_updates(
 
     received_documents = [row for row in (document_registry.get("received_documents") or []) if isinstance(row, dict)]
     uploaded_doc_types: set[str] = set()
-    for doc_type in actionable_missing_types:
+    expected_types = [str(item) for item in (document_registry.get("expected_types") or []) if str(item).strip()]
+    upload_needed_types = [
+        doc_type for doc_type in expected_types if _normalize_doc_type(doc_type) not in tms_uploaded_types
+    ]
+    for doc_type in upload_needed_types:
         matching_doc = next(
             (
                 row for row in received_documents
@@ -1743,6 +1747,94 @@ def _format_tms_action_details(rows: list[Any] | None) -> list[str]:
     return details
 
 
+def _note_clean_text(value: Any, *, limit: int | None = None) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if limit is not None and len(text) > limit:
+        return text[: max(0, limit - 1)].rstrip(" ,;:-") + "…"
+    return text
+
+
+def _note_sentence_summary(value: Any, *, limit: int = 360, max_sentences: int = 3) -> str:
+    text = _note_clean_text(value)
+    if not text or len(text) <= limit:
+        return text
+    raw_sentences = [m.group(0).strip() for m in re.finditer(r".+?(?:[.!?](?=\s|$)|$)", text) if m.group(0).strip()]
+    sentences: list[str] = []
+    for sentence in raw_sentences:
+        if sentences and re.search(r"\d{1,2}\.\d{1,2}\.$", sentences[-1]):
+            sentences[-1] = f"{sentences[-1]} {sentence}".strip()
+        else:
+            sentences.append(sentence)
+    selected: list[str] = []
+    for sentence in sentences:
+        candidate = " ".join([*selected, sentence]).strip()
+        if len(candidate) > limit or len(selected) >= max_sentences:
+            break
+        selected.append(sentence)
+    if selected:
+        return " ".join(selected)
+    return _note_clean_text(text, limit=limit)
+
+
+def _note_location_is_placeholder(value: str) -> bool:
+    normalized = value.strip().lower()
+    return normalized in {"", "-", "x", "xx", "xxx", "n/a", "na", "unknown", "unbekannt"}
+
+
+def _extract_destination_from_text(value: Any) -> str:
+    text = _note_clean_text(value)
+    patterns = [
+        r"\bnach\s+([A-ZÄÖÜ][\wÄÖÜäöüß\- ]{2,40})(?:\s*\([A-Z]{2}\))?",
+        r"\bZustellung\s+(?:in|bei|nach)\s+([A-ZÄÖÜ][\wÄÖÜäöüß\- ]{2,40})(?:\s*\([A-Z]{2}\))?",
+        r"\bEntladestelle\s+(?:in|bei|nach)?\s*([A-ZÄÖÜ][\wÄÖÜäöüß\- ]{2,40})(?:,|\.|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            candidate = match.group(1).strip(" ,.;:-")
+            candidate = re.sub(r"\s+(?:Die|Der|Das|Aktuell|CMR|TMS)\b.*$", "", candidate).strip(" ,.;:-")
+            if candidate and len(candidate) <= 40:
+                return candidate
+    return ""
+
+
+def _pick_transport_note_next_step(state: CaseState, pending_actions: list[Any] | None, analysis_summary: str | None) -> str:
+    actions = [item for item in (pending_actions or []) if isinstance(item, dict)]
+    status_conflict = next(
+        (
+            action for action in actions
+            if str(action.get("target") or "") == "shipment.review.status_inconsistent_with_analysis"
+        ),
+        None,
+    )
+    if status_conflict:
+        return "TMS-Status gegen Mailverlauf prüfen: operativ geladen/in Transit, TMS steht noch nicht passend; Status und Route danach nachziehen."
+
+    for action in actions:
+        action_type = str(action.get("action_type") or "")
+        target = str(action.get("target") or "")
+        if action_type in {"field_update", "transport_leg_update", "shipment_update"} or "transport_leg" in target:
+            suggested = action.get("suggested_value")
+            reason = _note_clean_text(action.get("reason"), limit=130)
+            if suggested not in (None, ""):
+                return f"TMS-Feld {target or action_type} auf {suggested} prüfen/übernehmen" + (f" ({reason})" if reason else "") + "."
+
+    analysis = _note_clean_text(analysis_summary).lower()
+    if "t1" in analysis or "grenz" in analysis or "verzoll" in analysis:
+        return "T1/Grenzabwicklung absichern und Zustellfenster mit Carrier/Empfänger bestätigen."
+
+    next_step = _note_clean_text(state.next_best_action, limit=180)
+    generic_markers = [
+        "gebündelte dokumentqualitäts-hinweise",
+        "nachforderung, klarstellung oder ignorieren",
+        "mail- und tms-stand prüfen",
+    ]
+    if next_step and not any(marker in next_step.lower() for marker in generic_markers):
+        return next_step
+
+    return "Konkreten TMS-Abgleich aus Mailverlauf durchführen und nur fachlich belegte Änderungen übernehmen."
+
+
 def _build_transport_internal_note(
     *,
     order_id: str,
@@ -1757,50 +1849,63 @@ def _build_transport_internal_note(
     history_sync_error: str | None,
     latest_subject: str | None = None,
     analysis_summary: str | None = None,
+    pending_actions: list[Any] | None = None,
 ) -> str:
     detail = tms_snapshot.get("detail") if isinstance(tms_snapshot.get("detail"), dict) else {}
     status = str(tms_snapshot.get("status") or detail.get("status") or state.current_status or "-").strip() or "-"
     network = str(detail.get("network") or tms_snapshot.get("network") or state.mode or "-").strip() or "-"
     origin = str((detail.get("origin") or {}).get("city") or detail.get("origin_city") or tms_snapshot.get("origin_city") or "-").strip() or "-"
-    destination = str((detail.get("destination") or {}).get("city") or detail.get("destination_city") or tms_snapshot.get("destination_city") or "-").strip() or "-"
-    next_step = re.sub(r"\s+", " ", str(state.next_best_action or "-").strip())[:140] or "-"
-    latest_subject_text = re.sub(r"\s+", " ", str(latest_subject or "").strip())[:120]
-    analysis_text = re.sub(r"\s+", " ", str(analysis_summary or "").strip())[:180]
+    raw_destination = str((detail.get("destination") or {}).get("city") or detail.get("destination_city") or tms_snapshot.get("destination_city") or "-").strip() or "-"
+    analysis_text = _note_sentence_summary(analysis_summary or state.latest_summary, limit=360, max_sentences=3)
+    derived_destination = _extract_destination_from_text(analysis_summary or "\n".join(state.open_questions))
+    destination = derived_destination if _note_location_is_placeholder(raw_destination) and derived_destination else raw_destination
+    latest_subject_text = _note_clean_text(latest_subject, limit=120)
     applied_targets_list = [str(item).strip() for item in (applied_targets or []) if str(item).strip()]
+    next_step = _note_clean_text(_pick_transport_note_next_step(state, pending_actions, analysis_summary), limit=220)
 
     route_text = f"{origin} → {destination}" if origin != "-" or destination != "-" else "-"
+    route_hint = ""
+    if destination != raw_destination and _note_location_is_placeholder(raw_destination):
+        route_hint = f"; TMS-Ziel war Platzhalter '{raw_destination}'"
 
-    if run_type == "bootstrap_case":
-        first_line = f"Initialer Stand für {order_id}: Status {status}, Verkehr {network}, Route {route_text}."
-    elif run_type == "process_event":
-        first_line = f"Update zu {order_id}: Status {status}, Verkehr {network}, Route {route_text}."
+    label = "Initialer Stand" if run_type == "bootstrap_case" else "Update" if run_type == "process_event" else "Stand"
+    if analysis_text and analysis_text.lower() not in {"-", "unknown"}:
+        first_line = f"{label} zu {order_id}: {analysis_text}"
     else:
-        first_line = f"Stand {order_id}: Status {status}, Verkehr {network}, Route {route_text}."
+        first_line = f"{label} zu {order_id}: Status {status}, Verkehr {network}, Route {route_text}."
 
     lines = [first_line]
+    lines.append(f"TMS-Abgleich: Status {status}, Verkehr {network}, Route {route_text}{route_hint}.")
 
-    if latest_subject_text:
-        lines.append(f"Letzter relevanter Betreff: {latest_subject_text}.")
-
+    mail_parts: list[str] = []
     if history_sync_error:
-        lines.append(f"Mailhistorie konnte nicht sauber geladen werden: {history_sync_error}.")
+        mail_parts.append(f"Mailhistorie Fehler: {history_sync_error}")
     elif str(history_sync_status or "").strip().lower() == "ok":
-        lines.append(f"In diesem Lauf wurden {history_sync_count} weitere Nachricht(en) berücksichtigt.")
+        mail_parts.append(f"Mail +{history_sync_count}")
     elif str(history_sync_status or "").strip().lower() == "skipped":
-        lines.append("Mailhistorie wurde in diesem Lauf nicht erneut abgefragt.")
+        mail_parts.append("Mailhistorie nicht erneut abgefragt")
+    if latest_subject_text:
+        mail_parts.append(f"Betreff: {latest_subject_text}")
 
+    pending_parts: list[str] = []
     if isinstance(pending_summary, dict):
-        pending_parts = []
-        if int(pending_summary.get("write_now", 0) or 0) > 0:
-            pending_parts.append(f"{int(pending_summary.get('write_now', 0))} direkte TMS-Anpassung(en) möglich")
-        if int(pending_summary.get("review", 0) or 0) > 0:
-            pending_parts.append(f"{int(pending_summary.get('review', 0))} Punkt(e) noch zur fachlichen Prüfung")
-        if int(pending_summary.get("not_yet_due", 0) or 0) > 0:
-            pending_parts.append(f"{int(pending_summary.get('not_yet_due', 0))} Punkt(e) aktuell noch nicht fällig")
-        if int(pending_summary.get("not_yet_knowable", 0) or 0) > 0:
-            pending_parts.append(f"{int(pending_summary.get('not_yet_knowable', 0))} Punkt(e) derzeit noch nicht belastbar")
+        write_now = int(pending_summary.get("write_now", 0) or 0)
+        review = int(pending_summary.get("review", 0) or 0)
+        not_due = int(pending_summary.get("not_yet_due", 0) or 0)
+        not_knowable = int(pending_summary.get("not_yet_knowable", 0) or 0)
+        if write_now:
+            pending_parts.append(f"{write_now} direkt umsetzbar")
+        if review:
+            pending_parts.append(f"{review} Review")
+        if not_due:
+            pending_parts.append(f"{not_due} noch nicht fällig")
+        if not_knowable:
+            pending_parts.append(f"{not_knowable} nicht belastbar")
+    if mail_parts or pending_parts:
+        line = " / ".join(mail_parts)
         if pending_parts:
-            lines.append("Offen sind aktuell " + "; ".join(pending_parts) + ".")
+            line = (line + " | " if line else "") + "Offen: " + ", ".join(pending_parts)
+        lines.append(line + ".")
 
     if isinstance(applied_summary, dict):
         applied = int(applied_summary.get("applied", 0) or 0)
@@ -1809,21 +1914,19 @@ def _build_transport_internal_note(
         if applied or failed or skipped:
             status_bits = []
             if applied:
-                status_bits.append(f"{applied} Änderung(en) wurden im TMS übernommen")
+                status_bits.append(f"{applied} übernommen")
             if failed:
-                status_bits.append(f"{failed} Änderung(en) konnten nicht geschrieben werden")
+                status_bits.append(f"{failed} fehlgeschlagen")
             if skipped:
-                status_bits.append(f"{skipped} Änderung(en) wurden bewusst übersprungen")
-            lines.append("TMS-Rückmeldung: " + "; ".join(status_bits) + ".")
+                status_bits.append(f"{skipped} übersprungen")
+            lines.append("TMS-Rückmeldung: " + ", ".join(status_bits) + ".")
     if applied_targets_list:
-        pretty_targets = ", ".join(applied_targets_list[:4])
-        if len(applied_targets_list) > 4:
-            pretty_targets += f" und {len(applied_targets_list) - 4} weitere"
+        pretty_targets = ", ".join(applied_targets_list[:3])
+        if len(applied_targets_list) > 3:
+            pretty_targets += f" und {len(applied_targets_list) - 3} weitere"
         lines.append(f"Übernommen: {pretty_targets}.")
 
-    lines.append(f"Nächster Schritt aus operativer Sicht: {next_step}.")
-    if analysis_text:
-        lines.append(f"Einschätzung: {analysis_text}.")
+    lines.append(f"Nächster Schritt: {next_step}")
     return "\n".join(lines)
 
 
@@ -2482,7 +2585,8 @@ def bootstrap_case(
                 history_sync_status="failed" if history_sync_error else ("ok" if refresh_history else "skipped"),
                 history_sync_error=history_sync_error,
                 latest_subject=None,
-                analysis_summary=analysis_summary,
+                analysis_summary=analysis_summary or pending_updates_payload.get("analysis_summary"),
+                pending_actions=pending_updates_payload.get("pending_actions") if isinstance(pending_updates_payload.get("pending_actions"), list) else None,
             ),
             source_key=bootstrap_note_source_key,
         )
@@ -2888,10 +2992,12 @@ def process_email_event(
         tms_snapshot=tms_snapshot,
     )
 
+    history_attachment_records = _collect_attachment_records_from_email_index(history_rows)
+    combined_attachment_records = [*history_attachment_records, *attachment_records]
     document_registry = _build_document_registry(
         prior_registry=prior_document_registry,
         message=message,
-        attachment_records=attachment_records,
+        attachment_records=combined_attachment_records,
         tms_snapshot=tms_snapshot,
         tms_document_requirements=tms_document_requirements,
     )
@@ -3128,7 +3234,8 @@ def process_email_event(
                 history_sync_status="failed" if history_sync_error else ("ok" if refresh_history else "skipped"),
                 history_sync_error=history_sync_error,
                 latest_subject=message.subject,
-                analysis_summary=None,
+                analysis_summary=pending_updates_payload.get("analysis_summary"),
+                pending_actions=pending_updates_payload.get("pending_actions") if isinstance(pending_updates_payload.get("pending_actions"), list) else None,
             ),
             source_key=process_note_source_key,
         )

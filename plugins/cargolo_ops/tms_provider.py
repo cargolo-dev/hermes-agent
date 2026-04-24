@@ -161,13 +161,15 @@ class MCPBridgeTMSProvider:
 
     def _call_backend(self, method_name: str, **kwargs: Any) -> dict[str, Any]:
         helper = (
-            "import json\n"
+            "import json, sys\n"
             "from cargolo_tms_mcp.backend import build_backend\n"
-            f"payload = build_backend().{method_name}(**json.loads({json.dumps(json.dumps(kwargs))}))\n"
+            "kwargs = json.load(sys.stdin)\n"
+            f"payload = build_backend().{method_name}(**kwargs)\n"
             "print(json.dumps(payload, ensure_ascii=False))\n"
         )
         result = subprocess.run(
             [self.python_bin, "-c", helper],
+            input=json.dumps(kwargs, ensure_ascii=False),
             capture_output=True,
             text=True,
             timeout=self.timeout,
@@ -191,16 +193,18 @@ class MCPBridgeTMSProvider:
 
     def _call_remote_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         helper = (
-            "import json\n"
+            "import json, sys\n"
             "from cargolo_tms_mcp.backend import build_backend\n"
             "backend = build_backend()\n"
-            f"payload = backend._call_remote_tool({json.dumps('TOOL_NAME_PLACEHOLDER')}, json.loads({json.dumps(json.dumps({'ARGS_PLACEHOLDER': True}))}))\n"
-            "print(json.dumps(payload, ensure_ascii=False))\n"
+            "payload = json.load(sys.stdin)\n"
+            "tool_name = payload['tool_name']\n"
+            "arguments = payload['arguments']\n"
+            "result = backend._call_remote_tool(tool_name, arguments)\n"
+            "print(json.dumps(result, ensure_ascii=False))\n"
         )
-        helper = helper.replace(json.dumps('TOOL_NAME_PLACEHOLDER'), json.dumps(tool_name))
-        helper = helper.replace(json.dumps(json.dumps({'ARGS_PLACEHOLDER': True})), json.dumps(json.dumps(arguments)))
         result = subprocess.run(
             [self.python_bin, "-c", helper],
+            input=json.dumps({"tool_name": tool_name, "arguments": arguments}, ensure_ascii=False),
             capture_output=True,
             text=True,
             timeout=self.timeout,

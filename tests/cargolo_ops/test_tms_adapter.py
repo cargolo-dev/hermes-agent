@@ -388,6 +388,38 @@ def test_build_tms_provider_falls_back_to_direct_client_when_requested():
         assert provider.__class__.__name__ == "DirectTMSProvider"
 
 
+def test_mcp_bridge_passes_large_backend_payload_via_stdin():
+    captured = {}
+
+    class Result:
+        returncode = 0
+        stdout = '{"status":"ok"}'
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return Result()
+
+    provider = MCPBridgeTMSProvider(python_bin="/python", package_root="/pkg", timeout=12)
+    large_payload = "x" * 300_000
+    with patch("plugins.cargolo_ops.tms_provider.subprocess.run", side_effect=fake_run):
+        result = provider.upload_document(
+            an="AN-10874",
+            admin_user_id=106,
+            document_type="commercial_invoice",
+            file_name="invoice.pdf",
+            file_base64=large_payload,
+        )
+
+    assert result == {"status": "ok"}
+    assert captured["cmd"] == ["/python", "-c", captured["cmd"][2]]
+    assert large_payload not in captured["cmd"][2]
+    stdin_payload = json.loads(captured["kwargs"]["input"])
+    assert stdin_payload["file_base64"] == large_payload
+    assert captured["kwargs"]["text"] is True
+
+
 # ---------------------------------------------------------------------------
 # Tests: Processor with TMS integration
 # ---------------------------------------------------------------------------

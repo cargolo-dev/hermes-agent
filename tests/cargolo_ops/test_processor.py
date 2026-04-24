@@ -339,6 +339,80 @@ def test_process_event_auto_applies_write_now_actions_for_current_case(tmp_path)
     assert applied_updates["skipped_actions"] == []
 
 
+def test_process_event_uploads_documents_found_only_in_mail_history(tmp_path):
+    payload = sample_payload()
+    payload["messages"][0]["message_id"] = "<acceptance@example.com>"
+    payload["trigger_message_id"] = "<acceptance@example.com>"
+    payload["messages"][0]["subject"] = "Angebot AN-10874 angenommen – CARGOLO"
+    payload["messages"][0]["body_text"] = "Angebot angenommen."
+    payload["messages"][0]["attachments"] = []
+    payload["messages"][0]["attachment_count"] = 0
+    payload["messages"][0]["has_attachments"] = False
+
+    case_root = tmp_path / "orders" / "AN-10874"
+    inbound_dir = case_root / "documents" / "inbound"
+    inbound_dir.mkdir(parents=True)
+    history_doc = inbound_dir / "packing list and invoice-06IWM260203.pdf"
+    history_doc.write_bytes(b"pdf bytes")
+    store = CaseStore(tmp_path)
+    store.append_email_index("AN-10874", {
+        "message_id": "<history@example.com>",
+        "subject": "AN-10874 // Rail LCL CN-DE // Cnee: Duschkraft",
+        "sender": "shipper@example.com",
+        "received_at": "2026-04-23T08:06:34Z",
+        "stored_paths": [str(history_doc)],
+        "classification": "history_sync",
+        "linked_order_id": "AN-10874",
+        "dedupe_hash": "history-hash",
+    })
+
+    tms_snapshot = TMSSnapshot(
+        order_id="AN-10874",
+        shipment_uuid="uuid-10874",
+        shipment_number="AN-10874",
+        source="live",
+        status="addresses_pending",
+        detail={"id": "uuid-10874", "status": "addresses_pending", "network": "rail", "documents": [], "dates": {}},
+        billing_items=[],
+        warnings=[],
+    )
+    requirements = {
+        "status": "ok",
+        "expected_types": ["commercial_invoice", "packing_list", "customs_document"],
+        "documents": [],
+    }
+    applied_calls: list[dict] = []
+
+    def _fake_apply(action, context, *, admin_user_id=106):
+        applied_calls.append({"action": dict(action), "context": dict(context)})
+        return {"status": "applied", "executed_tool": "fake_upload"}
+
+    with patch(
+        "plugins.cargolo_ops.processor._fetch_tms_bundle",
+        return_value=(tms_snapshot, requirements, {}),
+    ), patch(
+        "plugins.cargolo_ops.processor.apply_pending_tms_action",
+        side_effect=_fake_apply,
+    ), patch(
+        "plugins.cargolo_ops.processor._add_transport_internal_note",
+        return_value={"status": "applied", "preview": "kurzer transportkommentar", "error": None},
+    ):
+        result = process_email_event(payload, storage_root=tmp_path, refresh_history=False, write_internal_note=True)
+
+    assert result.status == "processed"
+    registry = json.loads((case_root / "documents" / "registry.json").read_text(encoding="utf-8"))
+    assert registry["received_types"] == ["commercial_invoice", "packing_list"]
+    assert registry["missing_types"] == ["customs_document"]
+    assert {call["action"]["document_type"] for call in applied_calls} == {"commercial_invoice", "packing_list"}
+    assert all(call["action"]["source_path"] == str(history_doc) for call in applied_calls)
+
+    pending = json.loads((case_root / "tms" / "pending_updates.json").read_text(encoding="utf-8"))
+    write_now_targets = {row["target"] for row in pending["pending_actions"] if row.get("action_status") == "write_now"}
+    assert write_now_targets >= {"documents.commercial_invoice", "documents.packing_list"}
+    assert result.pending_action_summary["write_now"] == 2
+    assert result.applied_action_summary == {"applied": 2, "failed": 0, "skipped": 0}
+
+
 def test_build_transport_internal_note_is_human_readable():
     note = _build_transport_internal_note(
         order_id="AN-TEST",
@@ -362,13 +436,62 @@ def test_build_transport_internal_note_is_human_readable():
         analysis_summary="Zollunterlagen sind noch unvollständig",
     )
 
-    assert "Initialer Stand für AN-TEST:" in note
-    assert "Offen sind aktuell" in note
+    assert "Initialer Stand zu AN-TEST:" in note
+    assert "Offen:" in note
     assert "TMS-Rückmeldung:" in note
     assert "Übernommen:" in note
     assert "→ 2026-05-09" in note
     assert "Grund: latest_delivery_date war älter als ETA" in note
-    assert "Nächster Schritt aus operativer Sicht:" in note
+    assert "Nächster Schritt:" in note
 
-    assert "Einschätzung:" in note
+    assert "Einschätzung:" not in note
     assert "W:1" not in note
+
+
+def test_build_transport_internal_note_uses_analysis_and_avoids_generic_document_step():
+    analysis_summary = (
+        "FTL-Transport (17,3t Stahl-Schalung) von Paderborn (DE) nach Bazenheid (CH). "
+        "Die Sendung wurde am 23.04. planmäßig verladen (Carrier: Hartmann International, LKW WGM5880H). "
+        "Aktuell besteht eine Diskrepanz zwischen der operativen Realität (In-Transit) und dem TMS-Status ('addresses_pending'). "
+        "CMR, Rechnung und Lieferschein liegen vor."
+    )
+    note = _build_transport_internal_note(
+        order_id="AN-12317",
+        run_type="process_event",
+        tms_snapshot={
+            "status": "addresses_pending",
+            "detail": {
+                "network": "road",
+                "origin": {"city": "Paderborn"},
+                "destination": {"city": "x"},
+            },
+        },
+        state=CaseState(
+            order_id="AN-12317",
+            next_best_action="Gebündelte Dokumentqualitäts-Hinweise prüfen und entscheiden, ob Nachforderung, Klarstellung oder Ignorieren angemessen ist",
+            open_questions=["Genaue Empfängeradresse in CH (nur 'x' im TMS, 'Bazenheid' im Dokument)"],
+        ),
+        pending_summary={"write_now": 0, "review": 1, "not_yet_due": 0, "not_yet_knowable": 0},
+        applied_summary={"applied": 0, "failed": 0, "skipped": 0},
+        applied_targets=[],
+        history_sync_count=5,
+        history_sync_status="ok",
+        history_sync_error=None,
+        latest_subject="AW: AN-12317 // FTL DE-CH",
+        analysis_summary=analysis_summary,
+        pending_actions=[
+            {
+                "action_type": "review_hint",
+                "target": "shipment.review.status_inconsistent_with_analysis",
+                "action_status": "review",
+            }
+        ],
+    )
+
+    assert "FTL-Transport (17,3t Stahl-Schalung)" in note
+    assert "Route Paderborn → Bazenheid" in note
+    assert "TMS-Ziel war Platzhalter 'x'" in note
+    assert "Mail +5" in note
+    assert "Offen: 1 Review" in note
+    assert "TMS-Status gegen Mailverlauf prüfen" in note
+    assert "Gebündelte Dokumentqualitäts-Hinweise" not in note

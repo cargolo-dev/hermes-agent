@@ -67,6 +67,61 @@ def test_build_manual_ops_notification_body_returns_html_payload(tmp_path):
     assert len(body["message_text"].splitlines()) <= 4
 
 
+def test_summary_message_keeps_complete_lage_and_next_step_clean(tmp_path):
+    brief_path = tmp_path / "latest_brief.json"
+    long_summary = (
+        "FTL-Transport (17,3t Stahl-Schalung) von Paderborn (DE) nach Bazenheid (CH). "
+        "Die Sendung wurde am 23.04. planmäßig verladen (Carrier: Hartmann International, LKW WGM5880H). "
+        "Aktuell besteht eine Diskrepanz zwischen der operativen Realität (In-Transit) und dem TMS-Status ('addresses_pending'). "
+        "CMR, Rechnung und Lieferschein liegen vor, jedoch schlug die automatisierte Dokumentenextraktion fehl. "
+        "Verzollung (T1) ist eingeleitet."
+    )
+    brief_path.write_text(
+        json.dumps(
+            {
+                "priority": "high",
+                "ops_summary": long_summary,
+                "internal_actions": [
+                    {
+                        "action": "Finalisierung der T1-Gestellung und Prüfung der Grenzabwicklung",
+                        "blocking": True,
+                    }
+                ],
+                "risk_flags": [
+                    {
+                        "code": "EXTRACTION_FAILURE",
+                        "severity": "medium",
+                        "reason": "Fehlgeschlagene automatisierte Datenübernahme aus Bestandsdokumenten.",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    body = build_manual_ops_notification_body(
+        run_type="process_event",
+        payload={
+            "order_id": "AN-12317",
+            "processor_result": {
+                "order_id": "AN-12317",
+                "status": "processed",
+                "history_sync_count": 0,
+                "pending_action_summary": {"review": 2},
+                "analysis_brief_path": str(brief_path),
+            },
+        },
+    )
+
+    assert "Aktuell besteht eine Diskrepanz zwischen der operativen Realität" in body["message_text"]
+    assert "Lage:" in body["message_text"]
+    assert "..." not in body["message_text"]
+    assert "Nächster Schritt: Finalisierung der T1-Gestellung" in body["message_text"]
+    next_step_html = body["message"].split("Nächster Schritt", 1)[1]
+    assert "Fehlgeschlagene automatisierte Datenübernahme" not in next_step_html
+
+
 def test_send_manual_ops_notification_uses_route_webhook_forward(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
