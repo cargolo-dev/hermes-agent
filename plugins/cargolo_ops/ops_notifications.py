@@ -316,16 +316,18 @@ def _build_summary_message(run_type: str, payload: dict[str, Any]) -> str:
     else:
         history_token = f"Mail {history_sync_status or 'unbekannt'}"
 
-    applied_targets = [str(item).strip() for item in (result.get("applied_action_targets") or []) if str(item).strip()]
-    failed_targets = [str(item).strip() for item in (result.get("failed_action_targets") or []) if str(item).strip()]
+    applied_details = [str(item).strip() for item in (result.get("applied_action_details") or []) if str(item).strip()]
+    failed_details = [str(item).strip() for item in (result.get("failed_action_details") or []) if str(item).strip()]
+    applied_targets = applied_details or [str(item).strip() for item in (result.get("applied_action_targets") or []) if str(item).strip()]
+    failed_targets = failed_details or [str(item).strip() for item in (result.get("failed_action_targets") or []) if str(item).strip()]
     pending_total = sum(int(value or 0) for value in pending_summary.values()) if isinstance(pending_summary, dict) else 0
     review_count = int(pending_summary.get("review", 0) or 0) if isinstance(pending_summary, dict) else 0
     write_now_count = int(pending_summary.get("write_now", 0) or 0) if isinstance(pending_summary, dict) else 0
 
     if applied_targets:
-        tms_token = f"TMS geändert: {_truncate(', '.join(applied_targets[:2]), 90)}"
+        tms_token = f"TMS geändert: {_truncate(', '.join(applied_targets[:2]), 180)}"
     elif failed_targets:
-        tms_token = f"TMS Fehler: {_truncate(', '.join(failed_targets[:2]), 90)}"
+        tms_token = f"TMS Fehler: {_truncate(', '.join(failed_targets[:2]), 180)}"
     elif isinstance(applied_summary, dict) and int(applied_summary.get("applied", 0) or 0) > 0:
         tms_token = f"TMS geändert: {int(applied_summary.get('applied', 0) or 0)}"
     elif write_now_count > 0:
@@ -493,13 +495,15 @@ def _build_overview_html(run_type: str, payload: dict[str, Any], case_report: di
         220,
     )
     top_risks = [_risk_short_text(risk) for risk in _pick_top_risks(risk_flags, limit=2)]
-    applied_targets = [str(item).strip() for item in (result.get("applied_action_targets") or []) if str(item).strip()]
-    failed_targets = [str(item).strip() for item in (result.get("failed_action_targets") or []) if str(item).strip()]
+    applied_details = [str(item).strip() for item in (result.get("applied_action_details") or []) if str(item).strip()]
+    failed_details = [str(item).strip() for item in (result.get("failed_action_details") or []) if str(item).strip()]
+    applied_targets = applied_details or [str(item).strip() for item in (result.get("applied_action_targets") or []) if str(item).strip()]
+    failed_targets = failed_details or [str(item).strip() for item in (result.get("failed_action_targets") or []) if str(item).strip()]
 
     if applied_targets:
-        tms_status = f"Geändert: {_truncate(', '.join(applied_targets[:2]), 90)}"
+        tms_status = f"Geändert: {_truncate(', '.join(applied_targets[:2]), 180)}"
     elif failed_targets:
-        tms_status = f"Fehler: {_truncate(', '.join(failed_targets[:2]), 90)}"
+        tms_status = f"Fehler: {_truncate(', '.join(failed_targets[:2]), 180)}"
     elif applied_count > 0:
         tms_status = f"Geändert: {applied_count}"
     elif write_now > 0:

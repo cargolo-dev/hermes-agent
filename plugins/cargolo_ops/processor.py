@@ -60,7 +60,7 @@ DOCUMENT_HINTS = {
 
 MODE_KEYWORDS = {
     "air": ("air", "awb", "iata", "airport", "flight"),
-    "ocean": ("ocean", "sea", "bl", "bill of lading", "port", "vessel"),
+    "sea": ("sea", "bl", "bill of lading", "port", "vessel"),
     "rail": ("rail", "train", "terminal", "wagon"),
 }
 
@@ -240,6 +240,26 @@ def detect_mode(text: str) -> str:
         if any(keyword in lowered for keyword in keywords):
             return mode
     return "unknown"
+
+
+def _mode_from_tms_snapshot(tms_snapshot: dict[str, Any]) -> str | None:
+    detail = tms_snapshot.get("detail") if isinstance(tms_snapshot.get("detail"), dict) else {}
+    raw_mode = str(
+        detail.get("transport_mode")
+        or detail.get("network")
+        or tms_snapshot.get("transport_mode")
+        or tms_snapshot.get("network")
+        or ""
+    ).strip().lower()
+    network_to_mode = {
+        "air": "air",
+        "sea": "sea",
+        "rail": "rail",
+        "road": "unknown",
+        "truck": "unknown",
+        "asr": "unknown",
+    }
+    return network_to_mode.get(raw_mode)
 
 
 def extract_entities(event: IncomingEmailEvent) -> EntitiesSnapshot:
@@ -435,13 +455,18 @@ def _derive_action_guidance_from_pending_actions(
         "shipment.review.actual_delivery_date_placeholder",
     } for target in targets):
         return True, "review:shipment_status_validation", "TMS-Status/Meilensteine fachlich prüfen und bei Bedarf korrigieren"
+    if {
+        "documents.review.commercial_invoice_expected_but_mail_evidence_unclear",
+        "documents.review.packing_list_expected_but_mail_evidence_unclear",
+    }.issubset(set(targets)):
+        return True, "review:commercial_invoice,packing_list_context", "Commercial Invoice / Packing List gegen Mail- und TMS-Stand prüfen"
     if "documents.review.air_waybill_missing_but_flight_context_present" in targets:
         return True, "review:air_waybill_context", "AWB/Flugdaten gegen Mail- und Carrier-Stand prüfen"
     if "documents.review.packing_list_expected_but_mail_evidence_unclear" in targets:
         return True, "review:packing_list_context", "Packing List Bedarf gegen Mail- und TMS-Stand prüfen"
     if "documents.review.commercial_invoice_expected_but_mail_evidence_unclear" in targets:
         return True, "review:commercial_invoice_context", "Commercial Invoice gegen Mail- und TMS-Stand prüfen"
-    if "documents.review.bill_of_lading_missing_but_ocean_context_present" in targets:
+    if "documents.review.bill_of_lading_missing_but_sea_context_present" in targets:
         return True, "review:bill_of_lading_context", "Bill of Lading gegen Mail- und Carrier-Stand prüfen"
 
     missing_doc_targets = [target for target in targets if target.startswith("documents.") and ".review." not in target]
@@ -1387,7 +1412,7 @@ def _build_tms_pending_updates(
             pending_actions.append(action)
             contextual_document_targets.add("documents.air_waybill")
 
-    if "packing_list" in actionable_missing_types and shipment_network in {"air", "ocean", "rail"}:
+    if "packing_list" in actionable_missing_types and shipment_network in {"air", "sea", "rail"}:
         action = {
             "action_type": "review_hint",
             "target": "documents.review.packing_list_expected_but_mail_evidence_unclear",
@@ -1408,7 +1433,7 @@ def _build_tms_pending_updates(
         pending_actions.append(action)
         contextual_document_targets.add("documents.packing_list")
 
-    if "commercial_invoice" in actionable_missing_types and shipment_network in {"air", "ocean", "rail"}:
+    if "commercial_invoice" in actionable_missing_types and shipment_network in {"air", "sea", "rail"}:
         action = {
             "action_type": "review_hint",
             "target": "documents.review.commercial_invoice_expected_but_mail_evidence_unclear",
@@ -1429,11 +1454,11 @@ def _build_tms_pending_updates(
         pending_actions.append(action)
         contextual_document_targets.add("documents.commercial_invoice")
 
-    if "bill_of_lading" in actionable_missing_types and shipment_network in {"sea", "ocean"}:
-        if any(token in history_blob for token in ("vessel", "ocean", "sea freight", "bl pending", "bill of lading", "port", "etd")):
+    if "bill_of_lading" in actionable_missing_types and shipment_network == "sea":
+        if any(token in history_blob for token in ("vessel", "sea freight", "bl pending", "bill of lading", "port", "etd")):
             action = {
                 "action_type": "review_hint",
-                "target": "documents.review.bill_of_lading_missing_but_ocean_context_present",
+                "target": "documents.review.bill_of_lading_missing_but_sea_context_present",
                 "suggested_value": "review_required",
                 "source": "mail_history.latest_messages",
                 "reason": "Im Mailverlauf liegt bereits klarer Seefracht-/Vessel-Kontext vor, aber ein belastbarer Bill of Lading ist im Fall/TMS noch nicht sichtbar.",
@@ -1675,6 +1700,47 @@ def _execute_write_now_actions(
     elif applied_payload["skipped_actions"]:
         applied_payload["status"] = "skipped"
     return applied_payload
+
+
+def _clean_action_text(value: Any, *, limit: int = 180) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) > limit:
+        return text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _format_tms_action_detail(row: dict[str, Any] | None) -> str:
+    action = row.get("action") if isinstance(row, dict) else None
+    if not isinstance(action, dict):
+        action = row if isinstance(row, dict) else {}
+    target = _clean_action_text(action.get("target") or action.get("action_type") or "TMS", limit=90)
+    suggested = action.get("suggested_value")
+    if suggested in (None, "") and isinstance(row, dict):
+        result = row.get("result") if isinstance(row.get("result"), dict) else {}
+        response = result.get("response") if isinstance(result.get("response"), dict) else {}
+        updated_fields = response.get("updated_fields") if isinstance(response.get("updated_fields"), list) else []
+        if updated_fields:
+            suggested = ", ".join(str(item) for item in updated_fields)
+    parts = [target]
+    if suggested not in (None, ""):
+        parts.append(f"→ {_clean_action_text(suggested, limit=90)}")
+    reason = _clean_action_text(action.get("reason"), limit=180)
+    if reason:
+        parts.append(f"Grund: {reason}")
+    source = _clean_action_text(action.get("source"), limit=120)
+    if source:
+        parts.append(f"Quelle: {source}")
+    return "; ".join(parts)
+
+
+def _format_tms_action_details(rows: list[Any] | None) -> list[str]:
+    details: list[str] = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            detail = _format_tms_action_detail(row)
+            if detail.strip():
+                details.append(detail)
+    return details
 
 
 def _build_transport_internal_note(
@@ -2281,10 +2347,9 @@ def bootstrap_case(
         tms_snapshot=tms_snapshot,
     )
 
-    tms_detail = tms_snapshot.get("detail") if isinstance(tms_snapshot, dict) else {}
-    network = str((tms_detail or {}).get("network") or "").lower()
-    network_to_mode = {"air": "air", "sea": "ocean", "rail": "rail", "road": "road", "asr": "air"}
-    state.mode = network_to_mode.get(network, state.mode or "unknown")
+    tms_detail = tms_snapshot.get("detail") if isinstance(tms_snapshot, dict) and isinstance(tms_snapshot.get("detail"), dict) else {}
+    tms_mode = _mode_from_tms_snapshot(tms_snapshot)
+    state.mode = tms_mode or state.mode or "unknown"
     state.current_status = str(tms_snapshot.get("status") or state.current_status or "bootstrapped")
     state.documents_received = sorted(set(document_registry.get("received_types", [])))
     state.documents_expected = sorted(set(document_registry.get("expected_types", [])))
@@ -2412,11 +2477,7 @@ def bootstrap_case(
                     "failed": len(applied_updates_payload.get("failed_actions") or []),
                     "skipped": len(applied_updates_payload.get("skipped_actions") or []),
                 },
-                applied_targets=[
-                    str((row.get("action") or {}).get("target") or "")
-                    for row in (applied_updates_payload.get("applied_actions") or [])
-                    if str((row.get("action") or {}).get("target") or "").strip()
-                ],
+                applied_targets=_format_tms_action_details(applied_updates_payload.get("applied_actions")),
                 history_sync_count=history_count,
                 history_sync_status="failed" if history_sync_error else ("ok" if refresh_history else "skipped"),
                 history_sync_error=history_sync_error,
@@ -2515,6 +2576,24 @@ def bootstrap_case(
             "failed": len(applied_updates_payload.get("failed_actions") or []),
             "skipped": len(applied_updates_payload.get("skipped_actions") or []),
         },
+        applied_action_targets=[
+            str((row.get("action") or {}).get("target") or "")
+            for row in (applied_updates_payload.get("applied_actions") or [])
+            if str((row.get("action") or {}).get("target") or "").strip()
+        ],
+        failed_action_targets=[
+            str((row.get("action") or {}).get("target") or "")
+            for row in (applied_updates_payload.get("failed_actions") or [])
+            if str((row.get("action") or {}).get("target") or "").strip()
+        ],
+        skipped_action_targets=[
+            str((row.get("action") or {}).get("target") or "")
+            for row in (applied_updates_payload.get("skipped_actions") or [])
+            if str((row.get("action") or {}).get("target") or "").strip()
+        ],
+        applied_action_details=_format_tms_action_details(applied_updates_payload.get("applied_actions")),
+        failed_action_details=_format_tms_action_details(applied_updates_payload.get("failed_actions")),
+        skipped_action_details=_format_tms_action_details(applied_updates_payload.get("skipped_actions")),
         analysis_status=analysis_status,
         analysis_brief_path=analysis_brief_path,
         analysis_priority=analysis_priority,
@@ -2713,6 +2792,7 @@ def process_email_event(
 
     history_count = 0
     history_sync_error: str | None = None
+    is_initial_history_sync = refresh_history and not bool(state.last_email_at)
     if refresh_history:
         try:
             history_count = _sync_mail_history(
@@ -2725,6 +2805,42 @@ def process_email_event(
         except Exception as exc:
             history_count = 0
             history_sync_error = f"mail_history_sync_failed: {exc}"
+            if is_initial_history_sync:
+                state.open_questions = sorted(set(state.open_questions) | {history_sync_error})
+                state_path = store.save_case_state(order_id, state)
+                tms_path = store.save_tms_snapshot(order_id, tms_snapshot)
+                store.append_audit(
+                    order_id,
+                    action="process_email_event",
+                    result="skipped",
+                    files=[str(raw_path), str(state_path), str(tms_path)],
+                    extra={
+                        "initialized": is_first_real_ingest,
+                        "message_id": message.message_id,
+                        "dedupe_hash": message.dedupe_hash,
+                        "history_sync_status": "failed",
+                        "history_sync_error": history_sync_error,
+                        "skip_reason": "initial_mail_history_sync_failed",
+                    },
+                )
+                return ProcessingResult(
+                    status="skipped",
+                    order_id=order_id,
+                    case_root=str(case_root),
+                    initialized=is_first_real_ingest,
+                    history_sync_count=0,
+                    history_sync_status="failed",
+                    history_sync_error=history_sync_error,
+                    latest_subject=message.subject,
+                    latest_sender=message.from_email,
+                    attachment_count=len(message.attachments),
+                    attachment_filenames=[a.filename for a in message.attachments if a.filename],
+                    suppress_delivery=True,
+                    message=(
+                        f"Mailhistory for {order_id} could not be fetched during initial sync. "
+                        "Automatic processing skipped; current mail saved for later retry."
+                    ),
+                )
 
     history_rows = store.list_email_index(order_id)
     attachment_paths: list[str] = []
@@ -2786,7 +2902,8 @@ def process_email_event(
         tms_snapshot=tms_snapshot,
     )
 
-    state.mode = entities_after.transport_mode_candidates[0] if entities_after.transport_mode_candidates else detect_mode(_body_blob(message))
+    tms_mode = _mode_from_tms_snapshot(tms_snapshot)
+    state.mode = tms_mode or (entities_after.transport_mode_candidates[0] if entities_after.transport_mode_candidates else detect_mode(_body_blob(message)))
     state.current_status = classification.value
     state.last_email_at = message.received_at or event.received_at
     if message.is_internal:
@@ -2835,7 +2952,7 @@ def process_email_event(
             state.customer_reference = tms_detail["customer_reference"]
         # Derive transport mode from the "network" field (air, sea, rail, road, asr)
         tms_network = tms_detail.get("network", "").lower()
-        network_to_mode = {"air": "air", "sea": "ocean", "rail": "rail", "road": "road", "asr": "air"}
+        network_to_mode = {"air": "air", "sea": "sea", "rail": "rail", "road": "unknown", "asr": "unknown"}
         if tms_network in network_to_mode and state.mode == "unknown":
             state.mode = network_to_mode[tms_network]
     # Collect TMS warnings as risks
@@ -3006,11 +3123,7 @@ def process_email_event(
                     "failed": len(applied_updates_payload.get("failed_actions") or []),
                     "skipped": len(applied_updates_payload.get("skipped_actions") or []),
                 },
-                applied_targets=[
-                    str((row.get("action") or {}).get("target") or "")
-                    for row in (applied_updates_payload.get("applied_actions") or [])
-                    if str((row.get("action") or {}).get("target") or "").strip()
-                ],
+                applied_targets=_format_tms_action_details(applied_updates_payload.get("applied_actions")),
                 history_sync_count=history_count,
                 history_sync_status="failed" if history_sync_error else ("ok" if refresh_history else "skipped"),
                 history_sync_error=history_sync_error,
@@ -3088,6 +3201,9 @@ def process_email_event(
             for row in (applied_updates_payload.get("skipped_actions") or [])
             if str((row.get("action") or {}).get("target") or "").strip()
         ],
+        applied_action_details=_format_tms_action_details(applied_updates_payload.get("applied_actions")),
+        failed_action_details=_format_tms_action_details(applied_updates_payload.get("failed_actions")),
+        skipped_action_details=_format_tms_action_details(applied_updates_payload.get("skipped_actions")),
         internal_note_status=str(internal_note.get("status") or ""),
         internal_note_preview=str(internal_note.get("preview") or ""),
         internal_note_error=internal_note.get("error"),

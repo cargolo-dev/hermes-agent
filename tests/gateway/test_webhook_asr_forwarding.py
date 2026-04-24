@@ -157,3 +157,31 @@ def test_build_suppressed_notification_body_for_not_in_tms_skip():
     assert 'nicht im ASR-TMS gefunden' in body['message']
     assert body['message_text'] == 'AN-12520 | übersprungen | nicht im ASR-TMS gefunden'
     assert body['payload']['run_type'] == 'skipped_not_in_tms'
+
+
+def test_build_suppressed_notification_body_for_mail_history_failure_skip():
+    cfg = PlatformConfig(enabled=True, extra={})
+    adapter = WebhookAdapter(cfg)
+
+    body = adapter._build_suppressed_notification_body(
+        route_name='cargolo-asr-ingest',
+        delivery_id='delivery-skip-history',
+        payload={
+            'bu': 'BU-4664',
+            'processor_result': {
+                'status': 'skipped',
+                'order_id': 'BU-4664',
+                'history_sync_status': 'failed',
+                'history_sync_error': 'mail_history_sync_failed: n8n mail history timed out',
+                'message': 'Mailhistory for BU-4664 could not be fetched during initial sync. Automatic processing skipped; current mail saved for later retry.',
+                'suppress_delivery': True,
+            },
+        },
+    )
+
+    assert body is not None
+    assert body['message_format'] == 'html'
+    assert 'BU-4664' in body['message']
+    assert 'Mailhistory konnte beim initialen Sync nicht gezogen werden' in body['message']
+    assert body['message_text'] == 'BU-4664 | übersprungen | Mailhistory konnte nicht gezogen werden'
+    assert body['payload']['run_type'] == 'skipped_mail_history_failed'

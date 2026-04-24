@@ -746,14 +746,25 @@ class WebhookAdapter(BasePlatformAdapter):
             or ""
         ).strip().upper()
         message = str(result.get("message") or "").strip()
-        if "not found in asr shipment list" not in message.lower():
+        message_lower = message.lower()
+        if "not found in asr shipment list" in message_lower:
+            plain = f"{order_id or 'Unbekannt'} | übersprungen | nicht im ASR-TMS gefunden"
+            detail = "Übersprungen, weil nicht im ASR-TMS gefunden."
+            run_type = "skipped_not_in_tms"
+        elif "mailhistory" in message_lower and "initial sync" in message_lower:
+            plain = f"{order_id or 'Unbekannt'} | übersprungen | Mailhistory konnte nicht gezogen werden"
+            error = str(result.get("history_sync_error") or "").strip()
+            detail = "Mailhistory konnte beim initialen Sync nicht gezogen werden. Automatische Verarbeitung wurde übersprungen; die aktuelle Mail wurde für einen späteren Retry gespeichert."
+            if error:
+                detail += f" Fehler: {html.escape(error[:240])}"
+            run_type = "skipped_mail_history_failed"
+        else:
             return None
 
-        plain = f"{order_id or 'Unbekannt'} | übersprungen | nicht im ASR-TMS gefunden"
         body_html = (
             "<html><body style='margin:0;padding:16px;font-family:Segoe UI,Arial,sans-serif;color:#0f172a;'>"
             f"<div style='font-size:14px;font-weight:600;'>{html.escape(order_id or 'Unbekannt')}</div>"
-            "<div style='margin-top:6px;font-size:13px;'>Übersprungen, weil nicht im ASR-TMS gefunden.</div>"
+            f"<div style='margin-top:6px;font-size:13px;'>{detail}</div>"
             "</body></html>"
         )
         return {
@@ -765,7 +776,7 @@ class WebhookAdapter(BasePlatformAdapter):
             "message_format": "html",
             "payload": {
                 "event_type": "cargolo_asr_suppressed_notification",
-                "run_type": "skipped_not_in_tms",
+                "run_type": run_type,
                 **payload,
             },
         }

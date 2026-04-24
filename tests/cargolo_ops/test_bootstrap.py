@@ -336,20 +336,20 @@ def test_bootstrap_case_creates_baseline_without_fake_email(tmp_path):
     state = json.loads((case_root / "case_state.json").read_text(encoding="utf-8"))
     assert state["customer_name"] == "Test Kunde GmbH"
     assert state["customer_reference"] == f"REF-{order_id}"
-    assert state["mode"] == "ocean"
+    assert state["mode"] == "sea"
     assert state["documents_expected"] == ["commercial_invoice", "packing_list"]
     assert state["missing_information"] == ["document:commercial_invoice", "document:packing_list"]
     assert state["next_best_action"] == "Commercial Invoice / Packing List gegen Mail- und TMS-Stand prüfen"
-    assert state["task_reason"] == "missing_documents:commercial_invoice,packing_list"
+    assert state["task_reason"] == "review:commercial_invoice,packing_list_context"
     registry = json.loads((case_root / "documents" / "registry.json").read_text(encoding="utf-8"))
     assert registry["expected_types"] == ["commercial_invoice", "packing_list"]
     assert registry["missing_types"] == ["commercial_invoice", "packing_list"]
     pending_updates = json.loads((case_root / "tms" / "pending_updates.json").read_text(encoding="utf-8"))
     assert pending_updates["order_id"] == order_id
     assert pending_updates["pending_actions"]
-    assert {row["target"] for row in pending_updates["pending_actions"] if row["action_type"] == "document_gap"} == {
-        "documents.commercial_invoice",
-        "documents.packing_list",
+    assert {row["target"] for row in pending_updates["pending_actions"] if row["action_type"] == "review_hint"} >= {
+        "documents.review.commercial_invoice_expected_but_mail_evidence_unclear",
+        "documents.review.packing_list_expected_but_mail_evidence_unclear",
     }
     writeback_queue = json.loads((tmp_path / "tms_writeback_queue.json").read_text(encoding="utf-8"))
     assert writeback_queue["summary"]["pending_orders"] == 1

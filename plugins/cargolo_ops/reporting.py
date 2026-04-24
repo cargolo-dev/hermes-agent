@@ -31,7 +31,7 @@ def generate_daily_report(root: Path | None = None) -> dict[str, Any]:
         "cases_with_missing_documents": [],
         "cases_with_contradictions": [],
         "overdue_internal_tasks": [],
-        "exceptions_by_mode": {"air": 0, "ocean": 0, "rail": 0, "unknown": 0},
+        "exceptions_by_mode": {"air": 0, "sea": 0, "rail": 0, "unknown": 0},
         "unassigned_cases": [],
     }
 

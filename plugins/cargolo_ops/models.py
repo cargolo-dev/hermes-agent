@@ -578,6 +578,9 @@ class ProcessingResult(BaseModel):
     applied_action_targets: list[str] = Field(default_factory=list)
     failed_action_targets: list[str] = Field(default_factory=list)
     skipped_action_targets: list[str] = Field(default_factory=list)
+    applied_action_details: list[str] = Field(default_factory=list)
+    failed_action_details: list[str] = Field(default_factory=list)
+    skipped_action_details: list[str] = Field(default_factory=list)
     analysis_status: str | None = None
     analysis_brief_path: str | None = None
     analysis_priority: str | None = None

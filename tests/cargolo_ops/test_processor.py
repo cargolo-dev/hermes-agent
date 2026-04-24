@@ -58,6 +58,71 @@ def test_process_event_creates_case_files(tmp_path):
     assert state["task_reason"] != ""
 
 
+def test_tms_transport_mode_overrides_signature_air_sea_text(tmp_path):
+    payload = sample_payload()
+    payload["an"] = "BU-4664"
+    payload["messages"][0]["message_id"] = "<msg-bu-4664@example.com>"
+    payload["trigger_message_id"] = "<msg-bu-4664@example.com>"
+    payload["messages"][0]["subject"] = "WG: CARGOLO Transportauftrag: BU-4664 // Seefracht Standard // Nordvant"
+    payload["messages"][0]["body_text"] = (
+        "Können Sie uns bitte den Preis geben?\n\n"
+        "Freundliche Grüße\n"
+        "i. A. Sandra Henneken\n"
+        "Import Air & Sea\n"
+        "BU-4664 Seefracht Standard"
+    )
+    tms_snapshot = TMSSnapshot(
+        order_id="BU-4664",
+        shipment_uuid="uuid-bu-4664",
+        shipment_number="BU-4664",
+        source="live",
+        status="confirmed",
+        detail={"id": "uuid-bu-4664", "network": "sea", "transport_mode": "sea", "documents": []},
+        billing_items=[],
+        warnings=[],
+    )
+
+    with patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(tms_snapshot, {}, {})):
+        result = process_email_event(payload, storage_root=tmp_path, refresh_history=False)
+
+    assert result.status == "processed"
+    state = json.loads((tmp_path / "orders" / "BU-4664" / "case_state.json").read_text(encoding="utf-8"))
+    entities = json.loads((tmp_path / "orders" / "BU-4664" / "entities.json").read_text(encoding="utf-8"))
+    assert "air" in entities["transport_mode_candidates"]  # signature still mentions Import Air & Sea
+    assert state["mode"] == "sea"
+
+
+def test_initial_mail_history_failure_skips_remaining_pipeline(tmp_path):
+    payload = sample_payload()
+    tms_snapshot = TMSSnapshot(
+        order_id="AN-10874",
+        shipment_uuid="uuid-10874",
+        shipment_number="AN-10874",
+        source="live",
+        status="confirmed",
+        detail={"id": "uuid-10874", "network": "sea", "transport_mode": "sea", "documents": []},
+        billing_items=[],
+        warnings=[],
+    )
+
+    with patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(tms_snapshot, {}, {})), \
+         patch("plugins.cargolo_ops.processor._sync_mail_history", side_effect=TimeoutError("n8n mail history timed out")), \
+         patch("plugins.cargolo_ops.processor.analyze_case_documents") as mock_analyze:
+        result = process_email_event(payload, storage_root=tmp_path, refresh_history=True)
+
+    assert result.status == "skipped"
+    assert result.suppress_delivery is True
+    assert result.history_sync_status == "failed"
+    assert "mail_history_sync_failed" in (result.history_sync_error or "")
+    assert "Mailhistory" in result.message
+    mock_analyze.assert_not_called()
+    case_root = tmp_path / "orders" / "AN-10874"
+    assert (case_root / "tms_snapshot.json").exists()
+    assert not (case_root / "analysis" / "case_report_latest.json").exists()
+    audit = (case_root / "audit" / "actions.jsonl").read_text(encoding="utf-8")
+    assert "initial_mail_history_sync_failed" in audit
+
+
 def test_process_event_is_idempotent_for_duplicate_messages(tmp_path):
     first = process_email_event(sample_payload(), storage_root=tmp_path, refresh_history=False)
     second = process_email_event(sample_payload(), storage_root=tmp_path, refresh_history=False)
@@ -256,6 +321,10 @@ def test_process_event_auto_applies_write_now_actions_for_current_case(tmp_path)
     assert result.pending_action_summary == {"write_now": 2, "review": 0, "not_yet_due": 0, "not_yet_knowable": 0}
     assert result.applied_action_summary == {"applied": 2, "failed": 0, "skipped": 0}
     assert result.applied_action_targets == ["shipment.status", "documents.commercial_invoice"]
+    assert result.applied_action_details[0] == "shipment.status; → delivered; Grund: actual_delivery_date gesetzt; Quelle: tms.detail.dates.actual_delivery_date"
+    assert "documents.commercial_invoice" in result.applied_action_details[1]
+    assert "→ upload_local_case_document_to_tms" in result.applied_action_details[1]
+    assert "Grund: liegt lokal vor" in result.applied_action_details[1]
     assert result.internal_note_status == "applied"
     assert result.internal_note_preview == "kurzer transportkommentar"
     assert [call["action"]["action_type"] for call in applied_calls] == ["status_update", "document_upload"]
@@ -285,7 +354,7 @@ def test_build_transport_internal_note_is_human_readable():
         state=CaseState(order_id="AN-TEST", next_best_action="Commercial Invoice nachfordern"),
         pending_summary={"write_now": 1, "review": 2, "not_yet_due": 0, "not_yet_knowable": 0},
         applied_summary={"applied": 1, "failed": 0, "skipped": 0},
-        applied_targets=["shipment.dates.latest_delivery_date"],
+        applied_targets=["shipment.dates.latest_delivery_date; → 2026-05-09; Grund: latest_delivery_date war älter als ETA"],
         history_sync_count=3,
         history_sync_status="ok",
         history_sync_error=None,
@@ -297,6 +366,8 @@ def test_build_transport_internal_note_is_human_readable():
     assert "Offen sind aktuell" in note
     assert "TMS-Rückmeldung:" in note
     assert "Übernommen:" in note
+    assert "→ 2026-05-09" in note
+    assert "Grund: latest_delivery_date war älter als ETA" in note
     assert "Nächster Schritt aus operativer Sicht:" in note
 
     assert "Einschätzung:" in note

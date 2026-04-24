@@ -355,12 +355,12 @@ def test_build_tms_pending_updates_adds_precise_air_review_hints_instead_of_gene
     assert "documents.commercial_invoice" not in targets
 
 
-def test_build_tms_pending_updates_adds_precise_ocean_review_hint_for_missing_bl():
+def test_build_tms_pending_updates_adds_precise_sea_review_hint_for_missing_bl():
     payload = _build_tms_pending_updates(
-        order_id="AN-OCEAN",
+        order_id="AN-SEA",
         tms_snapshot={
-            "shipment_uuid": "uuid-AN-OCEAN",
-            "shipment_number": "AN-OCEAN",
+            "shipment_uuid": "uuid-AN-SEA",
+            "shipment_number": "AN-SEA",
             "status": "confirmed",
             "detail": {
                 "status": "confirmed",
@@ -370,8 +370,8 @@ def test_build_tms_pending_updates_adds_precise_ocean_review_hint_for_missing_bl
         },
         history_rows=[
             {
-                "subject": "AN-OCEAN vessel booking / BL pending",
-                "body_text": "Ocean booking confirmed, vessel ETD updated, B/L still pending.",
+                "subject": "AN-SEA vessel booking / BL pending",
+                "body_text": "Sea booking confirmed, vessel ETD updated, B/L still pending.",
                 "sender": "sea@example.com",
             }
         ],
@@ -386,7 +386,7 @@ def test_build_tms_pending_updates_adds_precise_ocean_review_hint_for_missing_bl
     )
 
     targets = {action["target"]: action for action in payload["pending_actions"]}
-    assert "documents.review.bill_of_lading_missing_but_ocean_context_present" in targets
+    assert "documents.review.bill_of_lading_missing_but_sea_context_present" in targets
     assert "documents.bill_of_lading" not in targets
 
 

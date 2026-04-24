@@ -610,6 +610,6 @@ def build_mail_history_client_from_env() -> N8NMailHistoryClient | None:
     if not url:
         return None
     token = os.getenv("HERMES_CARGOLO_ASR_MAIL_HISTORY_TOKEN", "").strip() or None
-    timeout_raw = os.getenv("HERMES_CARGOLO_ASR_MAIL_HISTORY_TIMEOUT", "45").strip()
-    timeout = int(timeout_raw) if timeout_raw.isdigit() else 45
+    timeout_raw = os.getenv("HERMES_CARGOLO_ASR_MAIL_HISTORY_TIMEOUT", "90").strip()
+    timeout = int(timeout_raw) if timeout_raw.isdigit() else 90
     return N8NMailHistoryClient(url=url, timeout=timeout, auth_token=token)

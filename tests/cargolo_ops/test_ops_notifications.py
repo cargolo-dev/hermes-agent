@@ -40,6 +40,10 @@ def test_build_manual_ops_notification_body_returns_html_payload(tmp_path):
                 "status": "processed",
                 "history_sync_count": 7,
                 "pending_action_summary": {"write_now": 1},
+                "applied_action_summary": {"applied": 1, "failed": 0, "skipped": 0},
+                "applied_action_details": [
+                    "shipment.dates.latest_delivery_date; → 2026-05-09; Grund: latest_delivery_date war früher als ETA"
+                ],
                 "case_report_path": str(case_report_path),
             },
         },
@@ -55,6 +59,9 @@ def test_build_manual_ops_notification_body_returns_html_payload(tmp_path):
     assert body["payload"]["run_type"] == "process_event"
     assert body["payload"]["processor_result"]["order_id"] == "AN-12001"
     assert "TMS-Aktion" in body["message"]
+    assert "→ 2026-05-09" in body["message"]
+    assert "Grund:" in body["message"]
+    assert "→ 2026-05-09" in body["message_text"]
     assert "Nächster Schritt" in body["message"]
     assert "Webhook-Kurzfazit" not in body["message"]
     assert len(body["message_text"].splitlines()) <= 4

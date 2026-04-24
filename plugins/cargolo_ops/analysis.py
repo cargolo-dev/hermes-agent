@@ -434,35 +434,80 @@ def _specialist_tasks(*, case_root: Path, case_state_path: Path, entities_path: 
     ]
 
 
+def _known_specialist_fallback_paths(case_root: Path | None) -> list[Path]:
+    if case_root is None:
+        return []
+    analysis_root = case_root / "analysis"
+    return [
+        case_root / "reconciliation.json",
+        analysis_root / "reconciliation.json",
+        case_root / "draft_review.json",
+        analysis_root / "draft_review.json",
+        case_root / "ops_action_analysis.json",
+        analysis_root / "ops_action_analysis.json",
+        case_root / "ops_action.json",
+        analysis_root / "ops_action.json",
+    ]
+
+
+def _load_specialist_payload(path: Path) -> dict[str, Any] | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.debug("Could not parse specialist fallback file %s", path, exc_info=True)
+        return None
+    if not isinstance(payload, dict):
+        logger.debug("Ignoring specialist fallback file %s because it is not a JSON object", path)
+        return None
+    return payload
+
+
+def _append_specialist_payload(parsed: list[ASRSpecialistOutput], payload: dict[str, Any], *, source: str) -> None:
+    try:
+        specialist = ASRSpecialistOutput.model_validate(payload)
+    except Exception:
+        logger.debug("Ignoring invalid specialist output from %s", source, exc_info=True)
+        return
+    existing_roles = {str(item.role or "").strip() for item in parsed}
+    if specialist.role and specialist.role in existing_roles:
+        return
+    parsed.append(specialist)
+
+
 def _parse_specialist_outputs(raw_results: list[dict[str, Any]], *, case_root: Path | None = None) -> list[ASRSpecialistOutput]:
     parsed: list[ASRSpecialistOutput] = []
-    fallback_paths = []
-    if case_root is not None:
-        fallback_paths = [
-            case_root / "reconciliation.json",
-            case_root / "analysis" / "draft_review.json",
-            case_root / "ops_action_analysis.json",
-        ]
+    parse_failures = 0
     for idx, entry in enumerate(raw_results):
-        summary = entry.get("summary") or ""
+        summary = entry.get("summary") or "" if isinstance(entry, dict) else ""
         try:
             payload = _extract_json_blob(summary)
         except Exception:
-            payload = None
-            if idx < len(fallback_paths):
-                candidate = fallback_paths[idx]
-                if candidate.exists():
-                    try:
-                        payload = json.loads(candidate.read_text(encoding="utf-8"))
-                    except Exception:
-                        logger.debug("Could not parse specialist fallback file %s", candidate, exc_info=True)
-            if payload is None:
-                raise
-        parsed.append(ASRSpecialistOutput.model_validate(payload))
+            parse_failures += 1
+            logger.debug("Specialist result %s did not contain inline JSON; will try case-local fallback files", idx, exc_info=True)
+            continue
+        _append_specialist_payload(parsed, payload, source=f"delegate_result[{idx}]")
+
+    for candidate in _known_specialist_fallback_paths(case_root):
+        payload = _load_specialist_payload(candidate)
+        if payload is not None:
+            _append_specialist_payload(parsed, payload, source=str(candidate))
+
+    if parse_failures and parsed:
+        logger.warning(
+            "Recovered %s ASR specialist output(s) from fallback files/other results after %s non-JSON delegate result(s)",
+            len(parsed),
+            parse_failures,
+        )
+    elif parse_failures and not parsed:
+        logger.warning("No parseable ASR specialist outputs found after %s non-JSON delegate result(s); using deterministic fallback brief", parse_failures)
     return parsed
 
 
 def _synthesize_brief(result: ProcessingResult, specialists: list[ASRSpecialistOutput]) -> ASRAnalysisBrief:
+    if not specialists:
+        return _fallback_synthesize_brief(result, specialists)
     agent = _build_synthesis_agent()
     prompt = COORDINATOR_SYNTHESIS_PROMPT.format(
         order_id=result.order_id or "",

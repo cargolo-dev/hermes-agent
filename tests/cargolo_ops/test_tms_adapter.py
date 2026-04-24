@@ -482,8 +482,8 @@ def test_processor_enriches_state_from_live_tms(tmp_path):
     state = json.loads((tmp_path / "orders" / "AN-10874" / "case_state.json").read_text(encoding="utf-8"))
     assert state["customer_name"] == "Test Kunde GmbH"
     assert state["customer_reference"] == "REF-K001"
-    # network "sea" maps to mode "ocean"
-    assert state["mode"] == "ocean"
+    # network "sea" stays as mode "sea"
+    assert state["mode"] == "sea"
 
 
 def test_processor_builds_document_registry_against_tms_documents(tmp_path):
