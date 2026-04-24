@@ -29,19 +29,23 @@ Security:
 import asyncio
 import hashlib
 import hmac
+import html
 import json
 import logging
+import os
 import re
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from aiohttp import web
+    from aiohttp import ClientSession, web
 
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
+    ClientSession = None  # type: ignore[assignment]
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
@@ -193,14 +197,39 @@ class WebhookAdapter(BasePlatformAdapter):
         to the ``log`` deliver type.  TTL cleanup happens on POST.
         """
         delivery = self._delivery_info.get(chat_id, {})
+        deliveries = delivery.get("deliveries")
+        if isinstance(deliveries, list) and deliveries:
+            results: list[SendResult] = []
+            for item in deliveries:
+                if not isinstance(item, dict):
+                    continue
+                results.append(await self._dispatch_delivery(content, item, chat_id=chat_id))
+            failures = [result.error or "unknown delivery error" for result in results if not result.success]
+            if failures:
+                return SendResult(success=False, error="; ".join(failures))
+            return SendResult(success=True)
+
+        return await self._dispatch_delivery(content, delivery, chat_id=chat_id)
+
+    async def _dispatch_delivery(
+        self,
+        content: str,
+        delivery: dict,
+        *,
+        chat_id: str = "",
+    ) -> SendResult:
+        """Deliver content to a single resolved delivery target."""
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
-            logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
+            logger.info("[webhook] Response for %s: %s", chat_id or "<unknown>", content[:200])
             return SendResult(success=True)
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "webhook_forward":
+            return await self._deliver_webhook_forward(content, delivery)
 
         # Cross-platform delivery — any platform with a gateway adapter
         if self.gateway_runner and deliver_type in (
@@ -376,6 +405,46 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        # Build a unique delivery ID early so suppressed direct-processor
+        # paths can still reference it before the normal idempotency section.
+        delivery_id = request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+        )
+
+        # Optional deterministic direct processor before the agent prompt.
+        # This is ideal for business workflows that need guaranteed storage,
+        # idempotency, and case reconciliation before an LLM summarizes.
+        try:
+            processor_result = self._run_direct_processor(route_config, payload)
+        except Exception as e:
+            logger.exception("[webhook] Direct processor failed for route %s: %s", route_name, e)
+            return web.json_response({"error": f"Direct processor failed: {e}"}, status=500)
+        if processor_result is not None:
+            payload = {**payload, "processor_result": processor_result}
+            if bool(processor_result.get("suppress_delivery", False)):
+                logger.info(
+                    "[webhook] Suppressing downstream delivery for route %s due to processor_result.status=%s",
+                    route_name,
+                    processor_result.get("status"),
+                )
+                await self._deliver_suppressed_additional_notifications(
+                    route_name=route_name,
+                    route_config=route_config,
+                    payload=payload,
+                    delivery_id=delivery_id,
+                )
+                return web.json_response(
+                    {
+                        "status": "accepted",
+                        "route": route_name,
+                        "event": event_type,
+                        "suppressed": True,
+                        "processor_status": processor_result.get("status"),
+                    },
+                    status=202,
+                )
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
@@ -410,12 +479,6 @@ class WebhookAdapter(BasePlatformAdapter):
                         )
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
-
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-        )
 
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
@@ -506,8 +569,27 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
+            "route_name": route_name,
+            "delivery_id": delivery_id,
             "payload": payload,
         }
+        additional_deliveries = []
+        for item in route_config.get("deliver_additional") or []:
+            if not isinstance(item, dict):
+                continue
+            additional_deliveries.append(
+                {
+                    "deliver": item.get("deliver", "log"),
+                    "deliver_extra": self._render_delivery_extra(
+                        item.get("deliver_extra", {}), payload
+                    ),
+                    "route_name": route_name,
+                    "delivery_id": delivery_id,
+                    "payload": payload,
+                }
+            )
+        if additional_deliveries:
+            deliver_config["deliveries"] = [deliver_config, *additional_deliveries]
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._prune_delivery_info(now)
@@ -643,6 +725,132 @@ class WebhookAdapter(BasePlatformAdapter):
                 rendered[key] = value
         return rendered
 
+    def _build_suppressed_notification_body(
+        self,
+        *,
+        route_name: str,
+        payload: dict,
+        delivery_id: str,
+    ) -> dict | None:
+        if route_name != "cargolo-asr-ingest":
+            return None
+        result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}
+        if str(result.get("status") or "").strip().lower() != "skipped":
+            return None
+
+        order_id = str(
+            result.get("order_id")
+            or payload.get("order_id")
+            or payload.get("an")
+            or payload.get("bu")
+            or ""
+        ).strip().upper()
+        message = str(result.get("message") or "").strip()
+        if "not found in asr shipment list" not in message.lower():
+            return None
+
+        plain = f"{order_id or 'Unbekannt'} | übersprungen | nicht im ASR-TMS gefunden"
+        body_html = (
+            "<html><body style='margin:0;padding:16px;font-family:Segoe UI,Arial,sans-serif;color:#0f172a;'>"
+            f"<div style='font-size:14px;font-weight:600;'>{html.escape(order_id or 'Unbekannt')}</div>"
+            "<div style='margin-top:6px;font-size:13px;'>Übersprungen, weil nicht im ASR-TMS gefunden.</div>"
+            "</body></html>"
+        )
+        return {
+            "route": route_name,
+            "delivery_id": delivery_id,
+            "delivered_at": time.time(),
+            "message": body_html,
+            "message_text": plain,
+            "message_format": "html",
+            "payload": {
+                "event_type": "cargolo_asr_suppressed_notification",
+                "run_type": "skipped_not_in_tms",
+                **payload,
+            },
+        }
+
+    async def _deliver_suppressed_additional_notifications(
+        self,
+        *,
+        route_name: str,
+        route_config: dict,
+        payload: dict,
+        delivery_id: str,
+    ) -> None:
+        body = self._build_suppressed_notification_body(
+            route_name=route_name,
+            payload=payload,
+            delivery_id=delivery_id,
+        )
+        if body is None or ClientSession is None:
+            return
+
+        for item in route_config.get("deliver_additional") or []:
+            if not isinstance(item, dict) or item.get("deliver") != "webhook_forward":
+                continue
+            extra = self._render_delivery_extra(item.get("deliver_extra", {}), payload)
+            url = str(extra.get("url") or "").strip()
+            if not url:
+                continue
+            method = str(extra.get("method") or "POST").strip().upper() or "POST"
+            headers = dict(extra.get("headers") or {})
+            headers.setdefault("Content-Type", "application/json")
+            try:
+                async with ClientSession() as session:
+                    request_fn = getattr(session, method.lower(), None)
+                    if request_fn is None:
+                        logger.warning("[webhook] Unsupported suppressed webhook_forward method: %s", method)
+                        continue
+                    async with request_fn(url, json=body, headers=headers, timeout=30) as response:
+                        if 200 <= response.status < 300:
+                            continue
+                        response_text = await response.text()
+                        logger.warning(
+                            "[webhook] Suppressed webhook_forward HTTP %s for route %s: %s",
+                            response.status,
+                            route_name,
+                            response_text[:300],
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "[webhook] Suppressed webhook_forward failed for route %s: %s",
+                    route_name,
+                    exc,
+                )
+
+    def _run_direct_processor(self, route_config: dict, payload: dict) -> dict | None:
+        """Run an optional deterministic processor before creating the agent prompt."""
+        processor_name = route_config.get("direct_processor")
+        if not processor_name:
+            return None
+
+        options = route_config.get("direct_processor_options", {}) or {}
+        if processor_name == "cargolo_asr_email":
+            from plugins.cargolo_ops.processor import process_email_event
+
+            storage_root = options.get("storage_root")
+            result = process_email_event(
+                payload,
+                storage_root=Path(storage_root).expanduser() if storage_root else None,
+                create_task=bool(options.get("create_task", False)),
+                refresh_history=bool(options.get("refresh_history", True)),
+                enable_subagent_analysis=bool(options.get("enable_subagent_analysis", False)),
+                write_internal_note=bool(options.get("write_internal_note", str(os.getenv("HERMES_CARGOLO_ASR_ENABLE_TMS_INTERNAL_NOTES", "")).strip().lower() not in {"", "0", "false", "no", "off"})),
+            )
+            return result.model_dump(mode="json")
+
+        if processor_name == "cargolo_asr_review":
+            from plugins.cargolo_ops.review import process_review
+
+            storage_root = options.get("storage_root")
+            return process_review(
+                payload,
+                storage_root=Path(storage_root).expanduser() if storage_root else None,
+            )
+
+        raise ValueError(f"Unknown direct processor: {processor_name}")
+
     # ------------------------------------------------------------------
     # Response delivery
     # ------------------------------------------------------------------
@@ -658,22 +866,7 @@ class WebhookAdapter(BasePlatformAdapter):
         work in agent mode work here — Telegram, Discord, Slack, GitHub
         PR comments, etc.
         """
-        deliver_type = delivery.get("deliver", "log")
-
-        if deliver_type == "log":
-            # Shouldn't reach here — startup validation rejects deliver_only
-            # with deliver=log — but guard defensively.
-            logger.info("[webhook] direct-deliver log-only: %s", content[:200])
-            return SendResult(success=True)
-
-        if deliver_type == "github_comment":
-            return await self._deliver_github_comment(content, delivery)
-
-        # Fall through to the cross-platform dispatcher, which validates the
-        # target name and routes via the gateway runner.
-        return await self._deliver_cross_platform(
-            deliver_type, content, delivery
-        )
+        return await self._dispatch_delivery(content, delivery)
 
     async def _deliver_github_comment(
         self, content: str, delivery: dict
@@ -728,6 +921,78 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))
+
+    async def _deliver_webhook_forward(
+        self, content: str, delivery: dict
+    ) -> SendResult:
+        """POST the final agent result plus structured webhook context to another webhook."""
+        extra = delivery.get("deliver_extra", {})
+        url = str(extra.get("url") or "").strip()
+        if not url:
+            return SendResult(success=False, error="Missing url for webhook_forward delivery")
+        if ClientSession is None:
+            return SendResult(success=False, error="aiohttp ClientSession unavailable")
+
+        method = str(extra.get("method") or "POST").strip().upper() or "POST"
+        headers = dict(extra.get("headers") or {})
+        headers.setdefault("Content-Type", "application/json")
+        payload = delivery.get("payload") or {}
+        route_name = str(delivery.get("route_name") or "")
+        delivered_at = time.time()
+        body = {
+            "route": route_name,
+            "delivery_id": delivery.get("delivery_id"),
+            "delivered_at": delivered_at,
+            "message": content,
+            "payload": payload,
+        }
+        if route_name == "cargolo-asr-ingest":
+            try:
+                from hermes_constants import get_hermes_home
+                from plugins.cargolo_ops.ops_notifications import build_manual_ops_notification_body
+
+                processor_result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}
+                order_id = (
+                    processor_result.get("order_id")
+                    or payload.get("order_id")
+                    or payload.get("an")
+                    or payload.get("bu")
+                    or ""
+                )
+                order_id = str(order_id or "").strip().upper()
+                if order_id and not processor_result.get("case_report_path"):
+                    case_root = get_hermes_home() / "cargolo_asr" / "orders" / order_id
+                    case_report_path = case_root / "analysis" / "case_report_latest.json"
+                    analysis_brief_path = case_root / "analysis" / "latest_brief.json"
+                    if case_report_path.exists():
+                        processor_result = {**processor_result, "case_report_path": str(case_report_path)}
+                    if analysis_brief_path.exists() and not processor_result.get("analysis_brief_path"):
+                        processor_result = {**processor_result, "analysis_brief_path": str(analysis_brief_path)}
+                body = build_manual_ops_notification_body(
+                    run_type="process_event",
+                    payload={
+                        "order_id": order_id or payload.get("order_id"),
+                        "processor_result": processor_result,
+                    },
+                    route_name=route_name,
+                    delivery_id=str(delivery.get("delivery_id") or ""),
+                    delivered_at=delivered_at,
+                )
+            except Exception as exc:
+                logger.warning("[webhook] ASR teams/html render fallback for route %s failed: %s", route_name, exc)
+
+        try:
+            async with ClientSession() as session:
+                request_fn = getattr(session, method.lower(), None)
+                if request_fn is None:
+                    return SendResult(success=False, error=f"Unsupported webhook_forward method: {method}")
+                async with request_fn(url, json=body, headers=headers, timeout=30) as response:
+                    if 200 <= response.status < 300:
+                        return SendResult(success=True)
+                    response_text = await response.text()
+                    return SendResult(success=False, error=f"webhook_forward HTTP {response.status}: {response_text[:500]}")
+        except Exception as exc:
+            return SendResult(success=False, error=f"webhook_forward failed: {exc}")
 
     async def _deliver_cross_platform(
         self, platform_name: str, content: str, delivery: dict
