@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import mimetypes
+import os
 import re
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,7 @@ from hermes_cli.config import load_config
 from .models import utc_now_iso
 
 ANALYSIS_VERSION = "2026-04-13-doc-analysis-v2-native-openrouter"
+PRICING_KB_ROOT = Path(os.environ.get("CARGOLO_PRICING_KB_ROOT", "/root/.hermes/cargolo_pricing"))
 _IMAGE_EXTENSIONS = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -458,7 +462,12 @@ def _match_tms_documents(*, analysis: dict[str, Any], received_doc: dict[str, An
 
 def _analyze_single_document(*, order_id: str, path: Path, received_doc: dict[str, Any], registry: dict[str, Any], tms_snapshot: dict[str, Any]) -> dict[str, Any]:
     original_mime_type = _guess_mime_type(path, received_doc.get("mime_type"))
-    provider, model, base_url, api_key = _resolve_task_provider_model("document_analysis")
+    resolved_provider_model = _resolve_task_provider_model("document_analysis")
+    if len(resolved_provider_model) == 5:
+        provider, model, base_url, api_key, _api_mode = resolved_provider_model
+    else:  # backward-compatible with older tests/helpers that returned 4 fields
+        provider, model, base_url, api_key = resolved_provider_model
+        _api_mode = None
     if provider == "auto":
         provider = "openrouter"
     registry_types = list(received_doc.get("detected_types") or [])
@@ -538,6 +547,60 @@ def _analyze_single_document(*, order_id: str, path: Path, received_doc: dict[st
     }
 
 
+def _load_pricing_ingest_adapter() -> Any:
+    root = str(PRICING_KB_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    module_path = PRICING_KB_ROOT / "pricing_ingest_adapter_v1.py"
+    if module_path.exists():
+        module_name = f"_cargolo_pricing_ingest_adapter_{abs(hash(str(module_path)))}"
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load pricing adapter from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    import pricing_ingest_adapter_v1
+    return pricing_ingest_adapter_v1
+
+
+def _record_pricing_document_events_if_relevant(
+    *,
+    order_id: str,
+    path: Path,
+    row: dict[str, Any],
+    analysis: dict[str, Any],
+    tms_snapshot: dict[str, Any],
+    tms_matches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Best-effort handoff from document monitoring to pricing KB.
+
+    Offer documents contribute VK/quote signals; billing documents contribute
+    actual EK/VK invoice evidence. Pricing indexing must never break ops analysis.
+    """
+    try:
+        module = _load_pricing_ingest_adapter()
+        analysis_with_path = dict(analysis)
+        analysis_with_path.setdefault("analysis_path", row.get("analysis_path"))
+        common = dict(
+            order_id=order_id,
+            filename=str(row.get("filename") or path.name),
+            stored_path=path,
+            source_skill="cargolo-tms-document-monitoring",
+            source_event="document_analysis.analyzed",
+            analysis=analysis_with_path,
+            received_doc=row,
+            tms_snapshot=tms_snapshot,
+            tms_matches=tms_matches,
+        )
+        results = [module.record_pricing_offer_document(**common)]
+        if hasattr(module, "record_pricing_billing_document"):
+            results.append(module.record_pricing_billing_document(**common))
+        return [result for result in results if result and result.get("status") != "skipped"]
+    except Exception as exc:  # pragma: no cover - defensive integration guard
+        return [{"status": "error", "error": str(exc), "filename": str(row.get("filename") or path.name)}]
+
+
 def analyze_case_documents(*, order_id: str, case_root: Path, registry: dict[str, Any], tms_snapshot: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     analysis_root = case_root / "documents" / "analysis"
     analysis_root.mkdir(parents=True, exist_ok=True)
@@ -575,6 +638,17 @@ def analyze_case_documents(*, order_id: str, case_root: Path, registry: dict[str
             row["analysis_confidence"] = analysis.get("confidence")
             row["analysis_summary"] = analysis.get("summary")
             row["tms_matches"] = tms_matches
+            pricing_events = _record_pricing_document_events_if_relevant(
+                order_id=order_id,
+                path=stored_path,
+                row=row,
+                analysis=analysis,
+                tms_snapshot=tms_snapshot,
+                tms_matches=tms_matches,
+            )
+            if pricing_events:
+                row["pricing_kb_events"] = pricing_events
+                row["pricing_kb_event"] = pricing_events[0]
             analysis_types = set(analysis.get("suggested_registry_types", []))
             if analysis.get("doc_type") == "billing":
                 analysis_types.discard("commercial_invoice")
@@ -589,6 +663,8 @@ def analyze_case_documents(*, order_id: str, case_root: Path, registry: dict[str
                 "summary": analysis.get("summary"),
                 "analysis_path": str(artifact_path),
                 "tms_matches": tms_matches,
+                "pricing_kb_events": row.get("pricing_kb_events"),
+                "pricing_kb_event": row.get("pricing_kb_event"),
                 "operational_flags": analysis.get("operational_flags", []),
                 "missing_or_unreadable": analysis.get("missing_or_unreadable", []),
             })

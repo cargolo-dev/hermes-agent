@@ -29,8 +29,10 @@ class CaseStore:
             "emails/normalized",
             "emails/drafts",
             "documents/inbound",
+            "documents/tms",
             "documents/generated",
             "documents/analysis",
+            "document_monitoring",
             "tasks",
             "audit",
             "tms",
@@ -263,6 +265,15 @@ class CaseStore:
         md_path.write_text(markdown, encoding="utf-8")
         legacy_json_path.unlink(missing_ok=True)
         legacy_md_path.unlink(missing_ok=True)
+        return json_path, md_path
+
+    def save_document_monitoring_report(self, order_id: str, payload: dict[str, Any], markdown: str) -> tuple[Path, Path]:
+        case_root = self.ensure_case(order_id)
+        report_dir = case_root / "document_monitoring"
+        json_path = report_dir / "latest_report.json"
+        md_path = report_dir / "latest_report.md"
+        self._write_json(json_path, payload)
+        md_path.write_text(markdown, encoding="utf-8")
         return json_path, md_path
 
     def list_orders(self) -> list[str]:
