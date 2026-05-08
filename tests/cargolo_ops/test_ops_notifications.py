@@ -163,32 +163,32 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
     assert "AN-12505 | Dokument hochgeladen" in body["message_text"]
     assert "plausibel" in body["message_text"]
     assert "Mail +3" in body["message_text"]
-    assert len(body["message_text"].splitlines()) <= 4
+    assert "Dokument erkannt:" in body["message_text"]
+    assert "Analysierte Dokumente:" in body["message_text"]
+    assert "Abgleich:" in body["message_text"]
+    assert "Bewertung:" in body["message_text"]
+    assert "Sicherheitslogik:" in body["message_text"]
 
 
-def test_send_manual_ops_notification_uses_route_webhook_forward(tmp_path, monkeypatch):
+def test_send_manual_ops_notification_uses_native_teams_gateway_route(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
     (hermes_home / "webhook_subscriptions.json").write_text(
         json.dumps(
             {
-                "cargolo-asr-ingest": {
-                    "deliver_additional": [
-                        {
-                            "deliver": "webhook_forward",
-                            "deliver_extra": {
-                                "url": "https://example.test/asr-ops",
-                                "method": "POST",
-                                "headers": {"X-Test": "1"},
-                            },
-                        }
-                    ]
+                "cargolo-asr-ops-teams": {
+                    "events": ["cargolo_asr_manual_ops_notification"],
+                    "secret": "native-teams-secret",
+                    "deliver_only": True,
+                    "deliver": "teams",
+                    "prompt": "{message_text}",
                 }
             }
         ),
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_CARGOLO_ASR_OPS_DELIVERY", raising=False)
 
     captured = {}
     case_report_path = tmp_path / "case_report_latest.json"
@@ -208,10 +208,11 @@ def test_send_manual_ops_notification_uses_route_webhook_forward(tmp_path, monke
         encoding="utf-8",
     )
 
-    def _fake_request(method, url, json=None, headers=None, timeout=None):
+    def _fake_request(method, url, data=None, headers=None, timeout=None):
         captured["method"] = method
         captured["url"] = url
-        captured["json"] = json
+        captured["data"] = data
+        captured["json"] = json.loads(data.decode("utf-8"))
         captured["headers"] = headers
         captured["timeout"] = timeout
         return _Response()
@@ -234,19 +235,14 @@ def test_send_manual_ops_notification_uses_route_webhook_forward(tmp_path, monke
 
     assert result["enabled"] is True
     assert result["delivered"] == 1
-    assert captured["url"] == "https://example.test/asr-ops"
-    assert captured["json"]["payload"]["event_type"] == "cargolo_asr_manual_ops_notification"
+    assert result["targets"] == ["native_teams_route:cargolo-asr-ops-teams"]
+    assert captured["url"] == "http://127.0.0.1:8644/webhooks/cargolo-asr-ops-teams"
+    assert captured["headers"]["X-Hub-Signature-256"].startswith("sha256=")
+    assert captured["json"]["event_type"] == "cargolo_asr_manual_ops_notification"
     assert captured["json"]["payload"]["run_type"] == "bootstrap_case"
     assert captured["json"]["payload"]["processor_result"]["order_id"] == "AN-12001"
     assert captured["json"]["message_format"] == "html"
     assert "<html><body" in captured["json"]["message"]
-    assert "CARGOLO ASR" in captured["json"]["message"]
-    assert "TMS-Aktion" in captured["json"]["message"]
-    assert "Nächster Schritt" in captured["json"]["message"]
-    assert "Webhook-Kurzfazit" not in captured["json"]["message"]
-    assert "Quellartefakte" not in captured["json"]["message"]
-    assert "Mail History" not in captured["json"]["message"]
-    assert "AN-12001" in captured["json"]["message"]
     assert "AN-12001 | bootstrapped" in captured["json"]["message_text"]
     assert "Nächster Schritt:" in captured["json"]["message_text"]
     assert "Mail +7" in captured["json"]["message_text"]

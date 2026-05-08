@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html as _html
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -16,6 +18,8 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ROUTE_NAME = "cargolo-asr-ingest"
+_DEFAULT_NATIVE_TEAMS_ROUTE_NAME = "cargolo-asr-ops-teams"
+_DEFAULT_GATEWAY_WEBHOOK_BASE = "http://127.0.0.1:8644"
 
 
 def _load_targets_from_route_config(route_name: str) -> list[dict[str, Any]]:
@@ -49,7 +53,49 @@ def _load_targets_from_route_config(route_name: str) -> list[dict[str, Any]]:
     return targets
 
 
-def _load_targets(*, route_name: str, allow_route_fallback: bool) -> list[dict[str, Any]]:
+def _load_gateway_route_config(route_name: str) -> dict[str, Any]:
+    subscriptions_path = get_hermes_home() / "webhook_subscriptions.json"
+    if not subscriptions_path.exists():
+        return {}
+    try:
+        data = json.loads(subscriptions_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not read webhook subscriptions for native Teams ops notifications: %s", exc)
+        return {}
+    route = data.get(route_name)
+    return route if isinstance(route, dict) else {}
+
+
+def _load_native_teams_targets() -> list[dict[str, Any]]:
+    """Return the internal gateway deliver_only route used for native Teams.
+
+    CARGOLO ops notifications no longer post to n8n by default. Instead they
+    post to a local, HMAC-protected Hermes webhook route whose delivery target
+    is ``teams``; the running gateway then sends via the native Teams adapter
+    and its configured Teams home channel.
+    """
+    route_name = str(os.getenv("HERMES_CARGOLO_ASR_OPS_TEAMS_ROUTE", _DEFAULT_NATIVE_TEAMS_ROUTE_NAME)).strip()
+    route = _load_gateway_route_config(route_name)
+    if not route:
+        return []
+    base = str(os.getenv("HERMES_CARGOLO_ASR_OPS_GATEWAY_BASE_URL", _DEFAULT_GATEWAY_WEBHOOK_BASE)).strip().rstrip("/")
+    url = str(os.getenv("HERMES_CARGOLO_ASR_OPS_GATEWAY_URL", f"{base}/webhooks/{route_name}")).strip()
+    secret = str(route.get("secret") or "").strip()
+    if not url or not secret:
+        return []
+    return [
+        {
+            "url": url,
+            "method": "POST",
+            "headers": {"Content-Type": "application/json"},
+            "secret": secret,
+            "source": f"native_teams_route:{route_name}",
+            "kind": "native_teams_gateway",
+        }
+    ]
+
+
+def _load_webhook_targets(*, route_name: str, allow_route_fallback: bool) -> list[dict[str, Any]]:
     url = str(os.getenv("HERMES_CARGOLO_ASR_OPS_WEBHOOK_URL", "")).strip()
     if url:
         headers = {"Content-Type": "application/json"}
@@ -62,11 +108,24 @@ def _load_targets(*, route_name: str, allow_route_fallback: bool) -> list[dict[s
                 "method": str(os.getenv("HERMES_CARGOLO_ASR_OPS_WEBHOOK_METHOD", "POST") or "POST").strip().upper() or "POST",
                 "headers": headers,
                 "source": "env:HERMES_CARGOLO_ASR_OPS_WEBHOOK_URL",
+                "kind": "webhook",
             }
         ]
     if allow_route_fallback:
         return _load_targets_from_route_config(route_name)
     return []
+
+
+def _load_targets(*, route_name: str, allow_route_fallback: bool) -> list[dict[str, Any]]:
+    delivery_mode = str(os.getenv("HERMES_CARGOLO_ASR_OPS_DELIVERY", "native_teams")).strip().lower()
+    if delivery_mode in {"", "native", "native_teams", "teams"}:
+        return _load_native_teams_targets()
+    if delivery_mode in {"both", "native_teams_and_webhook", "teams_and_webhook"}:
+        return _load_native_teams_targets() + _load_webhook_targets(
+            route_name=route_name,
+            allow_route_fallback=allow_route_fallback,
+        )
+    return _load_webhook_targets(route_name=route_name, allow_route_fallback=allow_route_fallback)
 
 
 def _priority_emoji(priority: Any) -> str:
@@ -220,6 +279,210 @@ def _select_uploaded_document(registry: dict[str, Any], filename: str) -> dict[s
     return next((row for row in documents if isinstance(row, dict)), {})
 
 
+def _finding_summary_de(finding: dict[str, Any]) -> str:
+    raw = str(finding.get("summary") or finding.get("type") or "").strip()
+    mapping = {
+        "Incoterm_EXW_detected": "Incoterm EXW erkannt; Zuständigkeiten/Kosten gegen Angebot und TMS prüfen.",
+        "Incoterm EXW": "Incoterm EXW erkannt; Zuständigkeiten/Kosten gegen Angebot und TMS prüfen.",
+        "Incoterm EXW bestätigt": "Incoterm EXW bestätigt; Zuständigkeiten/Kosten gegen Angebot und TMS prüfen.",
+        "Incoterm EXW bestätigt.": "Incoterm EXW bestätigt; Zuständigkeiten/Kosten gegen Angebot und TMS prüfen.",
+        "Discrepancy_Weight_Detected": "Abweichung Gewicht zwischen Dokument/Angebot und TMS prüfen.",
+        "weight_discrepancy": "Gewichtsabweichung zwischen HAWB/Dokument und TMS prüfen.",
+        "Discrepancy_Packages_Detected": "Abweichung Packstückanzahl zwischen Dokument/Angebot und TMS prüfen.",
+        "DOCUMENT_ANALYSIS_ERROR": "Dokument konnte nicht sicher analysiert werden; Datei manuell öffnen.",
+    }
+    if raw in mapping:
+        return mapping[raw]
+    cleaned = raw.replace("_", " ").strip()
+    if cleaned:
+        return cleaned[:1].upper() + cleaned[1:]
+    return "Dokument/TMS-Abgleich fachlich prüfen."
+
+
+def _finding_text(finding: Any) -> str:
+    if isinstance(finding, dict):
+        filename = str(finding.get("filename") or "").strip()
+        summary = _finding_summary_de(finding)
+        severity = str(finding.get("severity") or "").strip()
+        prefix = f"{filename}: " if filename else ""
+        suffix = f" ({severity})" if severity else ""
+        return f"{prefix}{summary}{suffix}"
+    return str(finding or "").strip()
+
+
+def _is_weight_or_quantity_finding(finding: Any) -> bool:
+    if not isinstance(finding, dict):
+        text = str(finding or "").lower()
+    else:
+        text = " ".join(
+            str(finding.get(key) or "")
+            for key in ("type", "summary", "filename", "reason", "evidence")
+        ).lower()
+    return any(token in text for token in ("weight", "gewicht", "menge", "quantity", "packstück", "pieces", "packages"))
+
+
+def _pick_document_next_step(findings: list[Any]) -> str:
+    if not findings:
+        return "Dokument/TMS-Abgleich fachlich prüfen."
+    if any(_is_weight_or_quantity_finding(row) for row in findings):
+        return "Abweichung Gewicht/Menge zwischen Angebot, Dokumenten und TMS-Auszug prüfen."
+    preferred_tokens = (
+        "Incoterm_EXW_detected",
+        "Incoterm EXW",
+    )
+    dict_findings = [row for row in findings if isinstance(row, dict)]
+    for token in preferred_tokens:
+        for row in dict_findings:
+            if str(row.get("summary") or "") == token:
+                return _finding_summary_de(row)
+    return _finding_summary_de(dict_findings[0]) if dict_findings else "Dokument/TMS-Abgleich fachlich prüfen."
+
+
+def _read_email_index_count(case_root: Any) -> int | None:
+    try:
+        root = Path(str(case_root or ""))
+        index = root / "email_index.jsonl"
+        if not index.exists():
+            return None
+        return sum(1 for line in index.read_text(encoding="utf-8").splitlines() if line.strip())
+    except Exception:
+        return None
+
+
+def _display_doc_type_for_row(row: dict[str, Any]) -> str:
+    filename = str(row.get("filename") or "").lower()
+    summary = str(row.get("summary") or row.get("analysis_summary") or "").lower()
+    if "angebot" in filename or "transportangebot" in summary:
+        return "Angebot"
+    return _doc_type_label(row.get("doc_type") or row.get("analysis_doc_type"))
+
+
+def _document_line_from_analysis(row: dict[str, Any]) -> str:
+    filename = _truncate(str(row.get("filename") or "Dokument"), 72)
+    doc_type = _display_doc_type_for_row(row)
+    summary = _truncate_sentence(row.get("summary") or row.get("analysis_summary") or "kein Kurzinhalt extrahiert", 150)
+    flags = row.get("operational_flags") if isinstance(row.get("operational_flags"), list) else []
+    flag_text = ""
+    if flags:
+        flag_text = " | Hinweis: " + _truncate_sentence("; ".join(str(x) for x in flags[:2] if x), 120)
+    return f"- {filename}: {doc_type}; {summary}{flag_text}"
+
+
+def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any]) -> str:
+    model = _build_document_activity_model(payload, report)
+    context = model.get("context") if isinstance(model.get("context"), dict) else {}
+    route = _format_route_from_context(context)
+    history_delta = model.get("history_sync_count") or 0
+    total_mails = _read_email_index_count(report.get("case_root"))
+    history_status = "Mailhistorie Fehler" if model.get("history_sync_error") else f"Mail +{history_delta}"
+    if total_mails is not None:
+        history_status += f" / gesamt {total_mails}"
+    if model.get("last_email_at"):
+        history_status += f" / Stand {model.get('last_email_at')}"
+
+    lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
+    registry = _load_json_file(lifecycle.get("document_registry_path"))
+    latest_summary = {}
+    try:
+        case_root = Path(str(report.get("case_root") or ""))
+        candidate = case_root / "documents" / "analysis" / "latest_summary.json"
+        if candidate.exists():
+            latest_summary = _load_json_file(candidate)
+    except Exception:
+        latest_summary = {}
+    analyzed_docs = latest_summary.get("documents") if isinstance(latest_summary.get("documents"), list) else []
+    if not analyzed_docs and isinstance(registry.get("analyzed_documents"), list):
+        analyzed_docs = registry.get("analyzed_documents") or []
+
+    uploaded_name = str(model.get("filename") or "")
+    selected_docs: list[dict[str, Any]] = []
+    for row in analyzed_docs:
+        if isinstance(row, dict) and uploaded_name and str(row.get("filename") or "").strip().lower() == uploaded_name.strip().lower():
+            selected_docs.append(row)
+            break
+    for row in analyzed_docs:
+        if isinstance(row, dict) and row not in selected_docs:
+            selected_docs.append(row)
+        if len(selected_docs) >= 6:
+            break
+
+    findings = model.get("findings") if isinstance(model.get("findings"), list) else []
+    def _finding_rank(row: Any) -> tuple[int, str]:
+        text = _finding_text(row).lower()
+        if "weight" in text or "gewicht" in text:
+            return (0, text)
+        if any(token in text for token in ("menge", "quantity", "packstück", "pieces", "packages")):
+            return (1, text)
+        return (2, text)
+
+    major_findings = [row for row in findings if _is_weight_or_quantity_finding(row)]
+    if not major_findings:
+        major_findings = [row for row in findings if isinstance(row, dict) and str(row.get("severity") or "").lower() in {"medium", "high", "critical"}]
+    major_findings = sorted(major_findings, key=_finding_rank)[:5]
+
+    reconciliation = report.get("reconciliation") if isinstance(report.get("reconciliation"), dict) else {}
+    risk = str(reconciliation.get("risk") or "low")
+    needs_review = bool(reconciliation.get("needs_human_review"))
+
+    lines = [
+        "Ergebnis der Operator-Karte / Kurzfazit:",
+        "",
+        f"{model['order_id']} | Dokument hochgeladen | Priorität {_priority_label(model.get('priority'))}",
+        f"Dokument: {_truncate(model.get('filename'), 90)} | {_doc_type_label(model.get('analysis_doc_type') or model.get('event_doc_type'))} | {model.get('result_label')}",
+        f"Kontext: {route} | {history_status} | lokal {model.get('received_documents')} Dok. / TMS {model.get('mirrored_tms_documents')} gespiegelt",
+        f"Nächster Schritt: {model.get('next_step')}",
+        "",
+        "Dokument erkannt:",
+        f"- Datei: {model.get('filename')}",
+        f"- Upload: {model.get('changed_at')} | {model.get('changed_by')} | {model.get('source')}",
+        f"- Typ: {_doc_type_label(model.get('analysis_doc_type') or model.get('event_doc_type'))} | Confidence: {model.get('confidence') or '-'}",
+    ]
+    if model.get("summary"):
+        lines.append(f"- Inhalt: {_truncate_sentence(model.get('summary'), 180)}")
+
+    lines.extend(["", "Analysierte Dokumente:"])
+    if selected_docs:
+        for row in selected_docs:
+            lines.append(_document_line_from_analysis(row))
+    else:
+        lines.append("- Keine belastbaren Dokument-Zusammenfassungen im lokalen Report gefunden.")
+
+    lines.extend([
+        "",
+        "Abgleich:",
+        f"- {history_status}",
+        f"- Lokal gespeichert: {model.get('received_documents')} Dokumente; TMS gespiegelt: {model.get('mirrored_tms_documents')}",
+    ])
+    for note in (model.get("consistency_notes") or [])[:2]:
+        lines.append(f"- {note}")
+    for match in (model.get("tms_matches") or [])[:2]:
+        if isinstance(match, dict):
+            basis = ", ".join(match.get("match_basis") or []) or "-"
+            lines.append(f"- TMS-Match: {match.get('filename') or match.get('label') or '-'} ({match.get('document_type') or '-'}) über {basis}")
+
+    lines.extend([
+        "",
+        "Bewertung:",
+        f"- Risiko: {risk}",
+        f"- Human Review: {'true' if needs_review else 'false'}",
+        f"- Findings: {len(findings)}",
+    ])
+    if major_findings:
+        lines.append(f"- Haupt-Hinweis: {_truncate_sentence(_finding_text(major_findings[0]), 180)}")
+        for row in major_findings[1:4]:
+            lines.append(f"- Weiterer Hinweis: {_truncate_sentence(_finding_text(row), 180)}")
+    elif model.get("next_step"):
+        lines.append(f"- Haupt-Hinweis: {model.get('next_step')}")
+
+    lines.extend([
+        "",
+        "Sicherheitslogik:",
+        "- Fehlende Dokumente allein eskalieren nicht.",
+        "- Priorität entsteht nur aus echten Widersprüchen, neuen kritischen Uploads oder Analysefehlern.",
+    ])
+    return "\n".join(lines)
+
+
 def _build_document_activity_model(payload: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
     result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}
     event = payload.get("activity_event") if isinstance(payload.get("activity_event"), dict) else {}
@@ -248,8 +511,7 @@ def _build_document_activity_model(payload: dict[str, Any], report: dict[str, An
         tone = "warn"
     elif findings or risk in {"medium", "high", "critical"} or reconciliation.get("needs_human_review"):
         result_label = "Auffälligkeit erkannt"
-        first_finding = findings[0] if findings and isinstance(findings[0], dict) else {}
-        next_step = str(first_finding.get("summary") or "Dokument/TMS-Abgleich fachlich prüfen.")
+        next_step = _pick_document_next_step(findings)
         tone = "danger" if risk in {"high", "critical"} else "warn"
     else:
         result_label = "plausibel / keine Auffälligkeit"
@@ -422,15 +684,7 @@ def _build_summary_message(run_type: str, payload: dict[str, Any]) -> str:
     if run_type == "document_activity_monitor":
         result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}
         report = _load_json_file(result.get("document_monitoring_report_path") or result.get("case_report_path"))
-        model = _build_document_activity_model(payload, report)
-        history = "Mailhistorie Fehler" if model.get("history_sync_error") else f"Mail +{model.get('history_sync_count') or 0}"
-        route = _format_route_from_context(model.get("context") or {})
-        return "\n".join([
-            f"{model['order_id']} | Dokument hochgeladen | Priorität {_priority_label(model.get('priority'))}",
-            f"Dokument: {_truncate(model.get('filename'), 90)} | {_doc_type_label(model.get('analysis_doc_type') or model.get('event_doc_type'))} | {model.get('result_label')}",
-            f"Kontext: {route} | {history} | lokal {model.get('received_documents')} Dok. / TMS {model.get('mirrored_tms_documents')} gespiegelt",
-            f"Nächster Schritt: {model.get('next_step')}",
-        ])
+        return _build_document_activity_text(payload, report)
     result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}
     order_id = result.get("order_id") or payload.get("order_id") or "-"
     status = str(result.get("status") or payload.get("status") or run_type).strip()
@@ -860,6 +1114,7 @@ def build_manual_ops_notification_body(
     message = _build_message(run_type, payload)
     message_text = _build_summary_message(run_type, payload)
     return {
+        "event_type": "cargolo_asr_manual_ops_notification",
         "route": route_name,
         "delivery_id": delivery_id or f"manual-{run_type}-{int(time.time() * 1000)}",
         "delivered_at": delivered_at if delivered_at is not None else time.time(),
@@ -898,16 +1153,23 @@ def send_manual_ops_notification(
     delivered = 0
     errors: list[str] = []
     target_urls: list[str] = []
+    delivery_targets: list[str] = []
     for target in targets:
         url = str(target.get("url") or "").strip()
         if not url:
             continue
         target_urls.append(url)
+        delivery_targets.append(str(target.get("source") or url))
         method = str(target.get("method") or "POST").strip().upper() or "POST"
         headers = dict(target.get("headers") or {})
         headers.setdefault("Content-Type", "application/json")
         try:
-            response = requests.request(method, url, json=body, headers=headers, timeout=timeout)
+            request_body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            secret = str(target.get("secret") or "").strip()
+            if secret:
+                signature = hmac.new(secret.encode("utf-8"), request_body, hashlib.sha256).hexdigest()
+                headers.setdefault("X-Hub-Signature-256", f"sha256={signature}")
+            response = requests.request(method, url, data=request_body, headers=headers, timeout=timeout)
             response.raise_for_status()
             delivered += 1
         except Exception as exc:
@@ -920,5 +1182,5 @@ def send_manual_ops_notification(
         "attempted": len(target_urls),
         "delivered": delivered,
         "errors": errors,
-        "targets": target_urls,
+        "targets": delivery_targets or target_urls,
     }
