@@ -1042,4 +1042,30 @@ class WebhookAdapter(BasePlatformAdapter):
         if thread_id:
             metadata = {"thread_id": thread_id}
 
-        return await adapter.send(chat_id, content, metadata=metadata)
+        card_context = None
+        if platform_name == "teams" and str(delivery.get("route_name") or "") == "cargolo-asr-ops-teams":
+            try:
+                from plugins.cargolo_ops.teams_reply_loop import build_card_context
+
+                card_context = build_card_context(
+                    route_name=str(delivery.get("route_name") or ""),
+                    delivery_id=str(delivery.get("delivery_id") or ""),
+                    payload=delivery.get("payload") if isinstance(delivery.get("payload"), dict) else {},
+                    chat_id=str(chat_id),
+                )
+                context_id = str(card_context.get("context_id") or "").strip()
+                if context_id and f"ASRCTX:{context_id}" not in content:
+                    content = f"{content}\n\nKontext: ASRCTX:{context_id}"
+            except Exception as exc:
+                logger.warning("[webhook] could not build CARGOLO Teams card context marker: %s", exc)
+
+        result = await adapter.send(chat_id, content, metadata=metadata)
+        if result.success and card_context:
+            try:
+                from plugins.cargolo_ops.teams_reply_loop import record_sent_card
+
+                card_context["message_id"] = getattr(result, "message_id", None)
+                record_sent_card(context=card_context)
+            except Exception as exc:
+                logger.warning("[webhook] could not record CARGOLO Teams card context: %s", exc)
+        return result

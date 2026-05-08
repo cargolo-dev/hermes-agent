@@ -343,6 +343,8 @@ class TeamsAdapter(BasePlatformAdapter):
             import re
             text = re.sub(r"<at>[^<]*</at>\s*", "", text).strip()
 
+        reply_to_message_id = self._extract_reply_to_message_id(activity)
+
         # Determine chat type from conversation
         conv = activity.conversation
         conv_type = getattr(conv, "conversation_type", None) or ""
@@ -369,6 +371,62 @@ class TeamsAdapter(BasePlatformAdapter):
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
         )
 
+        # CARGOLO ASR Teams reply loop: replies to operator cards are
+        # deterministic case-learning/control events, not generic chat.
+        try:
+            from plugins.cargolo_ops.teams_reply_loop import handle_teams_message
+
+            reply_result = handle_teams_message(
+                text=text,
+                chat_id=str(conv.id),
+                user_id=str(user_id),
+                user_name=user_name,
+                message_id=str(msg_id) if msg_id else None,
+                reply_to_message_id=str(reply_to_message_id) if reply_to_message_id else None,
+            )
+            asr_agent_prompt = None
+            if reply_result.get("handled"):
+                await self.send(str(conv.id), str(reply_result.get("response_text") or "Gespeichert."), reply_to=str(msg_id) if msg_id else None)
+                return
+            if reply_result.get("allow_generic_chat") and reply_result.get("agent_prompt"):
+                asr_agent_prompt = str(reply_result.get("agent_prompt"))
+                text = asr_agent_prompt
+            else:
+                from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message
+
+                ops_result = route_teams_ops_message(
+                    text=text,
+                    chat_id=str(conv.id),
+                    user_id=str(user_id),
+                    user_name=user_name,
+                    message_id=str(msg_id) if msg_id else None,
+                )
+                if ops_result.get("handled"):
+                    await self.send(str(conv.id), str(ops_result.get("response_text") or "Gespeichert."), reply_to=str(msg_id) if msg_id else None)
+                    for pending_action in ops_result.get("teams_tms_review_cards") or []:
+                        if isinstance(pending_action, dict):
+                            await self.send_cargolo_asr_tms_review_card(str(conv.id), pending_action, reply_to=str(msg_id) if msg_id else None)
+                    return
+                if ops_result.get("allow_generic_chat") and ops_result.get("agent_prompt"):
+                    asr_agent_prompt = str(ops_result.get("agent_prompt"))
+                    text = asr_agent_prompt
+                elif self._looks_like_cargolo_asr_control_message(text):
+                    await self.send(
+                        str(conv.id),
+                        "Ich erkenne eine CARGOLO-ASR/TMS-Anweisung, kann sie aber nicht eindeutig einer Operator-Karte zuordnen. Bitte auf die konkrete ASR-Karte antworten/quote-reply und @Hermes CARGOLO erwähnen; ich lege TMS-Änderungen dann nur als Review-Vorschlag ab.",
+                        reply_to=str(msg_id) if msg_id else None,
+                    )
+                    return
+        except Exception as e:
+            logger.warning("[teams] CARGOLO ASR reply loop failed; suppressing generic chat fallback for safety: %s", e)
+            if self._looks_like_cargolo_asr_control_message(text):
+                await self.send(
+                    str(conv.id),
+                    "Ich konnte die CARGOLO-ASR-Anweisung gerade nicht sicher verarbeiten. Bitte nicht erneut als freie Chat-Anweisung senden; ich prüfe den Fehler, damit nichts ungeprüft ins TMS geschrieben wird.",
+                    reply_to=str(msg_id) if msg_id else None,
+                )
+                return
+
         # Handle image attachments
         media_urls = []
         media_types = []
@@ -393,8 +451,54 @@ class TeamsAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             message_id=msg_id,
+            reply_to_message_id=reply_to_message_id,
         )
         await self.handle_message(event)
+
+    @staticmethod
+    def _looks_like_cargolo_asr_control_message(text: str) -> bool:
+        """Detect ASR/TMS control messages that must not fall through to generic AI chat."""
+        raw = str(text or "")
+        if not raw.strip():
+            return False
+        has_case_ref = bool(re.search(r"(?:AN|BU)-\d{3,}|ASRCTX:", raw, re.IGNORECASE))
+        has_control_verb = bool(re.search(
+            r"\b(TMS|MRN|HBL|MBL|HAWB|Zollreferenz|eintragen|setzen|aktualisieren|ändern|aendern)\b",
+            raw,
+            re.IGNORECASE,
+        ))
+        return has_case_ref and has_control_verb
+
+    def _extract_reply_to_message_id(self, activity: Any) -> str | None:
+        """Best-effort extraction of the Teams message being replied to."""
+        def _coerce(value: Any) -> str | None:
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value)
+            return None
+
+        def _search_mapping(data: Any) -> str | None:
+            if not isinstance(data, dict):
+                return None
+            for key in ("replyToId", "reply_to_id", "ReplyToId", "replyToMessageId", "replyToActivityId", "parentMessageId"):
+                value = _coerce(data.get(key))
+                if value:
+                    return value
+            for key in ("message", "replyTo", "reply_to", "source", "context", "channelData"):
+                nested = data.get(key)
+                value = _search_mapping(nested)
+                if value:
+                    return value
+            return None
+
+        for attr in ("reply_to_id", "replyToId", "reply_to_message_id"):
+            value = _coerce(getattr(activity, attr, None))
+            if value:
+                return value
+        channel_data = getattr(activity, "channel_data", None) or getattr(activity, "channelData", None)
+        value = _search_mapping(channel_data)
+        if value:
+            return value
+        return None
 
     async def _send_card(self, chat_id: str, card: "AdaptiveCard") -> "Any":
         """Send an AdaptiveCard, using a stored ConversationReference when available."""
@@ -408,6 +512,83 @@ class TeamsAdapter(BasePlatformAdapter):
             return await self._app.send(chat_id, card)
         return None
 
+    def _authorize_card_action_click(self, ctx: Any) -> tuple[bool, str | None, str | None, Any | None]:
+        """Default-deny Teams Adaptive Card clicks unless explicitly allowed."""
+        allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
+        allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in ("1", "true", "yes")
+        from_account = ctx.activity.from_
+        clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
+        clicker_name = getattr(from_account, "name", None) or ""
+        if allow_all:
+            return True, str(clicker_id), str(clicker_name), None
+        if not allowed_csv:
+            logger.warning(
+                "[teams] card action rejected: TEAMS_ALLOWED_USERS not configured "
+                "and TEAMS_ALLOW_ALL_USERS not set — default deny"
+            )
+            return False, str(clicker_id), str(clicker_name), AdaptiveCardActionMessageResponse(
+                value="⛔ Approval buttons require TEAMS_ALLOWED_USERS to be configured."
+            )
+        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+        if "*" not in allowed_ids and str(clicker_id) not in allowed_ids:
+            logger.warning("[teams] Unauthorized card action by %s — ignoring", clicker_id)
+            return False, str(clicker_id), str(clicker_name), AdaptiveCardActionMessageResponse(value="⛔ Not authorized.")
+        return True, str(clicker_id), str(clicker_name), None
+
+    async def send_cargolo_asr_tms_review_card(
+        self,
+        chat_id: str,
+        pending_action: dict[str, Any],
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Send a CARGOLO ASR pending TMS update review card with approve/reject buttons."""
+        if not self._app:
+            return SendResult(success=False, error="Teams app not initialized")
+        order_id = str(pending_action.get("order_id") or "AN/BU?")
+        target = str(pending_action.get("target") or "Feld?")
+        value = str(pending_action.get("value") or "Wert?")
+        operator = str(pending_action.get("operator") or "unbekannt")
+        action_id = str(pending_action.get("action_id") or "")
+        context_id = str(pending_action.get("context_id") or "")
+        data_base = {
+            "order_id": order_id,
+            "action_id": action_id,
+            "target": target,
+            "value": value,
+            "context_id": context_id,
+        }
+        card = (
+            AdaptiveCard()
+            .with_version("1.4")
+            .with_body([
+                TextBlock(text=f"CARGOLO ASR · TMS-Freigabe {order_id}", wrap=True, weight="Bolder"),
+                TextBlock(text=f"Vorschlag: {target} = {value}", wrap=True),
+                TextBlock(text=f"Quelle: {operator} · Status: pending_review", wrap=True, isSubtle=True),
+                TextBlock(text="Bitte prüfen: ✅ schreibt nach Live-Writeback + frischer Verifikation ins TMS; ❌ lehnt ohne TMS-Write ab.", wrap=True),
+            ])
+            .with_actions([
+                ExecuteAction(
+                    title="✅ Bestätigen & TMS schreiben",
+                    verb="cargolo_asr_tms_approve",
+                    data={**data_base, "hermes_action": "cargolo_asr_tms_approve"},
+                    style="positive",
+                ),
+                ExecuteAction(
+                    title="❌ Ablehnen",
+                    verb="cargolo_asr_tms_reject",
+                    data={**data_base, "hermes_action": "cargolo_asr_tms_reject"},
+                    style="destructive",
+                ),
+            ])
+        )
+        try:
+            result = await self._send_card(chat_id, card)
+            message_id = getattr(result, "id", None) if result else None
+            return SendResult(success=True, message_id=message_id)
+        except Exception as e:
+            logger.error("[teams] send_cargolo_asr_tms_review_card failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e), retryable=True)
+
     async def _on_card_action(
         self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
     ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
@@ -419,41 +600,34 @@ class TeamsAdapter(BasePlatformAdapter):
         hermes_action = data.get("hermes_action", "")
         session_key = data.get("session_key", "")
 
+        if str(hermes_action or "").startswith("cargolo_asr_tms_"):
+            allowed, clicker_id, clicker_name, deny_body = self._authorize_card_action_click(ctx)
+            if not allowed:
+                return InvokeResponse(status=200, body=deny_body)
+            try:
+                from plugins.cargolo_ops.teams_reply_loop import process_teams_tms_card_action
+
+                result = process_teams_tms_card_action(
+                    data=data,
+                    user_id=clicker_id,
+                    user_name=clicker_name,
+                )
+                return InvokeResponse(
+                    status=200,
+                    body=AdaptiveCardActionMessageResponse(value=str(result.get("response_text") or "Gespeichert.")),
+                )
+            except Exception as exc:
+                logger.error("[teams] CARGOLO ASR card action failed: %s", exc, exc_info=True)
+                return InvokeResponse(
+                    status=200,
+                    body=AdaptiveCardActionMessageResponse(value="⚠️ CARGOLO ASR Aktion konnte nicht sicher verarbeitet werden; nichts wurde als erfolgreich markiert."),
+                )
+
         if not hermes_action or not session_key:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
-
-        # Only authorized users may click approval buttons.
-        # Default-deny: require either TEAMS_ALLOWED_USERS or an explicit
-        # TEAMS_ALLOW_ALL_USERS=true opt-in. Without one of these set, the
-        # bot silently treated every clicker as authorized — meaning any
-        # Teams user who could message the bot could approve dangerous commands.
-        allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
-        allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in ("1", "true", "yes")
-
-        if not allow_all:
-            if not allowed_csv:
-                logger.warning(
-                    "[teams] card action rejected: TEAMS_ALLOWED_USERS not configured "
-                    "and TEAMS_ALLOW_ALL_USERS not set — default deny"
-                )
-                return InvokeResponse(
-                    status=200,
-                    body=AdaptiveCardActionMessageResponse(
-                        value="⛔ Approval buttons require TEAMS_ALLOWED_USERS to be configured."
-                    ),
-                )
-            from_account = ctx.activity.from_
-            clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            if "*" not in allowed_ids and clicker_id not in allowed_ids:
-                logger.warning("[teams] Unauthorized card action by %s — ignoring", clicker_id)
-                return InvokeResponse(
-                    status=200,
-                    body=AdaptiveCardActionMessageResponse(value="⛔ Not authorized."),
-                )
 
         choice_map = {
             "approve_once": "once",

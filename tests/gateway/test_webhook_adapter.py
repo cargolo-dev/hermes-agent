@@ -759,6 +759,36 @@ class TestDeliverCrossPlatformThreadId:
             "12345", "hello", metadata=None
         )
 
+    @pytest.mark.asyncio
+    async def test_cargolo_teams_delivery_appends_context_marker_and_records_index(self, tmp_path, monkeypatch):
+        """CARGOLO native Teams cards carry a compact context marker for deterministic replies."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        adapter = _make_adapter()
+        mock_target = AsyncMock()
+        mock_target.send = AsyncMock(return_value=SendResult(success=True, message_id="teams-msg-777"))
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform("teams"): mock_target}
+        mock_runner.config.get_home_channel.return_value = None
+        adapter.gateway_runner = mock_runner
+        delivery = {
+            "route_name": "cargolo-asr-ops-teams",
+            "delivery_id": "delivery-marker",
+            "deliver_extra": {"chat_id": "teams-chat-1"},
+            "payload": {
+                "processor_result": {"order_id": "AN-11755"},
+                "activity_event": {"id": 1203},
+            },
+        }
+
+        result = await adapter._deliver_cross_platform("teams", "Operator card", delivery)
+
+        assert result.success is True
+        sent_content = mock_target.send.await_args.args[1]
+        assert "ASRCTX:AN-11755:1203:delivery-marker" in sent_content
+        index_path = tmp_path / ".hermes" / "cargolo_asr" / "runtime" / "teams_card_index.json"
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        assert index["by_message_id"]["teams-msg-777"]["context_id"] == "AN-11755:1203:delivery-marker"
+
 
 class TestInsecureNoAuthSafetyRail:
     """connect() refuses to start when INSECURE_NO_AUTH is combined with a

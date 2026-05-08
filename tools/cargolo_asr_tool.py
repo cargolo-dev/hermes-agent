@@ -19,6 +19,7 @@ from plugins.cargolo_ops.processor import bootstrap_case, bootstrap_cases_from_t
 from plugins.cargolo_ops.reporting import generate_daily_report
 from plugins.cargolo_ops.tms_provider import build_tms_provider_from_env
 from plugins.cargolo_ops.ops_notifications import send_manual_ops_notification
+from plugins.cargolo_ops.teams_reply_loop import record_agent_tms_update_intent
 from plugins.cargolo_ops.writeback_actions import apply_pending_tms_action, DEFAULT_ADMIN_USER_ID
 from plugins.cargolo_ops.writeback_executor import run_writeback_executor
 from plugins.cargolo_ops.document_activity_monitor import run_document_activity_monitor
@@ -215,6 +216,30 @@ TMS_WRITEBACK_SCHEMA = {
             "admin_user_id": {"type": "integer", "description": "Admin user ID for MCP write actions. Default 106."},
         },
         "required": [],
+    },
+}
+
+
+TMS_AGENT_INTENT_SCHEMA = {
+    "name": "cargolo_asr_record_teams_tms_intent",
+    "description": (
+        "Record an intelligent agent decision that a Teams reply is a CARGOLO ASR TMS change intent. "
+        "This ONLY queues pending_review in the local case; it never writes to TMS. Use instead of direct TMS writes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "order_id": {"type": "string", "description": "Shipment/order number like AN-11755 or BU-4664."},
+            "target": {"type": "string", "description": "customs_reference | hbl_number | mbl_number | hawb_number"},
+            "value": {"type": "string", "description": "Requested field value exactly as the operator intended."},
+            "text": {"type": "string", "description": "Short reason / relevant operator message."},
+            "context_id": {"type": "string", "description": "ASRCTX/context id from the card, if known."},
+            "source_message_id": {"type": "string", "description": "Teams reply message id, if known."},
+            "operator": {"type": "string", "description": "Operator/user name, if known."},
+            "confidence": {"type": "string", "description": "Agent confidence label. Default agent_decided."},
+            "storage_root": {"type": "string", "description": "Optional ASR case root override."},
+        },
+        "required": ["order_id", "target", "value"],
     },
 }
 
@@ -456,6 +481,25 @@ def cargolo_asr_tms_writeback_tool(args: dict[str, Any], **_: Any) -> str:
         return tool_error(str(exc))
 
 
+def cargolo_asr_record_teams_tms_intent_tool(args: dict[str, Any], **_: Any) -> str:
+    try:
+        root = _resolve_root(args.get("storage_root"))
+        result = record_agent_tms_update_intent(
+            root=root,
+            order_id=str(args.get("order_id") or ""),
+            target=str(args.get("target") or ""),
+            value=str(args.get("value") or ""),
+            text=str(args.get("text") or ""),
+            operator=args.get("operator"),
+            source_message_id=args.get("source_message_id"),
+            context_id=args.get("context_id"),
+            confidence=str(args.get("confidence") or "agent_decided"),
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return tool_error(str(exc))
+
+
 def cargolo_asr_document_activity_monitor_tool(args: dict[str, Any], **_: Any) -> str:
     try:
         root = _resolve_root(args.get("storage_root"))
@@ -617,6 +661,15 @@ registry.register(
     handler=cargolo_asr_tms_writeback_tool,
     description="Execute or dry-run pending ASR TMS writeback actions through the MCP write tools.",
     emoji="🛠️",
+)
+
+registry.register(
+    name="cargolo_asr_record_teams_tms_intent",
+    toolset="business_ops",
+    schema=TMS_AGENT_INTENT_SCHEMA,
+    handler=cargolo_asr_record_teams_tms_intent_tool,
+    description="Queue an agent-decided Teams TMS update intent as pending review without writing to TMS.",
+    emoji="🧠",
 )
 
 registry.register(

@@ -224,7 +224,7 @@ class TestTeamsRequirements:
         monkeypatch.delenv("TEAMS_CLIENT_ID", raising=False)
         monkeypatch.delenv("TEAMS_CLIENT_SECRET", raising=False)
         monkeypatch.delenv("TEAMS_TENANT_ID", raising=False)
-        cfg = _make_config(client_id="id", client_secret="secret", tenant_id="tenant")
+        cfg = _make_config(client_id="id", client_secret="x", tenant_id="tenant")
         assert validate_config(cfg) is True
 
     def test_validate_config_missing(self, monkeypatch):
@@ -266,20 +266,20 @@ class TestTeamsAdapterInit:
         assert adapter._tenant_id == "env-tenant"
 
     def test_default_port(self):
-        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="secret", tenant_id="tenant"))
+        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
         assert adapter._port == 3978
 
     def test_custom_port_from_extra(self):
-        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="secret", tenant_id="tenant", port=4000))
+        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant", port=4000))
         assert adapter._port == 4000
 
     def test_custom_port_from_env(self, monkeypatch):
         monkeypatch.setenv("TEAMS_PORT", "5000")
-        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="secret", tenant_id="tenant"))
+        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
         assert adapter._port == 5000
 
     def test_platform_value(self):
-        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="secret", tenant_id="tenant"))
+        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
         assert adapter.platform.value == "teams"
 
 
@@ -359,7 +359,7 @@ class TestTeamsConnect:
     async def test_connect_fails_without_sdk(self, monkeypatch):
         monkeypatch.setattr(_teams_mod, "TEAMS_SDK_AVAILABLE", False)
         adapter = TeamsAdapter(_make_config(
-            client_id="id", client_secret="secret", tenant_id="tenant",
+            client_id="id", client_secret="x", tenant_id="tenant",
         ))
         result = await adapter.connect()
         assert result is False
@@ -376,7 +376,7 @@ class TestTeamsConnect:
     @pytest.mark.asyncio
     async def test_disconnect_cleans_up(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="id", client_secret="secret", tenant_id="tenant",
+            client_id="id", client_secret="x", tenant_id="tenant",
         ))
         adapter._running = True
         mock_runner = AsyncMock()
@@ -398,7 +398,7 @@ class TestTeamsSend:
     @pytest.mark.asyncio
     async def test_send_returns_error_without_app(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="id", client_secret="secret", tenant_id="tenant",
+            client_id="id", client_secret="x", tenant_id="tenant",
         ))
         adapter._app = None
         result = await adapter.send("conv-id", "Hello")
@@ -408,7 +408,7 @@ class TestTeamsSend:
     @pytest.mark.asyncio
     async def test_send_calls_app_send(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="id", client_secret="secret", tenant_id="tenant",
+            client_id="id", client_secret="x", tenant_id="tenant",
         ))
         mock_result = MagicMock()
         mock_result.id = "msg-123"
@@ -424,7 +424,7 @@ class TestTeamsSend:
     @pytest.mark.asyncio
     async def test_send_preserves_plain_text_line_breaks_for_teams(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="id", client_secret="secret", tenant_id="tenant",
+            client_id="id", client_secret="x", tenant_id="tenant",
         ))
         mock_result = MagicMock()
         mock_result.id = "msg-123"
@@ -439,7 +439,7 @@ class TestTeamsSend:
     @pytest.mark.asyncio
     async def test_send_keeps_explicit_html_payloads(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="id", client_secret="secret", tenant_id="tenant",
+            client_id="id", client_secret="x", tenant_id="tenant",
         ))
         mock_result = MagicMock()
         mock_result.id = "msg-123"
@@ -454,7 +454,7 @@ class TestTeamsSend:
     @pytest.mark.asyncio
     async def test_send_handles_error(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="id", client_secret="secret", tenant_id="tenant",
+            client_id="id", client_secret="x", tenant_id="tenant",
         ))
         mock_app = MagicMock()
         mock_app.send = AsyncMock(side_effect=Exception("Network error"))
@@ -467,7 +467,7 @@ class TestTeamsSend:
     @pytest.mark.asyncio
     async def test_send_typing(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="id", client_secret="secret", tenant_id="tenant",
+            client_id="id", client_secret="x", tenant_id="tenant",
         ))
         mock_app = MagicMock()
         mock_app.send = AsyncMock()
@@ -496,6 +496,8 @@ class TestTeamsMessageHandling:
         tenant_id="tenant-789",
         activity_id="activity-001",
         attachments=None,
+        reply_to_id=None,
+        channel_data=None,
     ):
         activity = MagicMock()
         activity.text = text
@@ -510,6 +512,10 @@ class TestTeamsMessageHandling:
         activity.conversation.name = "Test Chat"
         activity.conversation.tenant_id = tenant_id
         activity.attachments = attachments or []
+        if channel_data is not None:
+            activity.channel_data = channel_data
+        if reply_to_id is not None:
+            activity.reply_to_id = reply_to_id
         return activity
 
     def _make_ctx(self, activity):
@@ -520,7 +526,7 @@ class TestTeamsMessageHandling:
     @pytest.mark.asyncio
     async def test_personal_message_creates_dm_event(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
         ))
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
@@ -536,7 +542,7 @@ class TestTeamsMessageHandling:
     @pytest.mark.asyncio
     async def test_group_message_creates_group_event(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
         ))
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
@@ -551,7 +557,7 @@ class TestTeamsMessageHandling:
     @pytest.mark.asyncio
     async def test_channel_message_creates_channel_event(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
         ))
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
@@ -566,7 +572,7 @@ class TestTeamsMessageHandling:
     @pytest.mark.asyncio
     async def test_user_id_uses_aad_object_id(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
         ))
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
@@ -581,7 +587,7 @@ class TestTeamsMessageHandling:
     @pytest.mark.asyncio
     async def test_self_message_filtered(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
         ))
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
@@ -595,7 +601,7 @@ class TestTeamsMessageHandling:
     @pytest.mark.asyncio
     async def test_bot_mention_stripped_from_text(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
         ))
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
@@ -611,9 +617,217 @@ class TestTeamsMessageHandling:
         assert event.text == "what is the weather?"
 
     @pytest.mark.asyncio
+    async def test_nested_channel_data_reply_id_is_forwarded_to_message_event(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="Antwort auf Karte",
+            channel_data={"message": {"replyToId": "teams-card-nested"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.reply_to_message_id == "teams-card-nested"
+
+    @pytest.mark.asyncio
+    async def test_cargolo_reply_loop_routes_tms_language_to_agent_decision(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from plugins.cargolo_ops.teams_reply_loop import build_card_context, record_sent_card
+
+        record_sent_card(
+            context=build_card_context(
+                route_name="cargolo-asr-ops-teams",
+                delivery_id="delivery-1",
+                payload={"processor_result": {"order_id": "AN-11755"}, "activity_event": {"id": 1200}},
+                message_id="teams-card-1",
+                chat_id="19:abc@thread.v2",
+            )
+        )
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "ack-1"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="Ja bitte TMS MRN 26DE123 aktualisieren",
+            activity_id="reply-activity-1",
+            reply_to_id="teams-card-1",
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert "AN-11755" in event.text
+        assert "cargolo_asr_record_teams_tms_intent" in event.text
+        mock_app.send.assert_not_awaited()
+        assert (tmp_path / "cargolo_asr" / "orders" / "AN-11755" / "teams" / "replies.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_cargolo_ops_status_command_is_handled_before_generic_chat(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {"handled": False, "reason": "no_card_context"}
+
+        def fake_route_teams_ops_message(**kwargs):
+            return {
+                "handled": True,
+                "classification": "ops_status",
+                "response_text": "CARGOLO Teams Ops · Status\n- Dokumenten-Monitor: scheduled · last=ok",
+            }
+
+        monkeypatch.setattr(
+            "plugins.cargolo_ops.teams_reply_loop.handle_teams_message",
+            fake_handle_teams_message,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "plugins.cargolo_ops.teams_ops_router.route_teams_ops_message",
+            fake_route_teams_ops_message,
+            raising=False,
+        )
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "ops-status-ack"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(text="<at>Hermes CARGOLO</at> status", activity_id="msg-ops-status")
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert "CARGOLO Teams Ops" in mock_app.send.call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_cargolo_ops_case_command_flows_to_employee_agent_prompt(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {"handled": False, "reason": "no_card_context"}
+
+        def fake_route_teams_ops_message(**kwargs):
+            return {
+                "handled": False,
+                "allow_generic_chat": True,
+                "classification": "case_deep_dive_request",
+                "agent_prompt": "Rolle: ASR Ops Coordinator\nTeams-Nachricht: prüfe AN-12345 komplett",
+            }
+
+        monkeypatch.setattr(
+            "plugins.cargolo_ops.teams_reply_loop.handle_teams_message",
+            fake_handle_teams_message,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "plugins.cargolo_ops.teams_ops_router.route_teams_ops_message",
+            fake_route_teams_ops_message,
+            raising=False,
+        )
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
+        ))
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock()
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(text="<at>Hermes CARGOLO</at> prüfe AN-12345 komplett", activity_id="msg-case-check")
+        await adapter._on_message(self._make_ctx(activity))
+
+        mock_app.send.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text.startswith("Rolle: ASR Ops Coordinator")
+        assert "AN-12345" in event.text
+
+    @pytest.mark.asyncio
+    async def test_cargolo_asr_tms_request_without_context_is_guarded_from_generic_chat(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {"handled": False, "reason": "no_context"}
+
+        monkeypatch.setattr(
+            "plugins.cargolo_ops.teams_reply_loop.handle_teams_message",
+            fake_handle_teams_message,
+            raising=False,
+        )
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "guard-ack"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="<at>Hermes CARGOLO</at> Bitte TMS MRN 26DE99999 eintragen für AN-11755",
+            activity_id="msg-guard",
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert "nicht eindeutig" in mock_app.send.call_args[0][1]
+
+
+    @pytest.mark.asyncio
+    async def test_cargolo_context_note_flows_to_generic_agent_prompt(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {
+                "handled": False,
+                "allow_generic_chat": True,
+                "asr_context_saved": True,
+                "agent_prompt": "ASR agent prompt for BU-4664: antworte intelligent, kein TMS-Write.",
+            }
+
+        monkeypatch.setattr(
+            "plugins.cargolo_ops.teams_reply_loop.handle_teams_message",
+            fake_handle_teams_message,
+            raising=False,
+        )
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
+        ))
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock()
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="Display NameBU-4664 | TMS-Aktion: Review | MRN 26DE12345\nich bin kurz im termin",
+            activity_id="msg-asr-agent",
+            reply_to_id="teams-card-bu",
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        mock_app.send.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text.startswith("ASR agent prompt for BU-4664")
+        assert event.reply_to_message_id == "teams-card-bu"
+
+    @pytest.mark.asyncio
     async def test_deduplication(self):
         adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+            client_id="bot-id", client_secret="x", tenant_id="tenant",
         ))
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
@@ -626,3 +840,103 @@ class TestTeamsMessageHandling:
         await adapter._on_message(ctx)
 
         assert adapter.handle_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cargolo_asr_approve_button_routes_to_safe_handler(monkeypatch):
+    adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
+    monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-1")
+    calls = []
+
+    def fake_process(**kwargs):
+        calls.append(kwargs)
+        return {"handled": True, "status": "applied", "response_text": "✅ umgesetzt"}
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.process_teams_tms_card_action", fake_process)
+
+    ctx = MagicMock()
+    ctx.activity.value.action.data = {
+        "hermes_action": "cargolo_asr_tms_approve",
+        "order_id": "AN-11755",
+        "action_id": "abc123",
+        "target": "customs_reference",
+        "value": "26DE99999",
+    }
+    ctx.activity.from_.aad_object_id = "aad-1"
+    ctx.activity.from_.id = "teams-user-id"
+    ctx.activity.from_.name = "Dominik"
+
+    response = await adapter._on_card_action(ctx)
+
+    assert response.status == 200
+    assert calls
+    assert calls[0]["data"]["hermes_action"] == "cargolo_asr_tms_approve"
+    assert calls[0]["user_id"] == "aad-1"
+    assert calls[0]["user_name"] == "Dominik"
+
+
+@pytest.mark.asyncio
+async def test_cargolo_asr_button_default_denies_when_allowed_users_missing(monkeypatch):
+    adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
+    monkeypatch.delenv("TEAMS_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("TEAMS_ALLOW_ALL_USERS", raising=False)
+
+    def fake_process(**kwargs):
+        raise AssertionError("unauthorized button must not reach CARGOLO handler")
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.process_teams_tms_card_action", fake_process)
+
+    ctx = MagicMock()
+    ctx.activity.value.action.data = {
+        "hermes_action": "cargolo_asr_tms_reject",
+        "order_id": "AN-11755",
+        "action_id": "abc123",
+    }
+    ctx.activity.from_.aad_object_id = "aad-1"
+    ctx.activity.from_.id = "teams-user-id"
+    ctx.activity.from_.name = "Dominik"
+
+    response = await adapter._on_card_action(ctx)
+
+    assert response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_cargolo_ops_pending_command_sends_interactive_review_cards(monkeypatch):
+    def fake_handle_teams_message(**kwargs):
+        return {"handled": False, "reason": "no_card_context"}
+
+    def fake_route_teams_ops_message(**kwargs):
+        return {
+            "handled": True,
+            "classification": "pending_tms_reviews",
+            "response_text": "CARGOLO Teams Ops · Offene TMS-Freigaben",
+            "teams_tms_review_cards": [{
+                "action_id": "abc123",
+                "order_id": "AN-11755",
+                "target": "customs_reference",
+                "value": "26DE99999",
+                "operator": "Dominik",
+            }],
+        }
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
+    monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", fake_route_teams_ops_message, raising=False)
+    adapter = TeamsAdapter(_make_config(client_id="bot-id", client_secret="x", tenant_id="tenant"))
+    mock_result = MagicMock()
+    mock_result.id = "ops-pending-ack"
+    mock_app = MagicMock()
+    mock_app.id = "bot-id"
+    mock_app.send = AsyncMock(return_value=mock_result)
+    adapter._app = mock_app
+    adapter.handle_message = AsyncMock()
+    adapter.send_cargolo_asr_tms_review_card = AsyncMock(return_value=MagicMock(success=True))
+
+    helper = TestTeamsMessageHandling()
+    activity = helper._make_activity(text="<at>Hermes CARGOLO</at> offene Freigaben", activity_id="msg-pending")
+    await adapter._on_message(helper._make_ctx(activity))
+
+    adapter.handle_message.assert_not_awaited()
+    mock_app.send.assert_awaited_once()
+    adapter.send_cargolo_asr_tms_review_card.assert_awaited_once()
+    assert adapter.send_cargolo_asr_tms_review_card.call_args[0][1]["action_id"] == "abc123"
