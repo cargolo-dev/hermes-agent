@@ -422,6 +422,36 @@ class TestTeamsSend:
         mock_app.send.assert_awaited_once_with("conv-id", "Hello")
 
     @pytest.mark.asyncio
+    async def test_send_preserves_plain_text_line_breaks_for_teams(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "msg-123"
+        mock_app = MagicMock()
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+
+        result = await adapter.send("conv-id", "AN-1\n- Punkt <prüfen>")
+        assert result.success is True
+        mock_app.send.assert_awaited_once_with("conv-id", "AN-1<br>- Punkt &lt;prüfen&gt;")
+
+    @pytest.mark.asyncio
+    async def test_send_keeps_explicit_html_payloads(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "msg-123"
+        mock_app = MagicMock()
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+
+        result = await adapter.send("conv-id", "<b>AN-1</b><br>- Punkt")
+        assert result.success is True
+        mock_app.send.assert_awaited_once_with("conv-id", "<b>AN-1</b><br>- Punkt")
+
+    @pytest.mark.asyncio
     async def test_send_handles_error(self):
         adapter = TeamsAdapter(_make_config(
             client_id="id", client_secret="secret", tenant_id="tenant",

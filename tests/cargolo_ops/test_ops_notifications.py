@@ -155,20 +155,27 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
     )
 
     assert body["message_format"] == "html"
-    assert "Dokumenten-Upload" in body["message"]
-    assert "Dokument erkannt" in body["message"]
-    assert "Abgleich" in body["message"]
-    assert "Nächster Schritt" in body["message"]
-    assert "Konkrete Abweichung" in body["message"]
-    assert "Gesamtgewicht laut Dokument 123kg" in body["message"]
+    assert "Dokumenten-Upload geprüft" in body["message"]
+    assert "Kernpunkt" not in body["message"]  # no legacy long report section label
+    assert "Auffälligkeit" in body["message"]
+    assert "TMS:" in body["message"]
+    assert "Dokumente geprüft" in body["message"]
+    assert "Frage:" in body["message"]
+    assert "Vorschlag:" in body["message"]
+    assert "Gesamtgewicht laut Dokument 123kg" not in body["message"]
+    assert "123kg vs 500kg" in body["message"]
     assert "Handelsrechnung" in body["message"]
-    assert "AN-12505 · Dokument-Check" in body["message_text"]
-    assert "Ich sehe eine Gewichts-/Mengenabweichung" in body["message_text"]
-    assert "Frage an euch:" in body["message_text"]
+    assert "AN-12505" in body["message_text"]
+    assert "<div" in body["message_text"]
+    assert "Dokumenten-Upload geprüft" in body["message_text"]
+    assert "TMS:" in body["message_text"]
+    assert "Dokumente geprüft" in body["message_text"]
+    assert "Frage:" in body["message_text"]
     assert "Vorschlag:" in body["message_text"]
     assert "Mail +3" in body["message_text"]
     assert "123kg vs 500kg" in body["message_text"]
-    assert "Kontext:" in body["message_text"]
+    assert "Erkannte Dokumente:" not in body["message_text"]
+    assert len(body["message_text"]) < 2400
 
 
 def test_send_manual_ops_notification_uses_native_teams_gateway_route(tmp_path, monkeypatch):

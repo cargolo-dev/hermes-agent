@@ -23,9 +23,11 @@ Configuration in config.yaml:
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, Optional
 
 try:
@@ -210,6 +212,21 @@ class TeamsAdapter(BasePlatformAdapter):
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
         self._conv_refs: Dict[str, Any] = {}
+
+    def format_message(self, content: str) -> str:
+        """Format plain Hermes text so Teams keeps paragraph/list breaks.
+
+        The Teams SDK renders string sends as HTML-ish text.  Raw newlines are
+        collapsed by the client in some conversations, which made operational
+        CARGOLO cards appear as one long paragraph.  Escape plain text and turn
+        line breaks into <br> while leaving explicit HTML payloads untouched.
+        """
+        text = str(content or "")
+        lowered = text.lower()
+        if re.search(r"</?(?:br|p|div|ul|ol|li|pre|table|html|body|strong|b|em|i)(?:\s|/?>)", lowered):
+            return text
+        escaped = html.escape(text, quote=False)
+        return escaped.replace("\n", "<br>")
 
     async def connect(self) -> bool:
         if not TEAMS_SDK_AVAILABLE:

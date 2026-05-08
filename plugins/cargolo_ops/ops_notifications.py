@@ -394,6 +394,14 @@ def _document_line_from_analysis(row: dict[str, Any]) -> str:
 
 
 def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any]) -> str:
+    """Return the compact Teams-facing document-upload card.
+
+    The native Teams webhook route currently delivers ``message_text``.  For
+    Teams this is intentionally HTML, not a long plaintext audit block: the
+    adapter passes known HTML through unchanged, giving us stable line breaks,
+    emphasis, and compact visual grouping without requiring a separate Adaptive
+    Card delivery path for this operational alert.
+    """
     model = _build_document_activity_model(payload, report)
     context = model.get("context") if isinstance(model.get("context"), dict) else {}
     route = _format_route_from_context(context)
@@ -427,9 +435,14 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
             selected_docs.append(row)
             break
     for row in analyzed_docs:
+        if isinstance(row, dict) and row not in selected_docs and _deviation_notes_from_doc(row):
+            selected_docs.append(row)
+        if len(selected_docs) >= 3:
+            break
+    for row in analyzed_docs:
         if isinstance(row, dict) and row not in selected_docs:
             selected_docs.append(row)
-        if len(selected_docs) >= 6:
+        if len(selected_docs) >= 3:
             break
 
     findings = model.get("findings") if isinstance(model.get("findings"), list) else []
@@ -445,12 +458,12 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
     major_findings = [row for row in findings if _is_weight_or_quantity_finding(row)]
     if not major_findings:
         major_findings = [row for row in findings if isinstance(row, dict) and str(row.get("severity") or "").lower() in {"medium", "high", "critical"}]
-    major_findings = sorted(major_findings, key=_finding_rank)[:5]
+    major_findings = sorted(major_findings, key=_finding_rank)[:4]
 
     concrete_deviations: list[str] = []
     for row in selected_docs:
         if isinstance(row, dict):
-            filename = _truncate(str(row.get("filename") or "Dokument"), 46)
+            filename = _truncate(str(row.get("filename") or "Dokument"), 38)
             for note in _deviation_notes_from_doc(row):
                 line = f"{filename}: {note}"
                 if line not in concrete_deviations:
@@ -459,18 +472,8 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
         for row in major_findings:
             text = _finding_text(row)
             lower = text.lower()
-            if any(token in lower for token in ("abweich", " vs ", "kg", "gewicht")) and text not in concrete_deviations:
+            if any(token in lower for token in ("abweich", " vs ", "kg", "gewicht", "discrep")) and text not in concrete_deviations:
                 concrete_deviations.append(text)
-
-    main_deviation = concrete_deviations[0] if concrete_deviations else _finding_text(major_findings[0]) if major_findings else "Keine konkrete Abweichung erkannt."
-    extra_deviations = [x for x in concrete_deviations[1:4] if x != main_deviation]
-    result_label = str(model.get("result_label") or "geprüft")
-    doc_type = _doc_type_label(model.get("analysis_doc_type") or model.get("event_doc_type"))
-
-    question = "Ist der TMS-Wert korrekt oder sind die Dokumente Teil-/Vorversionen?"
-    if any("pack" in x.lower() or "carton" in x.lower() for x in concrete_deviations):
-        question = "Welche Werte sollen führend sein: TMS-Stammdaten oder Dokumentwerte?"
-    suggestion = "Wenn die Dokumentwerte stimmen, bereite ich die TMS-Korrektur für Gewicht/Packstücke vor."
 
     def _compact_deviation_item(item: str) -> str:
         text = str(item or "").strip()
@@ -478,19 +481,18 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
         prefix = filename if note else ""
         body = note or text
         weights = re.findall(r"\d+(?:[,.]\d+)?\s*kg", body, flags=re.IGNORECASE)
-        packages = re.findall(r"\d+\s*(?:Cartons?|Packages?|Packstücke|Packstuecke)", body, flags=re.IGNORECASE)
+        packages = re.findall(r"\d+\s*(?:Cartons?|Packages?|Packstücke|Packstuecke|Paletten)", body, flags=re.IGNORECASE)
         if len(weights) >= 2:
             compact = f"{weights[0]} vs {weights[-1]}"
         elif len(packages) >= 2:
             compact = f"{packages[0]} vs {packages[-1]}"
         else:
-            compact = _truncate_sentence(body, 95)
+            compact = _truncate_sentence(body, 105)
         return f"{prefix}: {compact}" if prefix else compact
 
-    detail_items = [main_deviation, *extra_deviations] if concrete_deviations or major_findings else []
     compact_details: list[str] = []
     seen_compact: set[str] = set()
-    for item in detail_items:
+    for item in concrete_deviations or [_finding_text(x) for x in major_findings]:
         compact = _compact_deviation_item(item)
         compact_key = compact.lower()
         value_key = compact.split(": ", 1)[-1].lower()
@@ -498,20 +500,89 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
             compact_details.append(compact)
             seen_compact.add(compact_key)
             seen_compact.add(value_key)
-        if len(compact_details) >= 4:
+        if len(compact_details) >= 3:
             break
-    detail_text = " · ".join(compact_details)
-    if not detail_text:
-        detail_text = "kein konkreter Wertwiderspruch gefunden"
 
-    lines = [
-        f"{model['order_id']} · Dokument-Check: {uploaded_name} ({doc_type})",
-        f"⚠️ Ich sehe eine Gewichts-/Mengenabweichung: {detail_text}",
-        f"Frage an euch: {question}",
-        f"Vorschlag: {suggestion} Soll ich das nach eurer Bestätigung als TMS-Update vorbereiten?",
-        f"Kontext: {route} · {model.get('received_documents')} lokale Dok. / {model.get('mirrored_tms_documents')} TMS-Dok. · {history_status}",
-    ]
-    return "\n".join(lines)
+    risk = str(model.get("risk") or "low").strip().lower() or "low"
+    status_is_issue = bool(compact_details or major_findings or risk in {"medium", "high", "critical"})
+    tone = "danger" if risk in {"high", "critical"} else "warn" if status_is_issue else "good"
+    border = {"danger": "#dc2626", "warn": "#f59e0b", "good": "#16a34a"}.get(tone, "#2563eb")
+    bg = {"danger": "#fef2f2", "warn": "#fffbeb", "good": "#f0fdf4"}.get(tone, "#eff6ff")
+    issue_title = "Auffälligkeit" if status_is_issue else "Keine Auffälligkeit"
+    issue_text = " · ".join(compact_details) if compact_details else "Keine fachlichen Dokumenten-Widersprüche erkannt."
+    question = "Ist der TMS-Wert korrekt oder sind die Dokumente Teil-/Vorversionen?"
+    if any("pack" in x.lower() or "carton" in x.lower() or "palette" in x.lower() for x in compact_details):
+        question = "Welche Werte sollen führend sein: TMS-Stammdaten oder Dokumentwerte?"
+    suggestion = "Wenn TMS korrekt ist, markiere ich die Dokumentwerte als Vorversion/Schreibweise; sonst bereite ich die TMS-Korrektur vor."
+    doc_type = _doc_type_label(model.get("analysis_doc_type") or model.get("event_doc_type"))
+
+    def _context_value(*keys: str) -> str:
+        for key in keys:
+            if context.get(key) not in (None, "", [], {}):
+                return str(context.get(key))
+        return "-"
+
+    def _short_doc(row: dict[str, Any]) -> str:
+        filename = _truncate(str(row.get("filename") or "Dokument"), 34)
+        analysis = _load_json_file(row.get("analysis_path")) if row.get("analysis_path") else {}
+        fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+        label = _display_doc_type_for_row(row)
+        pieces = [filename, label]
+        amount = _first_present(fields.get("amount"), fields.get("total_amount"), empty="")
+        currency = _first_present(fields.get("currency"), empty="")
+        if amount:
+            pieces.append(f"{amount} {currency}".strip())
+        doc_number = _first_present(fields.get("document_number"), fields.get("invoice_number"), fields.get("awb"), fields.get("hawb"), empty="")
+        if doc_number:
+            pieces.append(f"Nr. {doc_number}")
+        notes = _deviation_notes_from_doc(row)
+        if notes:
+            pieces.append("Hinweis: " + _compact_deviation_item(notes[0]))
+        return " · ".join(_html_escape(str(part)) for part in pieces if part)
+
+    doc_lines = [_short_doc(row) for row in selected_docs[:3] if isinstance(row, dict)]
+    if not doc_lines:
+        doc_lines = ["Keine analysierten Dokumentdetails gefunden."]
+    if len(analyzed_docs) > len(selected_docs):
+        doc_lines.append(f"+{len(analyzed_docs) - len(selected_docs)} weitere Dokumente nur lokal im Order-Artefakt")
+
+    tms_line = (
+        f"{_context_value('network', 'mode')} · {_context_value('status')} · {route}"
+        f" · Incoterms {_context_value('incoterms')}"
+    )
+    cargo_bits = []
+    if _context_value('cargo_description') != "-":
+        cargo_bits.append(_truncate(str(_context_value('cargo_description')), 80))
+    if _context_value('weight_kg') != "-":
+        cargo_bits.append(f"TMS-Gewicht {_context_value('weight_kg')} kg")
+    if _context_value('pieces') != "-":
+        cargo_bits.append(f"Packstücke {_context_value('pieces')}")
+    cargo_line = " · ".join(cargo_bits) if cargo_bits else "TMS-Cargo: keine Gewichts-/Packstückwerte im Snapshot"
+
+    footer = (
+        f"{model.get('received_documents')} lokale Dok. / {model.get('mirrored_tms_documents')} TMS-Dok. · "
+        f"{history_status} · Findings {len(findings)}"
+    )
+    uploaded = _truncate(uploaded_name, 58)
+
+    return (
+        f"<div style='border:1px solid #d1d5db;border-left:6px solid {border};border-radius:14px;"
+        "padding:14px 16px;background:#ffffff;color:#111827;font-family:Segoe UI,Arial,sans-serif;line-height:1.35;'>"
+        f"<div style='font-size:18px;font-weight:800;margin-bottom:6px;'>📄 {_html_escape(str(model.get('order_id')))} · Dokumenten-Upload geprüft</div>"
+        f"<div style='font-size:13px;margin-bottom:10px;color:#374151;'>Upload: <b>{_html_escape(uploaded)}</b> · Typ: <b>{_html_escape(doc_type)}</b> · Risiko: <b>{_html_escape(risk)}</b></div>"
+        f"<div style='background:{bg};border:1px solid {border};border-radius:10px;padding:10px 12px;margin-bottom:10px;'>"
+        f"<b>⚠️ {issue_title}:</b> {_html_escape(_truncate_sentence(issue_text, 230))}</div>"
+        f"<div style='margin-bottom:8px;'><b>TMS:</b> {_html_escape(_truncate(tms_line, 180))}<br>"
+        f"<span style='color:#4b5563;'>{_html_escape(cargo_line)}</span></div>"
+        "<div style='margin-bottom:8px;'><b>Dokumente geprüft:</b><br>"
+        + "<br>".join(f"• {line}" for line in doc_lines[:4])
+        + "</div>"
+        f"<div style='background:#f9fafb;border-radius:10px;padding:10px 12px;margin-bottom:8px;'>"
+        f"<b>Frage:</b> {_html_escape(question)}<br>"
+        f"<b>Vorschlag:</b> {_html_escape(suggestion)}</div>"
+        f"<div style='font-size:12px;color:#6b7280;'>{_html_escape(footer)}</div>"
+        "</div>"
+    )
 
 def _build_document_activity_model(payload: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
     result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}
@@ -903,71 +974,8 @@ def _document_field_lines(fields: dict[str, Any]) -> list[str]:
 
 
 def _build_document_activity_html(payload: dict[str, Any], report: dict[str, Any]) -> str:
-    model = _build_document_activity_model(payload, report)
-    context = model.get("context") if isinstance(model.get("context"), dict) else {}
-    doc_type = _doc_type_label(model.get("analysis_doc_type") or model.get("event_doc_type"))
-    confidence = _first_present(model.get("confidence"), empty="-")
-    facts = _html_fact_grid([
-        ("Dokument", model.get("filename")),
-        ("Typ", f"{doc_type} ({confidence})" if confidence != "-" else doc_type),
-        ("Upload", f"{model.get('changed_at')} · {model.get('changed_by')} · {model.get('source')}"),
-        ("Route", _format_route_from_context(context)),
-        ("Kunde", context.get("customer") or "-"),
-        ("TMS", f"{context.get('status') or '-'} · {context.get('network') or '-'}"),
-        ("Incoterms", context.get("incoterms") or "-"),
-        ("Cargo", _format_cargo_from_context(context)),
-    ])
-    field_lines = _document_field_lines(model.get("fields") or {})
-    finding_lines = []
-    for finding in model.get("findings") or []:
-        if isinstance(finding, dict):
-            finding_lines.append(_truncate_sentence(f"{finding.get('filename') or ''}: {finding.get('summary') or finding.get('type') or ''}", 180))
-        else:
-            finding_lines.append(_truncate_sentence(finding, 180))
-    deviation_lines: list[str] = []
-    for item in [*(model.get("consistency_notes") or []), *finding_lines]:
-        text = str(item or "").strip()
-        lower = text.lower()
-        if text and (any(token in lower for token in ("abweich", " vs ", "differ", "discrep")) or ("tms" in lower and any(token in lower for token in ("kg", "gewicht", "packstück", "menge")))) and text not in deviation_lines:
-            deviation_lines.append(_truncate_sentence(text, 220))
-    match_lines = []
-    for match in model.get("tms_matches") or []:
-        if isinstance(match, dict):
-            match_lines.append(_truncate_sentence(f"TMS-Match: {match.get('document_type') or '-'} · {match.get('filename') or match.get('label') or '-'} · Basis {', '.join(match.get('match_basis') or []) or '-'}", 180))
-    if not match_lines and not finding_lines and not model.get("unreadable"):
-        match_lines.append("Keine TMS-/Dokument-Widersprüche erkannt.")
-    history_line = "Mailhistorie konnte nicht belastbar aktualisiert werden." if model.get("history_sync_error") else f"Mailhistorie aktualisiert: +{model.get('history_sync_count') or 0}; letzter lokaler Mailstand: {model.get('last_email_at') or '-'}"
-    header = (
-        "<div style='background:#0f172a;color:#ffffff;border:1px solid #2563eb;border-left:8px solid #60a5fa;"
-        "border-radius:20px;padding:24px 24px 18px 24px;box-shadow:0 6px 18px rgba(15,23,42,0.25);'>"
-        f"<div style='font-size:28px;font-weight:900;line-height:1.2;margin-bottom:10px;color:#ffffff;'>📄 Dokumenten-Upload · {_html_escape(str(model.get('order_id')))}</div>"
-        f"<div style='margin-bottom:12px;'>{_html_badge('Ergebnis ' + str(model.get('result_label')), model.get('tone') or 'neutral')}{_html_badge('Priorität ' + _priority_label(model.get('priority')), _priority_tone(model.get('priority')))}{_html_badge('Run Dokumenten-Upload-Monitor', 'neutral')}</div>"
-        f"<div style='font-size:16px;line-height:1.6;max-width:980px;color:#ffffff;'>{_format_html_value(model.get('summary') or 'Dokument wurde gespeichert, gespiegelt und gegen TMS/Mailkontext geprüft.')}</div>"
-        "</div>"
-    )
-    blocks = (
-        "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:16px;'>"
-        + _html_list_block("Dokument erkannt", [
-            f"Datei: {model.get('filename')}",
-            f"TMS-Typ: {_doc_type_label(model.get('event_doc_type'))}",
-            f"Analyse-Typ: {doc_type}",
-            *field_lines,
-        ], tone="neutral")
-        + _html_list_block("Konkrete Abweichung", deviation_lines[:5], tone=model.get("tone") or "neutral", empty="Keine konkrete Abweichung erkannt")
-        + _html_list_block("Abgleich", [
-            history_line,
-            *match_lines,
-            *(model.get("consistency_notes") or [])[:3],
-            *(model.get("unreadable") or [])[:2],
-            *finding_lines[:3],
-        ], tone=model.get("tone") or "neutral")
-        + _html_list_block("Nächster Schritt", [
-            model.get("next_step"),
-            "Fehlende Dokumente allein werden nicht eskaliert; sichtbar werden nur neue Uploads, Analysefehler oder echte Widersprüche.",
-        ], tone=model.get("tone") or "neutral")
-        + "</div>"
-    )
-    return header + "<div style='margin-top:18px;'>" + facts + blocks + "</div>"
+    """Use the same compact card for the full HTML payload and Teams prompt text."""
+    return _build_document_activity_text(payload, report)
 
 
 def _extract_section_value(case_report: dict[str, Any], *path: str) -> Any:
