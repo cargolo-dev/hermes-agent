@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 from html import escape as _html_escape
 from pathlib import Path
@@ -398,11 +399,12 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
     route = _format_route_from_context(context)
     history_delta = model.get("history_sync_count") or 0
     total_mails = _read_email_index_count(report.get("case_root"))
-    history_status = "Mailhistorie Fehler" if model.get("history_sync_error") else f"Mail +{history_delta}"
+    history_bits = [f"Mail +{history_delta}"]
     if total_mails is not None:
-        history_status += f" / gesamt {total_mails}"
+        history_bits.append(f"gesamt {total_mails}")
     if model.get("last_email_at"):
-        history_status += f" / Stand {model.get('last_email_at')}"
+        history_bits.append(f"Stand {model.get('last_email_at')}")
+    history_status = " / ".join(history_bits)
 
     lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
     registry = _load_json_file(lifecycle.get("document_registry_path"))
@@ -431,6 +433,7 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
             break
 
     findings = model.get("findings") if isinstance(model.get("findings"), list) else []
+
     def _finding_rank(row: Any) -> tuple[int, str]:
         text = _finding_text(row).lower()
         if "weight" in text or "gewicht" in text:
@@ -444,37 +447,10 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
         major_findings = [row for row in findings if isinstance(row, dict) and str(row.get("severity") or "").lower() in {"medium", "high", "critical"}]
     major_findings = sorted(major_findings, key=_finding_rank)[:5]
 
-    reconciliation = report.get("reconciliation") if isinstance(report.get("reconciliation"), dict) else {}
-    risk = str(reconciliation.get("risk") or "low")
-    needs_review = bool(reconciliation.get("needs_human_review"))
-
-    lines = [
-        "Ergebnis der Operator-Karte / Kurzfazit:",
-        "",
-        f"{model['order_id']} | Dokument hochgeladen | Priorität {_priority_label(model.get('priority'))}",
-        f"Dokument: {_truncate(model.get('filename'), 90)} | {_doc_type_label(model.get('analysis_doc_type') or model.get('event_doc_type'))} | {model.get('result_label')}",
-        f"Kontext: {route} | {history_status} | lokal {model.get('received_documents')} Dok. / TMS {model.get('mirrored_tms_documents')} gespiegelt",
-        f"Nächster Schritt: {model.get('next_step')}",
-        "",
-        "Dokument erkannt:",
-        f"- Datei: {model.get('filename')}",
-        f"- Upload: {model.get('changed_at')} | {model.get('changed_by')} | {model.get('source')}",
-        f"- Typ: {_doc_type_label(model.get('analysis_doc_type') or model.get('event_doc_type'))} | Confidence: {model.get('confidence') or '-'}",
-    ]
-    if model.get("summary"):
-        lines.append(f"- Inhalt: {_truncate_sentence(model.get('summary'), 180)}")
-
-    lines.extend(["", "Analysierte Dokumente:"])
-    if selected_docs:
-        for row in selected_docs:
-            lines.append(_document_line_from_analysis(row))
-    else:
-        lines.append("- Keine belastbaren Dokument-Zusammenfassungen im lokalen Report gefunden.")
-
     concrete_deviations: list[str] = []
     for row in selected_docs:
         if isinstance(row, dict):
-            filename = _truncate(str(row.get("filename") or "Dokument"), 72)
+            filename = _truncate(str(row.get("filename") or "Dokument"), 46)
             for note in _deviation_notes_from_doc(row):
                 line = f"{filename}: {note}"
                 if line not in concrete_deviations:
@@ -486,45 +462,56 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
             if any(token in lower for token in ("abweich", " vs ", "kg", "gewicht")) and text not in concrete_deviations:
                 concrete_deviations.append(text)
 
-    lines.extend([
-        "",
-        "Abgleich:",
-        f"- {history_status}",
-        f"- Lokal gespeichert: {model.get('received_documents')} Dokumente; TMS gespiegelt: {model.get('mirrored_tms_documents')}",
-    ])
-    if concrete_deviations:
-        lines.extend(["", "Konkrete Abweichung:"])
-        for note in concrete_deviations[:5]:
-            lines.append(f"- {_truncate_sentence(note, 210)}")
-    for note in (model.get("consistency_notes") or [])[:2]:
-        lines.append(f"- {note}")
-    for match in (model.get("tms_matches") or [])[:2]:
-        if isinstance(match, dict):
-            basis = ", ".join(match.get("match_basis") or []) or "-"
-            lines.append(f"- TMS-Match: {match.get('filename') or match.get('label') or '-'} ({match.get('document_type') or '-'}) über {basis}")
+    main_deviation = concrete_deviations[0] if concrete_deviations else _finding_text(major_findings[0]) if major_findings else "Keine konkrete Abweichung erkannt."
+    extra_deviations = [x for x in concrete_deviations[1:4] if x != main_deviation]
+    result_label = str(model.get("result_label") or "geprüft")
+    doc_type = _doc_type_label(model.get("analysis_doc_type") or model.get("event_doc_type"))
 
-    lines.extend([
-        "",
-        "Bewertung:",
-        f"- Risiko: {risk}",
-        f"- Human Review: {'true' if needs_review else 'false'}",
-        f"- Findings: {len(findings)}",
-    ])
-    if major_findings:
-        lines.append(f"- Haupt-Hinweis: {_truncate_sentence(_finding_text(major_findings[0]), 180)}")
-        for row in major_findings[1:4]:
-            lines.append(f"- Weiterer Hinweis: {_truncate_sentence(_finding_text(row), 180)}")
-    elif model.get("next_step"):
-        lines.append(f"- Haupt-Hinweis: {model.get('next_step')}")
+    question = "Ist der TMS-Wert korrekt oder sind die Dokumente Teil-/Vorversionen?"
+    if any("pack" in x.lower() or "carton" in x.lower() for x in concrete_deviations):
+        question = "Welche Werte sollen führend sein: TMS-Stammdaten oder Dokumentwerte?"
+    suggestion = "Wenn die Dokumentwerte stimmen, bereite ich die TMS-Korrektur für Gewicht/Packstücke vor."
 
-    lines.extend([
-        "",
-        "Sicherheitslogik:",
-        "- Fehlende Dokumente allein eskalieren nicht.",
-        "- Priorität entsteht nur aus echten Widersprüchen, neuen kritischen Uploads oder Analysefehlern.",
-    ])
+    def _compact_deviation_item(item: str) -> str:
+        text = str(item or "").strip()
+        filename, _, note = text.partition(": ")
+        prefix = filename if note else ""
+        body = note or text
+        weights = re.findall(r"\d+(?:[,.]\d+)?\s*kg", body, flags=re.IGNORECASE)
+        packages = re.findall(r"\d+\s*(?:Cartons?|Packages?|Packstücke|Packstuecke)", body, flags=re.IGNORECASE)
+        if len(weights) >= 2:
+            compact = f"{weights[0]} vs {weights[-1]}"
+        elif len(packages) >= 2:
+            compact = f"{packages[0]} vs {packages[-1]}"
+        else:
+            compact = _truncate_sentence(body, 95)
+        return f"{prefix}: {compact}" if prefix else compact
+
+    detail_items = [main_deviation, *extra_deviations] if concrete_deviations or major_findings else []
+    compact_details: list[str] = []
+    seen_compact: set[str] = set()
+    for item in detail_items:
+        compact = _compact_deviation_item(item)
+        compact_key = compact.lower()
+        value_key = compact.split(": ", 1)[-1].lower()
+        if compact and compact_key not in seen_compact and value_key not in seen_compact:
+            compact_details.append(compact)
+            seen_compact.add(compact_key)
+            seen_compact.add(value_key)
+        if len(compact_details) >= 4:
+            break
+    detail_text = " · ".join(compact_details)
+    if not detail_text:
+        detail_text = "kein konkreter Wertwiderspruch gefunden"
+
+    lines = [
+        f"{model['order_id']} · Dokument-Check: {uploaded_name} ({doc_type})",
+        f"⚠️ Ich sehe eine Gewichts-/Mengenabweichung: {detail_text}",
+        f"Frage an euch: {question}",
+        f"Vorschlag: {suggestion} Soll ich das nach eurer Bestätigung als TMS-Update vorbereiten?",
+        f"Kontext: {route} · {model.get('received_documents')} lokale Dok. / {model.get('mirrored_tms_documents')} TMS-Dok. · {history_status}",
+    ]
     return "\n".join(lines)
-
 
 def _build_document_activity_model(payload: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
     result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}

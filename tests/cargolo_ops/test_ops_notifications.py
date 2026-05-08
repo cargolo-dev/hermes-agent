@@ -162,16 +162,13 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
     assert "Konkrete Abweichung" in body["message"]
     assert "Gesamtgewicht laut Dokument 123kg" in body["message"]
     assert "Handelsrechnung" in body["message"]
-    assert "AN-12505 | Dokument hochgeladen" in body["message_text"]
-    assert "plausibel" in body["message_text"]
+    assert "AN-12505 · Dokument-Check" in body["message_text"]
+    assert "Ich sehe eine Gewichts-/Mengenabweichung" in body["message_text"]
+    assert "Frage an euch:" in body["message_text"]
+    assert "Vorschlag:" in body["message_text"]
     assert "Mail +3" in body["message_text"]
-    assert "Dokument erkannt:" in body["message_text"]
-    assert "Analysierte Dokumente:" in body["message_text"]
-    assert "Abgleich:" in body["message_text"]
-    assert "Konkrete Abweichung:" in body["message_text"]
-    assert "Gesamtgewicht laut Dokument 123kg" in body["message_text"]
-    assert "Bewertung:" in body["message_text"]
-    assert "Sicherheitslogik:" in body["message_text"]
+    assert "123kg vs 500kg" in body["message_text"]
+    assert "Kontext:" in body["message_text"]
 
 
 def test_send_manual_ops_notification_uses_native_teams_gateway_route(tmp_path, monkeypatch):
