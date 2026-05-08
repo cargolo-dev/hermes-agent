@@ -46,6 +46,41 @@ def _render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _shipment_context(tms_snapshot: dict[str, Any]) -> dict[str, Any]:
+    detail = tms_snapshot.get("detail") if isinstance(tms_snapshot, dict) else {}
+    if not isinstance(detail, dict):
+        detail = {}
+    origin = detail.get("origin") if isinstance(detail.get("origin"), dict) else {}
+    destination = detail.get("destination") if isinstance(detail.get("destination"), dict) else {}
+    totals = tms_snapshot.get("totals") if isinstance(tms_snapshot.get("totals"), dict) else {}
+    cargo_rows = detail.get("cargo") if isinstance(detail.get("cargo"), list) else []
+    cargo_description = ""
+    if cargo_rows:
+        first_cargo = next((row for row in cargo_rows if isinstance(row, dict)), {})
+        cargo_description = str(first_cargo.get("description") or first_cargo.get("goods_description") or "").strip()
+    customer = detail.get("customer") if isinstance(detail.get("customer"), dict) else {}
+    customer_name = (
+        customer.get("company_name")
+        or customer.get("name")
+        or detail.get("customer_name")
+        or detail.get("customer_company_name")
+    )
+    return {
+        "customer": customer_name,
+        "status": tms_snapshot.get("status") or detail.get("status"),
+        "network": detail.get("network") or detail.get("transport_mode") or tms_snapshot.get("network") or tms_snapshot.get("mode"),
+        "origin_city": origin.get("city") or detail.get("origin_city"),
+        "origin_country": origin.get("country") or origin.get("country_code") or detail.get("origin_country"),
+        "destination_city": destination.get("city") or detail.get("destination_city"),
+        "destination_country": destination.get("country") or destination.get("country_code") or detail.get("destination_country"),
+        "incoterms": detail.get("incoterms") or detail.get("incoterm"),
+        "pieces": totals.get("total_pieces") or detail.get("pieces") or detail.get("total_pieces"),
+        "weight_kg": totals.get("total_weight_kg") or detail.get("weight_kg") or detail.get("total_weight_kg"),
+        "volume_m3": totals.get("total_volume_m3") or detail.get("volume_m3") or detail.get("total_volume_m3"),
+        "cargo_description": cargo_description or detail.get("cargo_description"),
+    }
+
+
 def run_document_monitoring(
     order_id: str,
     *,
@@ -73,7 +108,8 @@ def run_document_monitoring(
         "case_root": str(case_root),
         "mode": reconciliation.get("mode"),
         "tms_status": tms_snapshot.get("status") or (detail or {}).get("status"),
-        "lifecycle": {k: lifecycle.get(k) for k in ["initialized", "history_sync_count", "history_sync_error", "tms_snapshot_path", "document_registry_path"]},
+        "tms_context": _shipment_context(tms_snapshot),
+        "lifecycle": {k: lifecycle.get(k) for k in ["initialized", "history_sync_count", "history_sync_error", "last_email_at", "tms_snapshot_path", "document_registry_path"]},
         "registry_summary": {
             "received_documents": len(registry.get("received_documents", []) or []),
             "tms_documents": len(registry.get("tms_documents", []) or []),

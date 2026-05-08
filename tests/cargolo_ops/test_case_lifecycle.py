@@ -49,6 +49,9 @@ def test_sync_case_lifecycle_mirrors_tms_documents_and_updates_registry(tmp_path
         ],
     }
 
+    store = CaseStore(tmp_path)
+    store.append_email_index("AN-12345", {"message_id": "m-old", "received_at": "2026-05-08T08:00:00Z"})
+
     with patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(snapshot, requirements, {})), \
          patch("plugins.cargolo_ops.processor._sync_mail_history", return_value=0), \
          patch("plugins.cargolo_ops.case_lifecycle.analyze_case_documents", side_effect=lambda **kwargs: (kwargs["registry"], [])):
@@ -62,6 +65,8 @@ def test_sync_case_lifecycle_mirrors_tms_documents_and_updates_registry(tmp_path
     assert registry["tms_documents"][0]["local_path"] == str(mirrored)
     state = json.loads((case_root / "case_state.json").read_text(encoding="utf-8"))
     assert state["mode"] == "air"
+    assert state["last_email_at"] == "2026-05-08T08:00:00Z"
+    assert result["last_email_at"] == "2026-05-08T08:00:00Z"
 
 
 def test_mirror_tms_documents_uses_tms_bearer_token_for_vault_downloads(tmp_path):

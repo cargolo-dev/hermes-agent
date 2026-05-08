@@ -241,6 +241,12 @@ def sync_case_lifecycle(
             history_error = f"mail_history_sync_failed: {exc}"
 
     history_rows = store.list_email_index(order_id)
+    latest_history_at = max(
+        (str(row.get("received_at") or "").strip() for row in history_rows if isinstance(row, dict) and str(row.get("received_at") or "").strip()),
+        default=None,
+    )
+    if latest_history_at and (not state.last_email_at or latest_history_at > state.last_email_at):
+        state.last_email_at = latest_history_at
     attachment_records = processor._collect_attachment_records_from_email_index(history_rows)
     lifecycle_message = IncomingMessagePayload(
         message_id=f"lifecycle:{order_id}:{utc_now_iso()}",
@@ -322,6 +328,7 @@ def sync_case_lifecycle(
         "initialized": not case_existed,
         "history_sync_count": history_count,
         "history_sync_error": history_error,
+        "last_email_at": state.last_email_at,
         "tms_snapshot_path": str(tms_path),
         "document_registry_path": str(registry_path),
         "registry": registry,

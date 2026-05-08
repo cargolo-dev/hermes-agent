@@ -134,16 +134,22 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         "history_sync_count": lifecycle.get("history_sync_count", 0),
         "history_sync_status": "error" if lifecycle.get("history_sync_error") else "ok",
         "history_sync_error": lifecycle.get("history_sync_error"),
+        "last_email_at": lifecycle.get("last_email_at"),
         "pending_action_summary": {"review": pending_review, "write_now": 0, "not_yet_due": 0, "not_yet_knowable": 0},
         "applied_action_summary": {"applied": 0, "failed": 0, "skipped": 0},
         "latest_subject": str(filename),
         "case_report_path": report.get("report_json_path"),
         "document_monitoring_report_path": report.get("report_json_path"),
+        "document_monitoring_report_md_path": report.get("report_md_path"),
         "document_activity_event_id": _activity_id(event),
         "document_activity_changed_at": event.get("changed_at"),
+        "document_activity_changed_by": event.get("changed_by_name") or event.get("changed_by"),
+        "document_activity_source": event.get("source"),
         "document_activity_file_name": str(filename),
         "document_activity_document_type": str(doc_type),
         "document_registry_summary": registry,
+        "document_reconciliation": reconciliation,
+        "tms_context": report.get("tms_context") if isinstance(report.get("tms_context"), dict) else {},
     }
 
 

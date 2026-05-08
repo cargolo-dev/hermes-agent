@@ -60,6 +60,112 @@ def test_build_manual_ops_notification_body_returns_html_payload(tmp_path):
     assert len(body["message_text"].splitlines()) <= 4
 
 
+def test_document_activity_notification_renders_operator_card(tmp_path):
+    registry_path = tmp_path / "document_registry.json"
+    analysis_path = tmp_path / "analysis.json"
+    report_path = tmp_path / "document_monitoring_latest.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "doc_type": "commercial_invoice",
+                "confidence": "high",
+                "summary": "Handelsrechnung erkannt; Referenz und Betrag lesbar.",
+                "extracted_fields": {"invoice_number": "CI-777", "amount": "1234.50", "currency": "EUR"},
+                "consistency_notes": ["Rechnungsreferenz passt zum Auftrag."],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "received_documents": [{"filename": "invoice.pdf"}],
+                "mirrored_tms_documents": [{"document_type": "commercial_invoice"}],
+                "analyzed_documents": [
+                    {
+                        "filename": "invoice.pdf",
+                        "analysis_path": str(analysis_path),
+                        "analysis_doc_type": "commercial_invoice",
+                        "analysis_confidence": "high",
+                        "tms_matches": [
+                            {"document_type": "commercial_invoice", "filename": "invoice.pdf", "match_basis": ["filename"]}
+                        ],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "order_id": "AN-12505",
+                "lifecycle": {
+                    "history_sync_count": 3,
+                    "last_email_at": "2026-05-08T08:22:00Z",
+                    "document_registry_path": str(registry_path),
+                },
+                "tms_context": {
+                    "customer": "Cargolo Testkunde",
+                    "status": "in_transit",
+                    "network": "ASR",
+                    "origin_city": "Ningbo",
+                    "origin_country": "CN",
+                    "destination_city": "Hamburg",
+                    "destination_country": "DE",
+                    "incoterms": "FOB",
+                    "pieces": 4,
+                    "weight_kg": 500,
+                    "cargo_description": "Bike parts",
+                },
+                "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+                "trigger_event": {
+                    "id": 12505,
+                    "changed_at": "2026-05-08T08:30:00Z",
+                    "changed_by_name": "Kundenportal",
+                    "source": "customer_portal",
+                    "metadata": {"file_name": "invoice.pdf", "document_type": "commercial_invoice"},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    body = build_manual_ops_notification_body(
+        run_type="document_activity_monitor",
+        payload={
+            "order_id": "AN-12505",
+            "activity_event": {
+                "changed_at": "2026-05-08T08:30:00Z",
+                "changed_by_name": "Kundenportal",
+                "source": "customer_portal",
+                "metadata": {"file_name": "invoice.pdf", "document_type": "commercial_invoice"},
+            },
+            "processor_result": {
+                "order_id": "AN-12505",
+                "status": "document_uploaded_checked",
+                "history_sync_count": 3,
+                "last_email_at": "2026-05-08T08:22:00Z",
+                "document_monitoring_report_path": str(report_path),
+            },
+        },
+    )
+
+    assert body["message_format"] == "html"
+    assert "Dokumenten-Upload" in body["message"]
+    assert "Dokument erkannt" in body["message"]
+    assert "Abgleich" in body["message"]
+    assert "Nächster Schritt" in body["message"]
+    assert "Handelsrechnung" in body["message"]
+    assert "AN-12505 | Dokument hochgeladen" in body["message_text"]
+    assert "plausibel" in body["message_text"]
+    assert "Mail +3" in body["message_text"]
+    assert len(body["message_text"].splitlines()) <= 4
+
+
 def test_send_manual_ops_notification_uses_route_webhook_forward(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
