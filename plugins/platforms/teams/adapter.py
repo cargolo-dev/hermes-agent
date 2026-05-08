@@ -205,13 +205,15 @@ class TeamsAdapter(BasePlatformAdapter):
             aiohttp_app = web.Application()
             aiohttp_app.router.add_get("/health", lambda _: web.Response(text="ok"))
 
-            self._app = App(
-                client_id=self._client_id,
-                client_secret=self._client_secret,
-                tenant_id=self._tenant_id,
-                http_server_adapter=_AiohttpBridgeAdapter(aiohttp_app),
-                client=ClientOptions(headers={"User-Agent": "Hermes"}),
-            )
+            app_kwargs = {
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "tenant_id": self._tenant_id,
+                "http_server_adapter": _AiohttpBridgeAdapter(aiohttp_app),
+            }
+            # microsoft-teams-apps 2.x no longer accepts the older `client=ClientOptions(...)`
+            # constructor argument. Keep the app construction minimal and SDK-version tolerant.
+            self._app = App(**app_kwargs)
 
             # Register message handler before initialize()
             @self._app.on_message
@@ -520,7 +522,8 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._app:
             return
         try:
-            await self._app.send(chat_id, TypingActivityInput())
+            activity = TypingActivityInput() if TypingActivityInput is not None else {"type": "typing"}
+            await self._app.send(chat_id, activity)
         except Exception:
             pass
 

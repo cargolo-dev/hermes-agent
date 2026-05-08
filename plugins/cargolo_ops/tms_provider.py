@@ -64,6 +64,7 @@ class TMSReadProvider(Protocol):
     def snapshot_bundle(self, an: str, customer_hint: str | None = None) -> TMSSnapshot: ...
     def shipments_list(self, transport_category: str = "asr", **kwargs: Any) -> list[dict[str, Any]]: ...
     def document_requirements(self, an: str) -> dict[str, Any]: ...
+    def get_document_download_url(self, **kwargs: Any) -> dict[str, Any]: ...
     def billing_context(self, an: str) -> dict[str, Any]: ...
 
 
@@ -130,6 +131,15 @@ class DirectTMSProvider:
             },
             "warnings": list(snapshot.warnings or []),
             "source": "direct_tms",
+        }
+
+    def get_document_download_url(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "status": "error",
+            "readonly": True,
+            "query": kwargs,
+            "download_url": None,
+            "warnings": ["direct_tms_provider_has_no_signed_download_url_tool"],
         }
 
 
@@ -296,6 +306,10 @@ class MCPBridgeTMSProvider:
 
     def document_requirements(self, an: str) -> dict[str, Any]:
         return self._call_backend("get_document_requirements", an=an)
+
+    def get_document_download_url(self, **kwargs: Any) -> dict[str, Any]:
+        payload = {key: value for key, value in kwargs.items() if value is not None}
+        return self._call_backend("get_document_download_url", **payload)
 
     def billing_context(self, an: str) -> dict[str, Any]:
         return self._call_backend("get_billing_context", an=an)

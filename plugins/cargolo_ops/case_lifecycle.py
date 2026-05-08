@@ -15,6 +15,7 @@ from .storage import CaseStore
 
 
 ASR_MODES = {"air", "sea", "rail", "unknown"}
+DEFAULT_TMS_ADMIN_USER_ID = 106
 
 
 def normalize_asr_mode(value: Any) -> str:
@@ -73,7 +74,49 @@ def _download_tms_document(url: str, target: Path, *, headers: dict[str, str] | 
         return False, str(exc)
 
 
-def mirror_tms_documents(*, case_root: Path, registry: dict[str, Any], tms_client: Any | None = None) -> list[dict[str, Any]]:
+def _resolve_tms_download_url(
+    *,
+    an: str | None,
+    record: dict[str, Any],
+    tms_client: Any | None,
+    admin_user_id: int = DEFAULT_TMS_ADMIN_USER_ID,
+) -> tuple[str | None, list[str]]:
+    """Ask the TMS MCP for an ephemeral/signed document URL before falling back to raw Vault URLs.
+
+    The signed URL is used only for the immediate download and is not persisted
+    into the registry, because it can contain short-lived credentials.
+    """
+    if not an or tms_client is None or not hasattr(tms_client, "get_document_download_url"):
+        return None, []
+    tms_document_id = record.get("tms_document_id") or record.get("document_uuid") or record.get("uuid")
+    document_id = record.get("document_id") or record.get("id")
+    if not tms_document_id and document_id in (None, ""):
+        return None, []
+    try:
+        payload = tms_client.get_document_download_url(
+            admin_user_id=admin_user_id,
+            an=an,
+            tms_document_id=str(tms_document_id) if tms_document_id else None,
+            document_id=int(document_id) if document_id not in (None, "") else None,
+            ttl_seconds=3600,
+        )
+    except Exception as exc:
+        return None, [f"download_url_tool_failed:{type(exc).__name__}"]
+    document = payload.get("document") if isinstance(payload.get("document"), dict) else {}
+    candidate = str(
+        payload.get("download_url")
+        or payload.get("signed_url")
+        or payload.get("url")
+        or document.get("download_url")
+        or document.get("signed_url")
+        or document.get("url")
+        or ""
+    ).strip()
+    warnings = [str(item) for item in payload.get("warnings", []) if item] if isinstance(payload, dict) else []
+    return (candidate or None), warnings
+
+
+def mirror_tms_documents(*, case_root: Path, registry: dict[str, Any], tms_client: Any | None = None, an: str | None = None) -> list[dict[str, Any]]:
     """Mirror downloadable TMS documents into the canonical case folder.
 
     Output lives under `<case>/documents/tms/`. Existing files with the same
@@ -93,7 +136,12 @@ def mirror_tms_documents(*, case_root: Path, registry: dict[str, Any], tms_clien
 
     for idx, row in enumerate([r for r in registry.get("tms_documents", []) if isinstance(r, dict)], start=1):
         record = dict(row)
-        url = str(record.get("url") or record.get("download_url") or "").strip()
+        resolved_url, resolve_warnings = _resolve_tms_download_url(an=an or case_root.name, record=record, tms_client=tms_client)
+        if resolved_url:
+            record["download_url_source"] = "tms_mcp_get_document_download_url"
+        if resolve_warnings:
+            record["download_url_warnings"] = resolve_warnings
+        url = resolved_url or str(record.get("url") or record.get("download_url") or "").strip()
         if url.startswith("/vault/"):
             url = f"https://api.cargolo.de{url}"
         if not url:
@@ -104,7 +152,11 @@ def mirror_tms_documents(*, case_root: Path, registry: dict[str, Any], tms_clien
         safe_name = filename.replace("/", "_").replace("\\", "_")
         target = tms_dir / safe_name
         headers = None
-        if tms_client is not None and str(url).startswith(str(getattr(tms_client, "api_url", "")).rstrip("/")):
+        if (
+            tms_client is not None
+            and hasattr(tms_client, "_headers")
+            and str(url).startswith(str(getattr(tms_client, "api_url", "")).rstrip("/"))
+        ):
             headers = {
                 key: value
                 for key, value in tms_client._headers().items()
@@ -205,8 +257,10 @@ def sync_case_lifecycle(
         tms_snapshot=tms_snapshot,
         tms_document_requirements=tms_document_requirements,
     )
-    tms_client = build_tms_client_from_env()
-    mirrored_tms_documents = mirror_tms_documents(case_root=case_root, registry=registry, tms_client=tms_client)
+    from .tms_provider import build_tms_provider_from_env
+
+    tms_client = build_tms_provider_from_env() or build_tms_client_from_env()
+    mirrored_tms_documents = mirror_tms_documents(case_root=case_root, registry=registry, tms_client=tms_client, an=order_id)
     registry["tms_documents"] = mirrored_tms_documents
     registry["mirrored_tms_documents"] = [row for row in mirrored_tms_documents if row.get("mirror_status") == "mirrored"]
     registry["tms_mirroring_gaps"] = [row for row in mirrored_tms_documents if row.get("mirror_status") != "mirrored"]

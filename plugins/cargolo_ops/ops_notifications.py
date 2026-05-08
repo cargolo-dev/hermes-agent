@@ -672,8 +672,9 @@ def send_manual_ops_notification(
             response.raise_for_status()
             delivered += 1
         except Exception as exc:
-            logger.warning("ASR manual ops notification failed for %s: %s", url, exc)
-            errors.append(f"{url}: {exc}")
+            safe_error = str(exc).replace(url, "<redacted_url>")
+            logger.warning("ASR manual ops notification failed for configured target: %s", safe_error)
+            errors.append(f"<redacted_url>: {safe_error}")
 
     return {
         "enabled": True,

@@ -115,6 +115,64 @@ def test_mirror_tms_documents_uses_tms_bearer_token_for_vault_downloads(tmp_path
     assert (tmp_path / "documents" / "tms" / "invoice.pdf").read_bytes() == b"vault document"
 
 
+def test_mirror_tms_documents_prefers_mcp_signed_download_url(tmp_path):
+    class FakeTMSClient:
+        api_url = "https://api.cargolo.de"
+
+        def __init__(self):
+            self.calls = []
+
+        def get_document_download_url(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "status": "ok",
+                "readonly": True,
+                "document": {"download_url": "https://signed.example.test/invoice.pdf?token=secret"},
+                "warnings": [],
+            }
+
+        def _headers(self):
+            raise AssertionError("signed URL download must not request TMS bearer headers")
+
+    class FakeResponse:
+        status_code = 200
+        url = "https://signed.example.test/invoice.pdf?token=secret"
+        content = b"signed document"
+
+        def raise_for_status(self):
+            return None
+
+    captured = {}
+
+    def fake_get(url, headers=None, timeout=0, allow_redirects=True):
+        captured["url"] = url
+        captured["headers"] = headers
+        return FakeResponse()
+
+    registry = {
+        "tms_documents": [
+            {
+                "tms_document_id": "doc-uuid-1",
+                "document_type": "commercial_invoice",
+                "filename": "invoice.pdf",
+                "url": "/vault/private/invoice.pdf",
+            }
+        ]
+    }
+    client = FakeTMSClient()
+
+    with patch("plugins.cargolo_ops.case_lifecycle.requests.get", side_effect=fake_get):
+        mirrored = mirror_tms_documents(case_root=tmp_path / "AN-12345", registry=registry, tms_client=client, an="AN-12345")
+
+    assert client.calls == [{"admin_user_id": 106, "an": "AN-12345", "tms_document_id": "doc-uuid-1", "document_id": None, "ttl_seconds": 3600}]
+    assert captured["url"] == "https://signed.example.test/invoice.pdf?token=secret"
+    assert captured["headers"] in (None, {})
+    assert mirrored[0]["download_url_source"] == "tms_mcp_get_document_download_url"
+    assert "https://signed.example.test" not in json.dumps(mirrored[0])
+    assert mirrored[0]["mirror_status"] == "mirrored"
+    assert (tmp_path / "AN-12345" / "documents" / "tms" / "invoice.pdf").read_bytes() == b"signed document"
+
+
 def test_sync_case_lifecycle_hands_billing_context_to_pricing(tmp_path):
     snapshot = TMSSnapshot(
         order_id="AN-55555",
