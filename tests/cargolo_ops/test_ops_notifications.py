@@ -176,6 +176,12 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
     assert "123kg vs 500kg" in body["message_text"]
     assert "Erkannte Dokumente:" not in body["message_text"]
     assert len(body["message_text"]) < 2400
+    assert "color:#111827" not in body["message_text"]
+    assert "color:#374151" not in body["message_text"]
+    assert "color:#4b5563" not in body["message_text"]
+    assert "background:#ffffff" not in body["message_text"]
+    assert "color:#f8fafc" in body["message_text"]
+    assert "color:#ffffff" in body["message_text"]
 
 
 def test_send_manual_ops_notification_uses_native_teams_gateway_route(tmp_path, monkeypatch):

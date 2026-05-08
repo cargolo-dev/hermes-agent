@@ -506,8 +506,8 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
     risk = str(model.get("risk") or "low").strip().lower() or "low"
     status_is_issue = bool(compact_details or major_findings or risk in {"medium", "high", "critical"})
     tone = "danger" if risk in {"high", "critical"} else "warn" if status_is_issue else "good"
-    border = {"danger": "#dc2626", "warn": "#f59e0b", "good": "#16a34a"}.get(tone, "#2563eb")
-    bg = {"danger": "#fef2f2", "warn": "#fffbeb", "good": "#f0fdf4"}.get(tone, "#eff6ff")
+    border = {"danger": "#f87171", "warn": "#fbbf24", "good": "#34d399"}.get(tone, "#60a5fa")
+    bg = {"danger": "#3f1d1d", "warn": "#3a2b0a", "good": "#123524"}.get(tone, "#172554")
     issue_title = "Auffälligkeit" if status_is_issue else "Keine Auffälligkeit"
     issue_text = " · ".join(compact_details) if compact_details else "Keine fachlichen Dokumenten-Widersprüche erkannt."
     question = "Ist der TMS-Wert korrekt oder sind die Dokumente Teil-/Vorversionen?"
@@ -566,21 +566,21 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
     uploaded = _truncate(uploaded_name, 58)
 
     return (
-        f"<div style='border:1px solid #d1d5db;border-left:6px solid {border};border-radius:14px;"
-        "padding:14px 16px;background:#ffffff;color:#111827;font-family:Segoe UI,Arial,sans-serif;line-height:1.35;'>"
-        f"<div style='font-size:18px;font-weight:800;margin-bottom:6px;'>📄 {_html_escape(str(model.get('order_id')))} · Dokumenten-Upload geprüft</div>"
-        f"<div style='font-size:13px;margin-bottom:10px;color:#374151;'>Upload: <b>{_html_escape(uploaded)}</b> · Typ: <b>{_html_escape(doc_type)}</b> · Risiko: <b>{_html_escape(risk)}</b></div>"
-        f"<div style='background:{bg};border:1px solid {border};border-radius:10px;padding:10px 12px;margin-bottom:10px;'>"
+        f"<div style='border:1px solid #475569;border-left:6px solid {border};border-radius:14px;"
+        "padding:14px 16px;background:#111827;color:#f8fafc;font-family:Segoe UI,Arial,sans-serif;line-height:1.35;'>"
+        f"<div style='font-size:18px;font-weight:800;margin-bottom:6px;color:#ffffff;'>📄 {_html_escape(str(model.get('order_id')))} · Dokumenten-Upload geprüft</div>"
+        f"<div style='font-size:13px;margin-bottom:10px;color:#cbd5e1;'>Upload: <b>{_html_escape(uploaded)}</b> · Typ: <b>{_html_escape(doc_type)}</b> · Risiko: <b>{_html_escape(risk)}</b></div>"
+        f"<div style='background:{bg};border:1px solid {border};border-radius:10px;padding:10px 12px;margin-bottom:10px;color:#f8fafc;'>"
         f"<b>⚠️ {issue_title}:</b> {_html_escape(_truncate_sentence(issue_text, 230))}</div>"
-        f"<div style='margin-bottom:8px;'><b>TMS:</b> {_html_escape(_truncate(tms_line, 180))}<br>"
-        f"<span style='color:#4b5563;'>{_html_escape(cargo_line)}</span></div>"
-        "<div style='margin-bottom:8px;'><b>Dokumente geprüft:</b><br>"
+        f"<div style='margin-bottom:8px;color:#f8fafc;'><b>TMS:</b> {_html_escape(_truncate(tms_line, 180))}<br>"
+        f"<span style='color:#cbd5e1;'>{_html_escape(cargo_line)}</span></div>"
+        "<div style='margin-bottom:8px;color:#f8fafc;'><b>Dokumente geprüft:</b><br>"
         + "<br>".join(f"• {line}" for line in doc_lines[:4])
         + "</div>"
-        f"<div style='background:#f9fafb;border-radius:10px;padding:10px 12px;margin-bottom:8px;'>"
+        f"<div style='background:#1f2937;border:1px solid #374151;border-radius:10px;padding:10px 12px;margin-bottom:8px;color:#f8fafc;'>"
         f"<b>Frage:</b> {_html_escape(question)}<br>"
         f"<b>Vorschlag:</b> {_html_escape(suggestion)}</div>"
-        f"<div style='font-size:12px;color:#6b7280;'>{_html_escape(footer)}</div>"
+        f"<div style='font-size:12px;color:#94a3b8;'>{_html_escape(footer)}</div>"
         "</div>"
     )
 
@@ -873,27 +873,27 @@ def _format_html_value(value: Any) -> str:
         items = [item for item in value if item not in (None, "", [], {})]
         if not items:
             return "-"
-        inner = "".join(f"<li>{_format_html_value(item)}</li>" for item in items)
-        return f"<ul>{inner}</ul>"
+        inner = "".join(f"<li style='color:#f8fafc;margin-bottom:4px;'>{_format_html_value(item)}</li>" for item in items)
+        return f"<ul style='color:#f8fafc;margin:8px 0 0 18px;padding:0;'>{inner}</ul>"
     if isinstance(value, dict):
         if not value:
             return "-"
         rows = []
         for key, item in value.items():
             rows.append(
-                f"<tr><th align='left'>{_html_escape(str(key))}</th><td>{_format_html_value(item)}</td></tr>"
+                f"<tr><th align='left' style='color:#ffffff;border-color:#334155;'>{_html_escape(str(key))}</th><td style='color:#f8fafc;border-color:#334155;'>{_format_html_value(item)}</td></tr>"
             )
-        return f"<table border='1' cellspacing='0' cellpadding='6'>{''.join(rows)}</table>"
+        return f"<table border='1' cellspacing='0' cellpadding='6' style='color:#f8fafc;border-color:#334155;border-collapse:collapse;'>{''.join(rows)}</table>"
     return _html_escape(str(value))
 
 
 def _html_badge(text: Any, tone: str = "neutral") -> str:
     palette = {
-        "neutral": ("#e5eefc", "#1d4ed8"),
-        "good": ("#dcfce7", "#166534"),
-        "warn": ("#fef3c7", "#92400e"),
-        "danger": ("#fee2e2", "#b91c1c"),
-        "dark": ("#e5e7eb", "#111827"),
+        "neutral": ("#1e3a8a", "#ffffff"),
+        "good": ("#065f46", "#ffffff"),
+        "warn": ("#92400e", "#ffffff"),
+        "danger": ("#991b1b", "#ffffff"),
+        "dark": ("#334155", "#ffffff"),
     }
     bg, fg = palette.get(tone, palette["neutral"])
     return (
@@ -1109,8 +1109,8 @@ def _render_case_report_sections(sections: dict[str, Any]) -> str:
             for block_name, block_value in section_body.items():
                 subtitle = block_name.replace("_", " ").strip().title()
                 body_parts.append(
-                    "<div style='margin:14px 0 0 0;padding-top:14px;border-top:1px solid #eef2f7;'>"
-                    f"<div style='font-size:15px;font-weight:800;color:#0f172a;margin-bottom:8px;'>{_html_escape(subtitle)}</div>"
+                    "<div style='margin:14px 0 0 0;padding-top:14px;border-top:1px solid #334155;color:#f8fafc;'>"
+                    f"<div style='font-size:15px;font-weight:800;color:#ffffff;margin-bottom:8px;'>{_html_escape(subtitle)}</div>"
                     f"{_format_html_value(block_value)}</div>"
                 )
         else:
