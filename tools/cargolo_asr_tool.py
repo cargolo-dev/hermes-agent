@@ -21,6 +21,7 @@ from plugins.cargolo_ops.tms_provider import build_tms_provider_from_env
 from plugins.cargolo_ops.ops_notifications import send_manual_ops_notification
 from plugins.cargolo_ops.writeback_actions import apply_pending_tms_action, DEFAULT_ADMIN_USER_ID
 from plugins.cargolo_ops.writeback_executor import run_writeback_executor
+from plugins.cargolo_ops.document_activity_monitor import run_document_activity_monitor
 from tools.registry import registry, tool_error
 
 
@@ -212,6 +213,33 @@ TMS_WRITEBACK_SCHEMA = {
             "storage_root": {"type": "string", "description": "Optional override for the ASR case root directory."},
             "dry_run": {"type": "boolean", "description": "If true, only stage actions into applied_updates.json without executing writes. Default true."},
             "admin_user_id": {"type": "integer", "description": "Admin user ID for MCP write actions. Default 106."},
+        },
+        "required": [],
+    },
+}
+
+
+DOCUMENT_ACTIVITY_MONITOR_SCHEMA = {
+    "name": "cargolo_asr_document_activity_monitor",
+    "description": (
+        "Poll the CARGOLO TMS ASR activity log for new document upload events, then run the shared "
+        "mail-history + TMS + document monitoring lifecycle for each affected AN/BU and optionally notify Teams. "
+        "Read-first except for the existing ops notification sink."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "storage_root": {"type": "string", "description": "Optional override for the ASR case root directory."},
+            "admin_user_id": {"type": "integer", "description": "Admin user ID for reading the ASR activity log. Default 106."},
+            "max_events": {"type": "integer", "description": "Maximum new document-upload events to process. Default 5."},
+            "per_page": {"type": "integer", "description": "Activity-log page size. Default 50."},
+            "date_from": {"type": "string", "description": "Optional lower bound for activity-log changed_at filtering."},
+            "date_to": {"type": "string", "description": "Optional upper bound for activity-log changed_at filtering."},
+            "force": {"type": "boolean", "description": "If true, ignore the local cursor/dedupe state. Default false."},
+            "dry_run": {"type": "boolean", "description": "If true, only list selected events and do not run monitoring or update cursor. Default false."},
+            "notify_ops_webhook": {"type": "boolean", "description": "If true, notify the configured ASR ops webhook/Teams sink. Default true."},
+            "refresh_history": {"type": "boolean", "description": "If true, sync full/delta ASR mail history before document analysis. Default true."},
+            "analyze_documents": {"type": "boolean", "description": "If true, run configured document analysis after mirroring TMS/mail documents. Default true."},
         },
         "required": [],
     },
@@ -428,6 +456,27 @@ def cargolo_asr_tms_writeback_tool(args: dict[str, Any], **_: Any) -> str:
         return tool_error(str(exc))
 
 
+def cargolo_asr_document_activity_monitor_tool(args: dict[str, Any], **_: Any) -> str:
+    try:
+        root = _resolve_root(args.get("storage_root"))
+        result = run_document_activity_monitor(
+            storage_root=root,
+            admin_user_id=int(args.get("admin_user_id") or DEFAULT_ADMIN_USER_ID),
+            max_events=int(args.get("max_events", 5) or 5),
+            per_page=int(args.get("per_page", 50) or 50),
+            date_from=args.get("date_from"),
+            date_to=args.get("date_to"),
+            force=bool(args.get("force", False)),
+            dry_run=bool(args.get("dry_run", False)),
+            notify_ops_webhook=bool(args.get("notify_ops_webhook", True)),
+            refresh_history=bool(args.get("refresh_history", True)),
+            analyze_documents=bool(args.get("analyze_documents", True)),
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return tool_error(str(exc))
+
+
 def cargolo_asr_bootstrap_case_tool(args: dict[str, Any], **_: Any) -> str:
     an = args.get("an", "").strip().upper()
     if not an:
@@ -568,6 +617,15 @@ registry.register(
     handler=cargolo_asr_tms_writeback_tool,
     description="Execute or dry-run pending ASR TMS writeback actions through the MCP write tools.",
     emoji="🛠️",
+)
+
+registry.register(
+    name="cargolo_asr_document_activity_monitor",
+    toolset="business_ops",
+    schema=DOCUMENT_ACTIVITY_MONITOR_SCHEMA,
+    handler=cargolo_asr_document_activity_monitor_tool,
+    description="Monitor TMS ASR document uploads and trigger mail/TMS/document analysis plus Teams notification.",
+    emoji="📄",
 )
 
 registry.register(

@@ -52,6 +52,7 @@ def run_document_monitoring(
     storage_root: Path | None = None,
     refresh_history: bool = True,
     analyze_documents: bool = True,
+    trigger_event: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     lifecycle = sync_case_lifecycle(
         order_id,
@@ -81,6 +82,16 @@ def run_document_monitoring(
         },
         "reconciliation": reconciliation,
     }
+    if trigger_event:
+        report["trigger_event"] = {
+            "id": trigger_event.get("id"),
+            "entity_type": trigger_event.get("entity_type"),
+            "action": trigger_event.get("action"),
+            "changed_at": trigger_event.get("changed_at"),
+            "changed_by_name": trigger_event.get("changed_by_name"),
+            "source": trigger_event.get("source"),
+            "metadata": trigger_event.get("metadata") if isinstance(trigger_event.get("metadata"), dict) else {},
+        }
     json_path, md_path = store.save_document_monitoring_report(lifecycle["order_id"], report, _render_markdown(report))
     report["report_json_path"] = str(json_path)
     report["report_md_path"] = str(md_path)
@@ -89,7 +100,11 @@ def run_document_monitoring(
         action="document_monitoring",
         result="ok",
         files=[str(json_path), str(md_path)],
-        extra={"risk": reconciliation.get("risk"), "needs_human_review": reconciliation.get("needs_human_review")},
+        extra={
+            "risk": reconciliation.get("risk"),
+            "needs_human_review": reconciliation.get("needs_human_review"),
+            "trigger_activity_id": (trigger_event or {}).get("id"),
+        },
     )
     return report
 

@@ -66,6 +66,7 @@ class TMSReadProvider(Protocol):
     def document_requirements(self, an: str) -> dict[str, Any]: ...
     def get_document_download_url(self, **kwargs: Any) -> dict[str, Any]: ...
     def billing_context(self, an: str) -> dict[str, Any]: ...
+    def list_asr_activity_log(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
 class TMSWriteProvider(Protocol):
@@ -140,6 +141,16 @@ class DirectTMSProvider:
             "query": kwargs,
             "download_url": None,
             "warnings": ["direct_tms_provider_has_no_signed_download_url_tool"],
+        }
+
+    def list_asr_activity_log(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "status": "error",
+            "readonly": True,
+            "query": kwargs,
+            "items": [],
+            "pagination": {"page": kwargs.get("page", 1), "per_page": kwargs.get("per_page", 50), "total_items": 0},
+            "warnings": ["direct_tms_provider_has_no_activity_log_tool"],
         }
 
 
@@ -313,6 +324,10 @@ class MCPBridgeTMSProvider:
 
     def billing_context(self, an: str) -> dict[str, Any]:
         return self._call_backend("get_billing_context", an=an)
+
+    def list_asr_activity_log(self, **kwargs: Any) -> dict[str, Any]:
+        payload = {key: value for key, value in kwargs.items() if value not in (None, "")}
+        return self._call_backend("list_asr_activity_log", **payload)
 
     def update_shipment(self, **kwargs: Any) -> dict[str, Any]:
         return self._call_backend("update_shipment", **kwargs)

@@ -148,6 +148,7 @@ def _run_label(run_type: str) -> str:
         "bootstrap_cases_from_tms": "Bulk-Bootstrap",
         "process_event": "Mail-Ingest",
         "analysis_update": "Analyse-Update",
+        "document_activity_monitor": "Dokumenten-Upload-Monitor",
     }.get(run_type, run_type or "Run")
 
 
