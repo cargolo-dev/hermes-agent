@@ -71,7 +71,7 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
                 "confidence": "high",
                 "summary": "Handelsrechnung erkannt; Referenz und Betrag lesbar.",
                 "extracted_fields": {"invoice_number": "CI-777", "amount": "1234.50", "currency": "EUR"},
-                "consistency_notes": ["Rechnungsreferenz passt zum Auftrag."],
+                "consistency_notes": ["Gesamtgewicht laut Dokument 123kg weicht vom TMS-Wert 500kg ab."],
             },
             ensure_ascii=False,
         ),
@@ -159,6 +159,8 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
     assert "Dokument erkannt" in body["message"]
     assert "Abgleich" in body["message"]
     assert "Nächster Schritt" in body["message"]
+    assert "Konkrete Abweichung" in body["message"]
+    assert "Gesamtgewicht laut Dokument 123kg" in body["message"]
     assert "Handelsrechnung" in body["message"]
     assert "AN-12505 | Dokument hochgeladen" in body["message_text"]
     assert "plausibel" in body["message_text"]
@@ -166,6 +168,8 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
     assert "Dokument erkannt:" in body["message_text"]
     assert "Analysierte Dokumente:" in body["message_text"]
     assert "Abgleich:" in body["message_text"]
+    assert "Konkrete Abweichung:" in body["message_text"]
+    assert "Gesamtgewicht laut Dokument 123kg" in body["message_text"]
     assert "Bewertung:" in body["message_text"]
     assert "Sicherheitslogik:" in body["message_text"]
 

@@ -357,14 +357,38 @@ def _display_doc_type_for_row(row: dict[str, Any]) -> str:
     return _doc_type_label(row.get("doc_type") or row.get("analysis_doc_type"))
 
 
+def _deviation_notes_from_doc(row: dict[str, Any]) -> list[str]:
+    notes: list[str] = []
+    analysis = _load_json_file(row.get("analysis_path")) if row.get("analysis_path") else {}
+    candidates: list[Any] = []
+    for source in (analysis, row):
+        if not isinstance(source, dict):
+            continue
+        candidates.extend(source.get("consistency_notes") or [])
+        candidates.extend(source.get("operational_flags") or [])
+    for item in candidates:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        lower = text.lower()
+        is_concrete = any(token in lower for token in ("abweich", " vs ", "differ", "discrep")) or ("tms" in lower and any(token in lower for token in ("kg", "gewicht", "packstück", "menge", "quantity", "pieces")))
+        is_generic = lower in {"weight_discrepancy", "freight_collect"}
+        if is_concrete and not is_generic and text not in notes:
+            notes.append(text)
+    return notes[:3]
+
+
 def _document_line_from_analysis(row: dict[str, Any]) -> str:
     filename = _truncate(str(row.get("filename") or "Dokument"), 72)
     doc_type = _display_doc_type_for_row(row)
     summary = _truncate_sentence(row.get("summary") or row.get("analysis_summary") or "kein Kurzinhalt extrahiert", 150)
+    deviation_notes = _deviation_notes_from_doc(row)
     flags = row.get("operational_flags") if isinstance(row.get("operational_flags"), list) else []
+    visible_flags = [str(x) for x in flags if str(x).strip().lower() not in {"weight_discrepancy", "freight_collect"}]
+    hint_items = deviation_notes[:2] or visible_flags[:2]
     flag_text = ""
-    if flags:
-        flag_text = " | Hinweis: " + _truncate_sentence("; ".join(str(x) for x in flags[:2] if x), 120)
+    if hint_items:
+        flag_text = " | Hinweis: " + _truncate_sentence("; ".join(str(x) for x in hint_items if x), 170)
     return f"- {filename}: {doc_type}; {summary}{flag_text}"
 
 
@@ -447,12 +471,31 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
     else:
         lines.append("- Keine belastbaren Dokument-Zusammenfassungen im lokalen Report gefunden.")
 
+    concrete_deviations: list[str] = []
+    for row in selected_docs:
+        if isinstance(row, dict):
+            filename = _truncate(str(row.get("filename") or "Dokument"), 72)
+            for note in _deviation_notes_from_doc(row):
+                line = f"{filename}: {note}"
+                if line not in concrete_deviations:
+                    concrete_deviations.append(line)
+    if not concrete_deviations:
+        for row in major_findings:
+            text = _finding_text(row)
+            lower = text.lower()
+            if any(token in lower for token in ("abweich", " vs ", "kg", "gewicht")) and text not in concrete_deviations:
+                concrete_deviations.append(text)
+
     lines.extend([
         "",
         "Abgleich:",
         f"- {history_status}",
         f"- Lokal gespeichert: {model.get('received_documents')} Dokumente; TMS gespiegelt: {model.get('mirrored_tms_documents')}",
     ])
+    if concrete_deviations:
+        lines.extend(["", "Konkrete Abweichung:"])
+        for note in concrete_deviations[:5]:
+            lines.append(f"- {_truncate_sentence(note, 210)}")
     for note in (model.get("consistency_notes") or [])[:2]:
         lines.append(f"- {note}")
     for match in (model.get("tms_matches") or [])[:2]:
@@ -891,9 +934,15 @@ def _build_document_activity_html(payload: dict[str, Any], report: dict[str, Any
     finding_lines = []
     for finding in model.get("findings") or []:
         if isinstance(finding, dict):
-            finding_lines.append(_truncate_sentence(f"{finding.get('type') or 'Finding'}: {finding.get('summary') or finding.get('filename') or ''}", 180))
+            finding_lines.append(_truncate_sentence(f"{finding.get('filename') or ''}: {finding.get('summary') or finding.get('type') or ''}", 180))
         else:
             finding_lines.append(_truncate_sentence(finding, 180))
+    deviation_lines: list[str] = []
+    for item in [*(model.get("consistency_notes") or []), *finding_lines]:
+        text = str(item or "").strip()
+        lower = text.lower()
+        if text and (any(token in lower for token in ("abweich", " vs ", "differ", "discrep")) or ("tms" in lower and any(token in lower for token in ("kg", "gewicht", "packstück", "menge")))) and text not in deviation_lines:
+            deviation_lines.append(_truncate_sentence(text, 220))
     match_lines = []
     for match in model.get("tms_matches") or []:
         if isinstance(match, dict):
@@ -917,6 +966,7 @@ def _build_document_activity_html(payload: dict[str, Any], report: dict[str, Any
             f"Analyse-Typ: {doc_type}",
             *field_lines,
         ], tone="neutral")
+        + _html_list_block("Konkrete Abweichung", deviation_lines[:5], tone=model.get("tone") or "neutral", empty="Keine konkrete Abweichung erkannt")
         + _html_list_block("Abgleich", [
             history_line,
             *match_lines,
