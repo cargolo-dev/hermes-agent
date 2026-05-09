@@ -66,6 +66,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes mcp` | Manage MCP server configurations and run Hermes as an MCP server. |
 | `hermes plugins` | Manage Hermes Agent plugins (install, enable, disable, remove). |
 | `hermes tools` | Configure enabled tools per platform. |
+| `hermes computer-use` | Install or check the cua-driver backend (macOS Computer Use). |
 | `hermes sessions` | Browse, export, prune, rename, and delete sessions. |
 | `hermes insights` | Show token/cost/activity analytics. |
 | `hermes fallback` | Interactive manager for the fallback provider chain. |
@@ -958,6 +959,26 @@ hermes tools [--summary]
 
 Without `--summary`, this launches the interactive per-platform tool configuration UI.
 
+## `hermes computer-use`
+
+```bash
+hermes computer-use <subcommand>
+```
+
+Subcommands:
+
+| Subcommand | Description |
+|------------|-------------|
+| `install` | Run the upstream cua-driver installer (macOS only). |
+| `status` | Print whether `cua-driver` is on `$PATH`. |
+
+`hermes computer-use install` is the stable entry point for installing the
+[cua-driver](https://github.com/trycua/cua) binary used by the
+`computer_use` toolset. It runs the same upstream installer that
+`hermes tools` invokes when you first enable Computer Use, so it's safe
+to use for re-running the install if the toolset toggle didn't trigger
+it (for example, on returning-user setups).
+
 ## `hermes sessions`
 
 ```bash
@@ -1077,8 +1098,11 @@ Manage profiles — multiple isolated Hermes instances, each with its own config
 | `show <name>` | Show profile details (home directory, config, etc.). |
 | `alias <name> [--remove] [--name NAME]` | Manage wrapper scripts for quick profile access. |
 | `rename <old> <new>` | Rename a profile. |
-| `export <name> [-o FILE]` | Export a profile to a `.tar.gz` archive. |
-| `import <archive> [--name NAME]` | Import a profile from a `.tar.gz` archive. |
+| `export <name> [-o FILE]` | Export a profile to a `.tar.gz` archive (local backup). |
+| `import <archive> [--name NAME]` | Import a profile from a `.tar.gz` archive (local restore). |
+| `install <source> [--name N] [--alias] [--force] [-y]` | Install a profile distribution from a git URL or local directory. |
+| `update <name> [--force-config] [-y]` | Re-pull a distribution; preserves user data (memories, sessions, auth). |
+| `info <name>` | Show a profile's distribution manifest (version, requirements, source). |
 
 Examples:
 
@@ -1089,6 +1113,8 @@ hermes profile use work
 hermes profile alias work --name h-work
 hermes profile export work -o work-backup.tar.gz
 hermes profile import work-backup.tar.gz --name restored
+hermes profile install github.com/user/my-distro --alias
+hermes profile update work
 hermes -p work chat -q "Hello from work profile"
 ```
 

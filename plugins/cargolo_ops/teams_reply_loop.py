@@ -570,7 +570,10 @@ def process_teams_tms_card_action(
         })
         return {"handled": True, "status": "rejected", "order_id": order_id, "derived_action": action, "response_text": _button_response_text(order_id, action)}
 
-    writeback_enabled = bool(enable_tms_writeback) or str(os.getenv("CARGOLO_ASR_TEAMS_TMS_WRITEBACK") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if enable_tms_writeback is None:
+        writeback_enabled = str(os.getenv("CARGOLO_ASR_TEAMS_TMS_WRITEBACK") or "").strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        writeback_enabled = bool(enable_tms_writeback)
     if not writeback_enabled:
         action = {
             "type": "tms_update_approval_blocked",
