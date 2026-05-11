@@ -978,6 +978,53 @@ class TestTeamsMessageHandling:
         assert route_calls[0]["root"].name == "cargolo_asr"
 
     @pytest.mark.asyncio
+    async def test_cargolo_employee_deep_dive_sends_typing_before_sync_route(self, monkeypatch):
+        def fake_handle_teams_employee_message(**kwargs):
+            raise AssertionError("deep dive must be handled by ops router before employee handoff")
+
+        route_calls = []
+
+        def fake_route_teams_ops_message(**kwargs):
+            route_calls.append(kwargs)
+            return {
+                "handled": True,
+                "classification": "case_deep_dive_local_refresh",
+                "response_text": "<div><h2>🔎 Fallprüfung AN-13038</h2></div>",
+            }
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", fake_route_teams_ops_message, raising=False)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids=["cargolo-hermes"],
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "deep-dive-ack"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="Sag mir alles zu AN-13038",
+            activity_id="msg-dedicated-deep-dive",
+            conversation_type="channel",
+            channel_data={"channel": {"id": "cargolo-hermes"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        assert mock_app.send.await_count == 2
+        assert mock_app.send.await_args_list[0].args[0] == "19:abc@thread.v2"
+        assert "Fallprüfung AN-13038" in mock_app.send.await_args_list[1].args[1]
+        assert route_calls[0]["text"] == "Sag mir alles zu AN-13038"
+
+    @pytest.mark.asyncio
     async def test_cargolo_employee_shared_channel_requires_teams_mention(self, monkeypatch):
         def fake_handle_teams_message(**kwargs):
             return {"handled": False, "reason": "no_card_context"}

@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover - test/import fallback
 _ORDER_RE = re.compile(r"\b(?:AN|BU)-\d{3,}\b", re.IGNORECASE)
 _STATUS_RE = re.compile(r"\b(status|health|readiness|zustand|system|läuft|laeuft|cron)\b", re.IGNORECASE)
 _PENDING_RE = re.compile(r"\b(offene?|pending|freigaben?|review|tms[-\s]?freigaben?)\b", re.IGNORECASE)
-_CASE_CHECK_RE = re.compile(r"\b(prüf(?:e|en)?|pruef(?:e|en)?|check|aktualisier(?:e|en)?|sync|zieh(?:e|en)?)\b", re.IGNORECASE)
+_CASE_CHECK_RE = re.compile(r"\b(prüf(?:e|en)?|pruef(?:e|en)?|(?<!-)check|aktualisier(?:e|en)?|sync|zieh(?:e|en)?)\b", re.IGNORECASE)
 _FULL_CASE_RE = re.compile(r"\b(?:gib|geb|zeig|sag|hol|hole)\b.*\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b|\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b.*\b(?:zu|für|fuer)\b", re.IGNORECASE)
 _WRITE_RE = re.compile(r"\b(schreib(?:e|en)?|setz(?:e|en)?|eintragen|ändern|aendern|update|aktualisier(?:e|en)?)\b", re.IGNORECASE)
 _TMS_FIELD_RE = re.compile(r"\b(TMS|MRN|HBL|MBL|HAWB|Zollreferenz|customs)\b", re.IGNORECASE)
@@ -425,9 +425,9 @@ def _run_local_case_deep_dive(*, root: Path, order_id: str, text: str, user_name
         lifecycle_error = str(exc)
 
     request_text = (
-        f"Gib mir alles zu {order_id}: komplette read-only Lage aus frisch aktualisiertem lokalem Case, "
-        "TMS-Status/Stand, Mail-Historie, Dokumente, Billing/Pricing-Kontext falls vorhanden, "
-        "Auffälligkeiten und konkreter nächster Schritt. Keine TMS-Writes, keine Kundenmail. "
+        f"Gib mir alles zu {order_id}: komplette lesende Lage aus dem soeben synchronisierten lokalen Case, "
+        "aktueller TMS-Status/Stand, Mail-Historie, Dokumente, Billing/Pricing-Kontext falls vorhanden, "
+        "Auffälligkeiten und konkreter nächster Schritt. Rein interne Antwort; keine externe Aktion auslösen. "
         f"Originalfrage: {text}"
     )
     runtime_result = run_employee_runtime(

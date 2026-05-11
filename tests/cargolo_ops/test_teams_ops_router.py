@@ -197,6 +197,26 @@ def test_gib_mir_alles_refreshes_local_case_before_answer(tmp_path: Path, monkey
     assert provider.calls[0]["shipment_number"] == "AN-12345"
 
 
+def test_deep_dive_prompt_remains_read_only_case_assist_not_tms_guard(tmp_path: Path, monkeypatch) -> None:
+    provider = _FakeTMSProvider([{"shipment_number": "AN-12345"}])
+    monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.build_tms_provider_from_env", lambda: provider)
+
+    def fake_sync_case_lifecycle(order_id, **kwargs):
+        root = Path(kwargs["storage_root"])
+        (root / "orders" / order_id).mkdir(parents=True, exist_ok=True)
+        return {"status": "ok", "order_id": order_id}
+
+    monkeypatch.setattr("plugins.cargolo_ops.case_lifecycle.sync_case_lifecycle", fake_sync_case_lifecycle)
+
+    result = route_teams_ops_message(text="Sag mir alles zu AN-12345", root=tmp_path / "cargolo_asr")
+
+    assert result["handled"] is True
+    assert result["classification"] == "case_deep_dive_local_refresh"
+    assert "TMS Guard erforderlich" not in result["response_text"]
+    assert "Fallprüfung AN-12345" in result["response_text"]
+    assert provider.calls[0]["shipment_number"] == "AN-12345"
+
+
 def test_tms_like_free_text_without_card_context_is_guarded(tmp_path: Path) -> None:
     result = route_teams_ops_message(
         text="AN-11755 bitte MRN 26DE99999 ins TMS eintragen",

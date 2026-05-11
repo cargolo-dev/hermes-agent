@@ -769,7 +769,6 @@ class TeamsAdapter(BasePlatformAdapter):
         # Strip <at>BotName</at> HTML tags that Teams prepends for @mentions
         had_teams_at_mention = "<at>" in text
         if had_teams_at_mention:
-            import re
             text = re.sub(r"<at>[^<]*</at>\s*", "", text).strip()
 
         reply_to_message_id = self._extract_reply_to_message_id(activity)
@@ -827,6 +826,16 @@ class TeamsAdapter(BasePlatformAdapter):
         ):
             from hermes_constants import get_hermes_home
             from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message
+
+            # Deep-dive ops commands are handled synchronously before the generic
+            # gateway loop, so the normal gateway typing indicator would not fire.
+            # Send an early Teams typing activity for these long-running TMS/mail/doc refreshes.
+            if re.search(r"\b(?:AN|BU)-\d{3,}\b", text or "", re.IGNORECASE) and re.search(
+                r"\b(?:gib|geb|zeig|sag|hol|hole|prüf(?:e|en)?|pruef(?:e|en)?)\b.*\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b|\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b.*\b(?:zu|für|fuer)\b",
+                text or "",
+                re.IGNORECASE,
+            ):
+                await self.send_typing(str(conv.id))
 
             ops_result = route_teams_ops_message(
                 text=text,

@@ -130,6 +130,28 @@ def _is_teams_send_request(text: str) -> bool:
 
 
 def _is_tms_write_request(text: str) -> bool:
+    read_only_or_negated_write = _has_any(
+        text,
+        (
+            "read-only",
+            "readonly",
+            "nur lesen",
+            "nur lesend",
+            "keine tms-write",
+            "keine tms write",
+            "keine tms-writes",
+            "keine tms writes",
+            "keine tms-änderung",
+            "keine tms aenderung",
+            "keine tms-änderungen",
+            "keine tms aenderungen",
+            "no tms write",
+            "no tms-write",
+        ),
+    )
+    if read_only_or_negated_write:
+        return False
+
     imperative_write = _has_any(
         text,
         (
@@ -189,9 +211,9 @@ def _context_needs_for(text: str, order_id: str | None) -> list[ContextNeed]:
     needs = [ContextNeed.CASE_FOLDER]
     if _has_any(text, ("mail", "historie", "kunde", "kunden", "antwort")):
         needs.append(ContextNeed.MAIL_HISTORY)
-    if _has_any(text, ("tms", "status", "stand", "lage")):
+    if _has_any(text, ("tms", "status", "stand", "lage", "alles", "komplett", "übersicht", "uebersicht")):
         needs.append(ContextNeed.TMS_SNAPSHOT)
-    if _has_any(text, ("dokument", "doc", "awb", "ci", "pl", "commercial invoice", "packing list", "komplett")):
+    if _has_any(text, ("dokument", "doc", "awb", "ci", "pl", "commercial invoice", "packing list", "komplett", "alles")):
         needs.append(ContextNeed.DOCUMENTS)
     if _has_any(text, ("preis", "pricing", "angebot", "rate")):
         needs.append(ContextNeed.PRICING_KB)
