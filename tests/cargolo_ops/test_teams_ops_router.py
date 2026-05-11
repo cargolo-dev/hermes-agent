@@ -149,18 +149,52 @@ def test_correction_followup_with_explicit_order_disambiguates(tmp_path: Path) -
     assert result["teams_tms_review_cards"][0]["value"] == "26DE888888"
 
 
-def test_case_deep_dive_routes_to_employee_agent_prompt_without_direct_write(tmp_path: Path, monkeypatch) -> None:
+def test_case_deep_dive_refreshes_local_case_before_answer(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.build_tms_provider_from_env", lambda: None)
+    calls = []
+
+    def fake_deep_dive(**kwargs):
+        calls.append(kwargs)
+        return {
+            "handled": True,
+            "classification": "case_deep_dive_local_refresh",
+            "order_id": kwargs["order_id"],
+            "response_text": "Lage aktualisiert",
+        }
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router._run_local_case_deep_dive", fake_deep_dive)
     result = route_teams_ops_message(text="prüfe AN-12345 komplett", root=tmp_path / "cargolo_asr")
 
-    assert result["handled"] is False
-    assert result["allow_generic_chat"] is True
-    assert result["classification"] == "case_deep_dive_request"
+    assert result["handled"] is True
+    assert result["classification"] == "case_deep_dive_local_refresh"
     assert result["order_id"] == "AN-12345"
-    assert "ASR Ops Coordinator" in result["agent_prompt"]
-    assert "Mail-Historie" in result["agent_prompt"]
-    assert "read-only" in result["agent_prompt"]
-    assert "Keine Audit-Dumps" in result["agent_prompt"]
+    assert calls[0]["order_id"] == "AN-12345"
+    assert calls[0]["root"] == tmp_path / "cargolo_asr"
+
+
+def test_gib_mir_alles_refreshes_local_case_before_answer(tmp_path: Path, monkeypatch) -> None:
+    provider = _FakeTMSProvider([{"shipment_number": "AN-12345"}])
+    monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.build_tms_provider_from_env", lambda: provider)
+    calls = []
+
+    def fake_deep_dive(**kwargs):
+        calls.append(kwargs)
+        return {
+            "handled": True,
+            "classification": "case_deep_dive_local_refresh",
+            "order_id": kwargs["order_id"],
+            "response_text": "Lage aktualisiert",
+        }
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router._run_local_case_deep_dive", fake_deep_dive)
+
+    result = route_teams_ops_message(text="Hermes CARGOLO Sag mir alles zu AN-12345", root=tmp_path / "cargolo_asr")
+
+    assert result["handled"] is True
+    assert result["classification"] == "case_deep_dive_local_refresh"
+    assert result["order_id"] == "AN-12345"
+    assert calls[0]["text"] == "Hermes CARGOLO Sag mir alles zu AN-12345"
+    assert provider.calls[0]["shipment_number"] == "AN-12345"
 
 
 def test_tms_like_free_text_without_card_context_is_guarded(tmp_path: Path) -> None:
@@ -209,13 +243,26 @@ def test_unknown_tms_case_is_answered_without_generic_agent_or_n8n(tmp_path: Pat
     assert provider.calls[0]["shipment_number"] == "AN-914458534581"
 
 
-def test_existing_tms_case_still_flows_to_employee_prompt(tmp_path: Path, monkeypatch) -> None:
+def test_existing_tms_case_refreshes_local_case(tmp_path: Path, monkeypatch) -> None:
     provider = _FakeTMSProvider([{"shipment_number": "AN-12345"}])
     monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.build_tms_provider_from_env", lambda: provider)
+    calls = []
+
+    def fake_deep_dive(**kwargs):
+        calls.append(kwargs)
+        return {
+            "handled": True,
+            "classification": "case_deep_dive_local_refresh",
+            "order_id": kwargs["order_id"],
+            "response_text": "Lage aktualisiert",
+        }
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router._run_local_case_deep_dive", fake_deep_dive)
 
     result = route_teams_ops_message(text="prüfe AN-12345 komplett", root=tmp_path / "cargolo_asr")
 
-    assert result["handled"] is False
-    assert result["allow_generic_chat"] is True
-    assert result["classification"] == "case_deep_dive_request"
-    assert "TMS-first" in result["agent_prompt"]
+    assert result["handled"] is True
+    assert result["classification"] == "case_deep_dive_local_refresh"
+    assert result["order_id"] == "AN-12345"
+    assert calls[0]["order_id"] == "AN-12345"
+    assert provider.calls[0]["shipment_number"] == "AN-12345"

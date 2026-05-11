@@ -30,6 +30,7 @@ _ORDER_RE = re.compile(r"\b(?:AN|BU)-\d{3,}\b", re.IGNORECASE)
 _STATUS_RE = re.compile(r"\b(status|health|readiness|zustand|system|läuft|laeuft|cron)\b", re.IGNORECASE)
 _PENDING_RE = re.compile(r"\b(offene?|pending|freigaben?|review|tms[-\s]?freigaben?)\b", re.IGNORECASE)
 _CASE_CHECK_RE = re.compile(r"\b(prüf(?:e|en)?|pruef(?:e|en)?|check|aktualisier(?:e|en)?|sync|zieh(?:e|en)?)\b", re.IGNORECASE)
+_FULL_CASE_RE = re.compile(r"\b(?:gib|geb|zeig|sag|hol|hole)\b.*\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b|\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b.*\b(?:zu|für|fuer)\b", re.IGNORECASE)
 _WRITE_RE = re.compile(r"\b(schreib(?:e|en)?|setz(?:e|en)?|eintragen|ändern|aendern|update|aktualisier(?:e|en)?)\b", re.IGNORECASE)
 _TMS_FIELD_RE = re.compile(r"\b(TMS|MRN|HBL|MBL|HAWB|Zollreferenz|customs)\b", re.IGNORECASE)
 _MRN_VALUE_RE = re.compile(r"\b([0-9]{2}[A-Z]{2}[A-Z0-9]{3,})\b", re.IGNORECASE)
@@ -397,6 +398,56 @@ def _coordinator_prompt(text: str, *, order_id: str | None = None, intent: str =
     )
 
 
+def _run_local_case_deep_dive(*, root: Path, order_id: str, text: str, user_name: str | None = None) -> dict[str, Any]:
+    """Refresh the canonical local case first, then synthesize a read-only Teams answer."""
+    try:
+        from .case_lifecycle import sync_case_lifecycle
+        from .employee_agent import EmployeeRequest
+        from .employee_runtime import run_employee_runtime
+    except Exception as exc:  # pragma: no cover - import degradation only
+        return {
+            "handled": True,
+            "classification": "case_deep_dive_unavailable",
+            "order_id": order_id,
+            "response_text": f"⚠️ Fallprüfung für {order_id} konnte nicht gestartet werden: {exc}",
+        }
+
+    lifecycle: dict[str, Any] | None = None
+    lifecycle_error: str | None = None
+    try:
+        lifecycle = sync_case_lifecycle(
+            order_id,
+            storage_root=root,
+            refresh_history=True,
+            analyze_documents=True,
+        )
+    except Exception as exc:
+        lifecycle_error = str(exc)
+
+    request_text = (
+        f"Gib mir alles zu {order_id}: komplette read-only Lage aus frisch aktualisiertem lokalem Case, "
+        "TMS-Status/Stand, Mail-Historie, Dokumente, Billing/Pricing-Kontext falls vorhanden, "
+        "Auffälligkeiten und konkreter nächster Schritt. Keine TMS-Writes, keine Kundenmail. "
+        f"Originalfrage: {text}"
+    )
+    runtime_result = run_employee_runtime(
+        EmployeeRequest(text=request_text, channel="teams", order_id=order_id, actor=user_name),
+        root=root,
+    )
+    response_text = runtime_result.draft_response or f"Lage: {order_id} | Case lokal aktualisiert, keine externe Aktion ausgeführt."
+    if lifecycle_error:
+        response_text = f"⚠️ Vorab-Sync für {order_id} nicht vollständig: {lifecycle_error}\n\n{response_text}"
+    return {
+        "handled": True,
+        "classification": "case_deep_dive_local_refresh",
+        "order_id": order_id,
+        "response_text": response_text,
+        "case_path": str(root / "orders" / order_id),
+        "lifecycle": lifecycle or {"status": "error", "error": lifecycle_error},
+        "result_path": runtime_result.result_path,
+    }
+
+
 def route_teams_ops_message(
     *,
     text: str,
@@ -451,15 +502,11 @@ def route_teams_ops_message(
             "teams_tms_review_cards": pending[:5],
         }
 
-    # Case deep-dive: let the normal Hermes agent use tools/context, but wrap it in a strict ops prompt.
-    if order_id and (_CASE_CHECK_RE.search(raw) or "komplett" in lowered or "case" in lowered):
-        return {
-            "handled": False,
-            "allow_generic_chat": True,
-            "classification": "case_deep_dive_request",
-            "order_id": order_id,
-            "agent_prompt": _coordinator_prompt(raw, order_id=order_id, intent="read_only_case_deep_dive"),
-        }
+    # Case deep-dive: for "gib mir alles" / complete case questions, refresh the
+    # canonical local case first (create if missing, update if present), then
+    # synthesize from the refreshed local TMS/mail/document evidence.
+    if order_id and (_CASE_CHECK_RE.search(raw) or _FULL_CASE_RE.search(raw) or "komplett" in lowered or "case" in lowered):
+        return _run_local_case_deep_dive(root=case_root, order_id=order_id, text=raw, user_name=user_name)
 
     # TMS-looking free text with AN but no card context: guard in-channel.
     # The safe pending tool is only offered from matched card/context prompts.
