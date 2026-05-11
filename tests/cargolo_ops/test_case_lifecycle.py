@@ -26,6 +26,50 @@ def test_case_store_creates_canonical_lifecycle_directories(tmp_path):
     assert (case_root / "documents" / "registry.json").exists()
 
 
+def test_sync_case_lifecycle_skips_unknown_tms_case_without_folder_or_mail_history(tmp_path):
+    with patch("plugins.cargolo_ops.processor._live_shipment_exists", return_value=False), \
+         patch("plugins.cargolo_ops.processor._fetch_tms_bundle") as fetch_bundle, \
+         patch("plugins.cargolo_ops.processor._sync_mail_history") as sync_history:
+        result = sync_case_lifecycle("AN-404404", storage_root=tmp_path, analyze_documents=True)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "shipment_not_found_in_tms"
+    assert not (tmp_path / "orders" / "AN-404404").exists()
+    fetch_bundle.assert_not_called()
+    sync_history.assert_not_called()
+
+
+def test_sync_case_lifecycle_fetches_tms_before_creating_local_case(tmp_path):
+    snapshot = TMSSnapshot(
+        order_id="AN-22222",
+        shipment_number="AN-22222",
+        status="confirmed",
+        source="live",
+        detail={"network": "air"},
+    )
+    events = []
+
+    def fake_fetch(store, order_id, customer_hint, *, persist_case_files=True):
+        events.append(("fetch_tms", (tmp_path / "orders" / order_id).exists(), persist_case_files))
+        return snapshot, {}, {}
+
+    def fake_sync(store, order_id, state, mailbox, *, exclude_message_ids=None):
+        events.append(("sync_mail", (tmp_path / "orders" / order_id).exists(), True))
+        return 0
+
+    with patch("plugins.cargolo_ops.processor._live_shipment_exists", return_value=True), \
+         patch("plugins.cargolo_ops.processor._fetch_tms_bundle", side_effect=fake_fetch), \
+         patch("plugins.cargolo_ops.processor._sync_mail_history", side_effect=fake_sync), \
+         patch("plugins.cargolo_ops.case_lifecycle.analyze_case_documents", side_effect=lambda **kwargs: (kwargs["registry"], [])):
+        result = sync_case_lifecycle("AN-22222", storage_root=tmp_path, analyze_documents=True)
+
+    assert result["status"] == "ok"
+    assert events[0] == ("fetch_tms", False, False)
+    assert events[1][0] == "sync_mail"
+    assert events[1][1] is True
+    assert (tmp_path / "orders" / "AN-22222" / "tms" / "shipment_detail.json").exists()
+
+
 def test_sync_case_lifecycle_mirrors_tms_documents_and_updates_registry(tmp_path):
     source_doc = tmp_path / "source_invoice.txt"
     source_doc.write_text("Commercial invoice AN-12345", encoding="utf-8")
@@ -52,7 +96,8 @@ def test_sync_case_lifecycle_mirrors_tms_documents_and_updates_registry(tmp_path
     store = CaseStore(tmp_path)
     store.append_email_index("AN-12345", {"message_id": "m-old", "received_at": "2026-05-08T08:00:00Z"})
 
-    with patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(snapshot, requirements, {})), \
+    with patch("plugins.cargolo_ops.processor._live_shipment_exists", return_value=True), \
+         patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(snapshot, requirements, {})), \
          patch("plugins.cargolo_ops.processor._sync_mail_history", return_value=0), \
          patch("plugins.cargolo_ops.case_lifecycle.analyze_case_documents", side_effect=lambda **kwargs: (kwargs["registry"], [])):
         result = sync_case_lifecycle("AN-12345", storage_root=tmp_path, analyze_documents=True)
@@ -201,7 +246,8 @@ def test_sync_case_lifecycle_hands_billing_context_to_pricing(tmp_path):
             captured.update(kwargs)
             return {"status": "ok", "event_type": "billing_context_synced", "record_hash": "bill-context"}
 
-    with patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(snapshot, {}, billing_context)), \
+    with patch("plugins.cargolo_ops.processor._live_shipment_exists", return_value=True), \
+         patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(snapshot, {}, billing_context)), \
          patch("plugins.cargolo_ops.processor._sync_mail_history", return_value=0), \
          patch("plugins.cargolo_ops.case_lifecycle.analyze_case_documents", side_effect=lambda **kwargs: (kwargs["registry"], [])), \
          patch("plugins.cargolo_ops.case_lifecycle._load_pricing_ingest_adapter", return_value=FakePricingModule):

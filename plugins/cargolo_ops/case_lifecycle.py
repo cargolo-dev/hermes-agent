@@ -58,6 +58,63 @@ def _tms_mode_from_snapshot(tms_snapshot: dict[str, Any]) -> str:
     return "unknown"
 
 
+def _persist_tms_evidence_sidecars(
+    *,
+    store: CaseStore,
+    order_id: str,
+    snapshot_obj: TMSSnapshot | dict[str, Any],
+    tms_snapshot: dict[str, Any],
+    document_requirements: dict[str, Any],
+    billing_context: dict[str, Any],
+) -> None:
+    """Persist already-fetched TMS evidence after the local case is allowed to exist."""
+    case_root = store.ensure_case(order_id)
+    tms_dir = case_root / "tms"
+    tms_dir.mkdir(parents=True, exist_ok=True)
+    detail = tms_snapshot.get("detail") if isinstance(tms_snapshot.get("detail"), dict) else {}
+    billing_items = tms_snapshot.get("billing_items") if isinstance(tms_snapshot.get("billing_items"), list) else []
+    if detail:
+        (tms_dir / "shipment_detail.json").write_text(json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8")
+    if billing_items:
+        (tms_dir / "shipment_billing_items.json").write_text(json.dumps(billing_items, ensure_ascii=False, indent=2), encoding="utf-8")
+    if document_requirements:
+        (tms_dir / "document_requirements.json").write_text(
+            json.dumps(document_requirements, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    if billing_context:
+        (tms_dir / "billing_context.json").write_text(json.dumps(billing_context, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if isinstance(snapshot_obj, TMSSnapshot):
+        sync_log = {
+            "timestamp": utc_now_iso(),
+            "phase": "read_sync",
+            "action": "fetch_tms_bundle",
+            "source": snapshot_obj.source,
+            "provider": getattr(snapshot_obj, "provider", None),
+            "status": snapshot_obj.status,
+            "shipment_uuid": snapshot_obj.shipment_uuid,
+            "shipment_number": snapshot_obj.shipment_number,
+            "warnings": snapshot_obj.warnings,
+            "document_requirements_synced": bool(document_requirements),
+            "billing_context_synced": bool(billing_context),
+        }
+    else:
+        sync_log = {
+            "timestamp": utc_now_iso(),
+            "phase": "read_sync",
+            "action": "fetch_tms_bundle",
+            "source": tms_snapshot.get("source"),
+            "provider": tms_snapshot.get("provider"),
+            "status": tms_snapshot.get("status"),
+            "shipment_uuid": tms_snapshot.get("shipment_uuid"),
+            "shipment_number": tms_snapshot.get("shipment_number") or order_id,
+            "warnings": tms_snapshot.get("warnings", []),
+            "document_requirements_synced": bool(document_requirements),
+            "billing_context_synced": bool(billing_context),
+        }
+    store.append_tms_sync_log(order_id, sync_log)
+
+
 def _download_tms_document(url: str, target: Path, *, headers: dict[str, str] | None = None) -> tuple[bool, str | None]:
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -194,9 +251,11 @@ def sync_case_lifecycle(
 ) -> dict[str, Any]:
     """Shared read-first lifecycle used by ingest and document monitoring.
 
-    It owns the canonical per-transport folder shape and evidence refresh:
-    folder -> TMS snapshot/requirements -> full-first/delta mail history -> TMS
-    document mirror -> merged registry -> optional document analysis.
+    TMS-first invariant: for live ASR cases the TMS existence/read gate happens
+    before the local case folder is created. Unknown AN/BU returns `skipped`
+    without n8n/mail-history lookup and without creating `orders/<AN-or-BU>/`.
+    Once TMS evidence is positive/usable, the local case becomes the derived
+    working folder for mail history, TMS documents, registry and analysis.
     """
     from . import processor  # late import avoids circular dependency
     from .adapters import build_tms_client_from_env
@@ -206,15 +265,37 @@ def sync_case_lifecycle(
         raise ValueError("sync_case_lifecycle requires a non-empty AN/BU")
 
     store = CaseStore(storage_root)
+    shipment_exists = processor._live_shipment_exists(order_id)
+    if shipment_exists is False:
+        return {
+            "status": "skipped",
+            "reason": "shipment_not_found_in_tms",
+            "order_id": order_id,
+            "message": f"{order_id} not found in ASR TMS; skipped local case creation and mail-history sync.",
+        }
+
+    snapshot_obj, tms_document_requirements, billing_context = processor._fetch_tms_bundle(
+        store,
+        order_id,
+        None,
+        persist_case_files=False,
+    )
+    tms_snapshot = _snapshot_to_dict(snapshot_obj)
+    if tms_document_requirements:
+        tms_snapshot["document_requirements"] = tms_document_requirements
+
     case_existed = store.order_path(order_id).exists()
     case_root = store.ensure_case(order_id)
     state = store.load_case_state(order_id)
     prior_registry = store.load_document_registry(order_id)
-
-    snapshot_obj, tms_document_requirements, billing_context = processor._fetch_tms_bundle(store, order_id, None)
-    tms_snapshot = _snapshot_to_dict(snapshot_obj)
-    if tms_document_requirements:
-        tms_snapshot["document_requirements"] = tms_document_requirements
+    _persist_tms_evidence_sidecars(
+        store=store,
+        order_id=order_id,
+        snapshot_obj=snapshot_obj,
+        tms_snapshot=tms_snapshot,
+        document_requirements=tms_document_requirements,
+        billing_context=billing_context,
+    )
     if billing_context:
         tms_snapshot["billing_context"] = billing_context
         try:

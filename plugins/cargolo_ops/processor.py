@@ -632,23 +632,32 @@ def _fetch_tms_bundle(
     store: CaseStore,
     order_id: str,
     customer_hint: str | None,
+    *,
+    persist_case_files: bool = True,
 ) -> tuple[TMSSnapshot | dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Fetch the main TMS snapshot plus MCP sidecars used by reconciliation."""
+    """Fetch the main TMS snapshot plus MCP sidecars used by reconciliation.
+
+    When persist_case_files=False, this performs the live TMS read without
+    creating/updating the local case folder. Use that for TMS-first gating flows
+    where the local case must only be created after positive TMS evidence exists.
+    """
     live_provider = build_tms_provider_from_env()
     if live_provider is not None:
         try:
             snapshot = live_provider.snapshot_bundle(order_id, customer_hint)
-            tms_dir = store.ensure_case(order_id) / "tms"
-            tms_dir.mkdir(parents=True, exist_ok=True)
+            tms_dir: Path | None = None
+            if persist_case_files:
+                tms_dir = store.ensure_case(order_id) / "tms"
+                tms_dir.mkdir(parents=True, exist_ok=True)
 
             document_requirements: dict[str, Any] = {}
             billing_context: dict[str, Any] = {}
 
-            if snapshot.detail:
+            if persist_case_files and tms_dir is not None and snapshot.detail:
                 (tms_dir / "shipment_detail.json").write_text(
                     json.dumps(snapshot.detail, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
-            if snapshot.billing_items:
+            if persist_case_files and tms_dir is not None and snapshot.billing_items:
                 (tms_dir / "shipment_billing_items.json").write_text(
                     json.dumps(snapshot.billing_items, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
@@ -657,7 +666,7 @@ def _fetch_tms_bundle(
                 raw_document_requirements = live_provider.document_requirements(order_id)
                 if isinstance(raw_document_requirements, dict):
                     document_requirements = raw_document_requirements
-                if document_requirements:
+                if persist_case_files and tms_dir is not None and document_requirements:
                     (tms_dir / "document_requirements.json").write_text(
                         json.dumps(document_requirements, ensure_ascii=False, indent=2), encoding="utf-8"
                     )
@@ -668,26 +677,27 @@ def _fetch_tms_bundle(
                 raw_billing_context = live_provider.billing_context(order_id)
                 if isinstance(raw_billing_context, dict):
                     billing_context = raw_billing_context
-                if billing_context:
+                if persist_case_files and tms_dir is not None and billing_context:
                     (tms_dir / "billing_context.json").write_text(
                         json.dumps(billing_context, ensure_ascii=False, indent=2), encoding="utf-8"
                     )
             except Exception:
                 logger.exception("TMS billing context sync failed for %s", order_id)
 
-            store.append_tms_sync_log(order_id, {
-                "timestamp": utc_now_iso(),
-                "phase": "read_sync",
-                "action": "fetch_tms_bundle",
-                "source": snapshot.source,
-                "provider": getattr(snapshot, "provider", None),
-                "status": snapshot.status,
-                "shipment_uuid": snapshot.shipment_uuid,
-                "shipment_number": snapshot.shipment_number,
-                "warnings": snapshot.warnings,
-                "document_requirements_synced": bool(document_requirements),
-                "billing_context_synced": bool(billing_context),
-            })
+            if persist_case_files:
+                store.append_tms_sync_log(order_id, {
+                    "timestamp": utc_now_iso(),
+                    "phase": "read_sync",
+                    "action": "fetch_tms_bundle",
+                    "source": snapshot.source,
+                    "provider": getattr(snapshot, "provider", None),
+                    "status": snapshot.status,
+                    "shipment_uuid": snapshot.shipment_uuid,
+                    "shipment_number": snapshot.shipment_number,
+                    "warnings": snapshot.warnings,
+                    "document_requirements_synced": bool(document_requirements),
+                    "billing_context_synced": bool(billing_context),
+                })
             logger.info(
                 "TMS live sync OK for %s (uuid=%s provider=%s)",
                 order_id,
