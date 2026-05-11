@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .document_monitoring import run_document_monitoring
+from .document_profiles import is_trusted_source_for_field
+from .document_schema import normalize_document_type
 from .models import utc_now_iso
 from .ops_notifications import send_manual_ops_notification
 from .storage import CaseStore
@@ -110,7 +112,7 @@ def _finding_rank(row: Any) -> tuple[int, str]:
     severity = str(row.get("severity") or "").lower()
     finding_type = str(row.get("type") or "").lower()
     text = str(row.get("summary") or "").lower()
-    if severity in {"critical", "high"} or "mrn" in finding_type or "customs" in finding_type:
+    if severity in {"critical", "high", "blocker"} or "mrn" in finding_type or "customs" in finding_type:
         return (0, text)
     if any(token in finding_type + " " + text for token in ("weight", "gewicht", "piece", "packstück", "package")):
         return (1, text)
@@ -210,6 +212,156 @@ def _same_location(tms_value: Any, doc_value: Any) -> bool:
     return tms_alias in doc or doc in tms_alias or tms in doc
 
 
+def _is_date_like_mbl_candidate(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    year_first = r"^(?:19|20)\d{2}[-./]?\d{2}[-./]?\d{2}"
+    eu_day_first = r"^(?:0?[1-9]|[12]\d|3[01])[-./](?:0?[1-9]|1[0-2])[-./](?:(?:19|20)\d{2}|\d{2})"
+    eu_day_month_without_year = r"^(?:0?[1-9]|[12]\d|3[01])[-./](?:0?[1-9]|1[0-2])(?:[A-Za-z]+|$)"
+    return bool(
+        re.match(year_first, text)
+        or re.match(eu_day_first, text)
+        or re.match(eu_day_month_without_year, text)
+    )
+
+
+def _is_valid_mbl_candidate(value: Any) -> bool:
+    text = _clean(value)
+    if not text or _is_date_like_mbl_candidate(text):
+        return False
+    normalized = _norm(text)
+    if len(normalized) < 6:
+        return False
+    placeholder_values = {
+        "unknown",
+        "unbekannt",
+        "notreadable",
+        "unreadable",
+        "nichtlesbar",
+        "notavailable",
+        "notapplicable",
+        "missing",
+        "pending",
+        "tobeadvised",
+        "tobeconfirmed",
+    }
+    if normalized in placeholder_values:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ./_-]*[A-Za-z0-9]", text):
+        return False
+    return bool(re.search(r"\d", text))
+
+
+def _select_explicit_mbl_candidate(fields: dict[str, Any]) -> str:
+    for key in ("mbl_number", "master_bl_number", "bill_of_lading_number", "bl_number"):
+        candidate = _clean(fields.get(key))
+        if _is_valid_mbl_candidate(candidate):
+            return candidate
+    return ""
+
+
+def _is_valid_container_candidate(value: Any) -> bool:
+    return bool(re.fullmatch(r"[A-Z]{4}\d{7}", str(value or "").strip()))
+
+
+def _is_valid_document_field_evidence(target: str, value: Any) -> bool:
+    if target == "mbl_number":
+        return _is_valid_mbl_candidate(value)
+    if target == "container_number":
+        return _is_valid_container_candidate(value)
+    return bool(_clean(value))
+
+
+def _has_uploaded_document_blocker_finding(findings: list[Any], filename: Any) -> bool:
+    uploaded_norm = str(filename or "").strip().lower()
+    for row in findings:
+        if not isinstance(row, dict):
+            continue
+        if uploaded_norm and str(row.get("filename") or "").strip().lower() != uploaded_norm:
+            continue
+        severity = str(row.get("severity") or "").strip().lower()
+        finding_type = str(row.get("type") or "").strip().lower()
+        if severity in {"high", "critical", "blocker"} or "blocker" in finding_type:
+            return True
+    return False
+
+
+def _has_blocker_finding(findings: list[Any]) -> bool:
+    for row in findings:
+        if not isinstance(row, dict):
+            continue
+        severity = str(row.get("severity") or "").strip().lower()
+        finding_type = str(row.get("type") or "").strip().lower()
+        if severity == "blocker" or "blocker" in finding_type:
+            return True
+    return False
+
+
+def _effective_trusted_doc_type(event_doc_type: Any, uploaded: dict[str, Any], target: str, value: Any) -> str:
+    analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+    candidates = [
+        analysis.get("doc_type"),
+        uploaded.get("analysis_doc_type"),
+        uploaded.get("doc_type"),
+        event_doc_type,
+    ]
+    legacy_bl_seen = False
+    fallback_normalized = ""
+    for candidate in candidates:
+        normalized = normalize_document_type(candidate)
+        if normalized == "bill_of_lading":
+            legacy_bl_seen = True
+            fallback_normalized = normalized
+            continue
+        if normalized and normalized != "unknown":
+            return normalized
+        if normalized and not fallback_normalized:
+            fallback_normalized = normalized
+
+    if legacy_bl_seen:
+        fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+        has_bl_evidence = bool(
+            _select_explicit_mbl_candidate(fields)
+            or _clean(fields.get("hbl_number") or fields.get("house_bl_number"))
+            or _clean(fields.get("bill_of_lading_number") or fields.get("bl_number"))
+            or (target in {"mbl_number", "hbl_number", "container_number"} and _is_valid_document_field_evidence(target, value))
+        )
+        if has_bl_evidence:
+            return "house_bill_of_lading" if target == "hbl_number" else "master_bill_of_lading"
+    return fallback_normalized or normalize_document_type(event_doc_type)
+
+
+def _mbl_candidate_field_name(fields: dict[str, Any], value: Any) -> str:
+    value_norm = _norm(value)
+    for key in ("mbl_number", "master_bl_number", "bill_of_lading_number", "bl_number"):
+        candidate = _clean(fields.get(key))
+        if _is_valid_mbl_candidate(candidate) and _norm(candidate) == value_norm:
+            return key
+    return ""
+
+
+def _field_source_allows_mbl_candidate(analysis: dict[str, Any], value: Any) -> bool:
+    field_sources = analysis.get("field_sources") if isinstance(analysis.get("field_sources"), dict) else {}
+    if not field_sources:
+        return True
+    fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    candidate_key = _mbl_candidate_field_name(fields, value) or "mbl_number"
+    source_meta = field_sources.get(candidate_key)
+    if not isinstance(source_meta, dict):
+        return True
+    provenance = " ".join(
+        _clean(source_meta.get(part))
+        for part in ("label", "source", "raw_context")
+        if _clean(source_meta.get(part))
+    )
+    if not provenance:
+        return False
+    has_bl_context = bool(re.search(r"\b(?:b\s*/\s*l|bl|bill\s+of\s+lading|master|ocean)\b", provenance, re.IGNORECASE))
+    has_wrong_context = bool(re.search(r"\b(?:booking|invoice|date)\b", provenance, re.IGNORECASE))
+    return has_bl_context and not has_wrong_context
+
+
 def _contains_reference(haystack: dict[str, Any], value: Any) -> bool:
     needle = _norm(value)
     if not needle:
@@ -235,8 +387,8 @@ def _build_document_field_comparison(report: dict[str, Any], filename: str) -> l
     main_leg = next((leg for leg in legs if isinstance(leg, dict) and str(leg.get("leg_type") or "") == "main_carriage"), {})
 
     refs = analysis.get("references") if isinstance(analysis.get("references"), list) else []
-    doc_number = _clean(fields.get("document_number"))
-    container_doc = next((str(ref).strip() for ref in refs if re.fullmatch(r"[A-Z]{4}\d{7}", str(ref).strip())), "")
+    mbl_doc = _select_explicit_mbl_candidate(fields)
+    container_doc = next((str(ref).strip() for ref in refs if _is_valid_container_candidate(ref)), "")
     vessel_doc = "EVER GREET" if _contains_reference(analysis, "EVER GREET") else ""
 
     comparisons: list[dict[str, str]] = []
@@ -270,7 +422,7 @@ def _build_document_field_comparison(report: dict[str, Any], filename: str) -> l
     add("POD", freight.get("pod_code") or main_leg.get("destination"), fields.get("pod"), match=_same_location(freight.get("pod_code") or main_leg.get("destination"), fields.get("pod")))
     add("ETD", _date_from_ms(main_leg.get("etd")) or _date_from_ms((detail.get("milestones") or {}).get("etd_main_carriage")), fields.get("etd"), target="Hauptlauf-ETD")
     add("ETA", dates.get("estimated_delivery_date") or _date_from_ms((detail.get("milestones") or {}).get("eta_main_carriage")), fields.get("eta"), target="ETA")
-    add("MBL / B/L-Nr.", freight.get("mbl_number") or freight.get("bl_number"), doc_number, target="mbl_number")
+    add("MBL / B/L-Nr.", freight.get("mbl_number") or freight.get("bl_number"), mbl_doc, target="mbl_number")
     add("Container", freight.get("container_number"), container_doc, target="container_number")
     if vessel_doc or main_leg.get("carrier") or main_leg.get("vessel_name"):
         add("Schiff", main_leg.get("vessel_name") or main_leg.get("carrier"), vessel_doc, target="Vessel/Hauptlauf")
@@ -394,6 +546,7 @@ def _queue_tms_review_cards_from_comparisons(
     report: dict[str, Any],
     event: dict[str, Any],
     comparisons: list[dict[str, str]],
+    findings: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Persist Teams approval items for document-derived TMS field updates.
 
@@ -419,6 +572,12 @@ def _queue_tms_review_cards_from_comparisons(
     activity_id = _activity_id(event)
     context_id = f"{order_id}:{activity_id}:document_monitor" if activity_id else f"{order_id}:document_monitor"
     supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference"}
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    filename = metadata.get("file_name") or metadata.get("filename") or event.get("field_name")
+    doc_type = metadata.get("document_type") or ""
+    uploaded = _select_uploaded_analysis(report, str(filename))
+    if _has_uploaded_document_blocker_finding(findings or [], filename):
+        return []
     cards: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for row in comparisons:
@@ -427,6 +586,14 @@ def _queue_tms_review_cards_from_comparisons(
         target = str(row.get("target") or "").strip()
         value = str(row.get("doc") or "").strip()
         if target not in supported_targets or not value or value == "nicht lesbar":
+            continue
+        effective_doc_type = _effective_trusted_doc_type(doc_type, uploaded, target, value)
+        if not is_trusted_source_for_field(effective_doc_type, target):
+            continue
+        analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+        if target == "mbl_number" and not _field_source_allows_mbl_candidate(analysis, value):
+            continue
+        if not _is_valid_document_field_evidence(target, value):
             continue
         key = (target, value)
         if key in seen:
@@ -494,14 +661,14 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
     risk = str(reconciliation.get("risk") or "low").strip().lower()
     needs_review = bool(reconciliation.get("needs_human_review"))
     findings = reconciliation.get("findings") if isinstance(reconciliation.get("findings"), list) else []
-    priority = "high" if risk in {"high", "critical"} else ("medium" if needs_review or findings else "low")
+    priority = "high" if risk in {"high", "critical"} or _has_blocker_finding(findings) else ("medium" if needs_review or findings else "low")
     context = report.get("tms_context") if isinstance(report.get("tms_context"), dict) else {}
     comparisons = _build_document_field_comparison(report, str(filename))
     if any(row.get("status") in {"diff", "missing_tms"} for row in comparisons):
         needs_review = True
         if priority == "low":
             priority = "medium"
-    tms_review_cards = _queue_tms_review_cards_from_comparisons(report=report, event=event, comparisons=comparisons)
+    tms_review_cards = _queue_tms_review_cards_from_comparisons(report=report, event=event, comparisons=comparisons, findings=findings)
     message = _human_document_message(
         order_id=report.get("order_id"),
         filename=filename,

@@ -5,12 +5,79 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from plugins.cargolo_ops.document_analysis import analyze_case_documents
+from plugins.cargolo_ops.document_analysis import (
+    analyze_case_documents,
+    _image_document_messages,
+    _profile_guidance_prompt,
+)
 
 
 class _FakeResponse:
     def __init__(self, content: str):
         self.choices = [SimpleNamespace(message=SimpleNamespace(content=content, reasoning=None, reasoning_content=None, reasoning_details=None))]
+
+
+def test_legacy_document_types_get_profile_guidance_fallbacks():
+    guidance = _profile_guidance_prompt(
+        ["air_waybill", "customs_document", "mrn", "billing", "proof_of_delivery"],
+        [],
+    )
+
+    assert "keine spezifischen bekannten/erwarteten Dokumentprofile" not in guidance
+    assert "customs_instruction" in guidance
+    assert "export_accompanying_document" in guidance
+    assert "tax_assessment" in guidance
+    assert "outgoing_invoice" in guidance
+    assert "freight_cost_invoice_cfr_cpt" in guidance
+    assert "shipment_advice" in guidance
+    assert "customer_misc" in guidance
+    assert "internal_misc" in guidance
+    assert guidance.count("- ") <= 8
+
+
+def test_legacy_expected_document_types_get_profile_guidance_fallbacks():
+    guidance = _profile_guidance_prompt(
+        [],
+        ["air_waybill", "customs_document", "mrn", "billing", "proof_of_delivery"],
+    )
+
+    assert "keine spezifischen bekannten/erwarteten Dokumentprofile" not in guidance
+    for profile_type in (
+        "customs_instruction",
+        "export_accompanying_document",
+        "tax_assessment",
+        "outgoing_invoice",
+        "freight_cost_invoice_cfr_cpt",
+        "shipment_advice",
+        "customer_misc",
+        "internal_misc",
+    ):
+        assert profile_type in guidance
+
+
+def test_image_document_prompt_includes_profile_guidance_common_fields_and_field_sources():
+    messages = _image_document_messages(
+        order_id="AN-IMG",
+        filename="packing-list.png",
+        mime_type="image/png",
+        registry_types=["packing_list"],
+        expected_types=["commercial_invoice", "packing_list"],
+        tms_snapshot={"detail": {"company_name": "Example GmbH"}},
+        image_data_url="data:image/png;base64,abc",
+    )
+
+    prompt_text = messages[1]["content"][0]["text"]
+    assert "Gemeinsame Extraktionsfelder" in prompt_text
+    assert "document_number" in prompt_text
+    assert "container_number" in prompt_text
+    assert "gross_weight" in prompt_text
+    assert "Profil-Hinweise" in prompt_text
+    assert "packing_list" in prompt_text
+    assert "commercial_invoice" in prompt_text
+    assert "critical checks" in prompt_text
+    assert "field_sources" in prompt_text
+    assert "value, label/source, confidence, raw_context/page" in prompt_text
+    assert "extracted_fields" in prompt_text
 
 
 def test_analyze_case_documents_with_separate_openrouter_model(tmp_path):
@@ -43,6 +110,10 @@ def test_analyze_case_documents_with_separate_openrouter_model(tmp_path):
         "references": ["INV-77"],
         "suggested_registry_types": ["commercial_invoice"],
         "extracted_fields": {"invoice_number": "INV-77", "amount": "1200", "currency": "EUR"},
+        "field_sources": {
+            "invoice_number": {"value": "INV-77", "label": "Invoice No.", "confidence": "high", "raw_context": "Invoice INV-77"},
+            "currency": {"value": "EUR", "label": "Currency", "confidence": "high", "page": 1},
+        },
         "missing_or_unreadable": [],
         "consistency_notes": ["Sendungsnummer passt zum Auftrag."],
         "operational_flags": ["DOCUMENT_OK"],
@@ -76,7 +147,27 @@ def test_analyze_case_documents_with_separate_openrouter_model(tmp_path):
     assert payload["model"] == "google/gemini-3-flash-preview"
     assert payload["transport_method"] == "native_file"
     assert payload["extracted_fields"]["invoice_number"] == "INV-77"
+    assert payload["field_sources"]["invoice_number"]["value"] == "INV-77"
+    assert payload["field_sources"]["invoice_number"]["label"] == "Invoice No."
     assert captured["task"] == "document_analysis"
+    prompt_text = captured["messages"][1]["content"][0]["text"]
+    assert '"mbl_number"' in prompt_text
+    assert '"master_bl_number"' in prompt_text
+    assert '"bill_of_lading_number"' in prompt_text
+    assert '"bl_number"' in prompt_text
+    assert "document_number ist generisch" in prompt_text
+    assert "keine Datumswerte" in prompt_text
+    assert "B/L/Master B/L/Ocean B/L" in prompt_text
+    assert "Gemeinsame Extraktionsfelder" in prompt_text
+    assert "shipment_number" in prompt_text
+    assert "gross_weight" in prompt_text
+    assert "incoterm_named_place" in prompt_text
+    assert "Profil-Hinweise" in prompt_text
+    assert "commercial_invoice" in prompt_text
+    assert "packing_list" in prompt_text
+    assert "critical checks" in prompt_text
+    assert "field_sources" in prompt_text
+    assert "value, label/source, confidence, raw_context/page" in prompt_text
     file_block = captured["messages"][1]["content"][1]
     assert file_block["type"] == "file"
     assert file_block["file"]["filename"] == "invoice.txt"

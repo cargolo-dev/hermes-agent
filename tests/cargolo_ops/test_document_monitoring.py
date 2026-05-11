@@ -4,9 +4,77 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from plugins.cargolo_ops.document_monitoring import run_document_monitoring
 from plugins.cargolo_ops.document_reconciliation import reconcile_documents
 from plugins.cargolo_ops.document_activity_monitor import _processor_result_from_report, run_document_activity_monitor
+
+
+def _processor_result_for_uploaded_fields(
+    tmp_path,
+    *,
+    filename="document.pdf",
+    event_doc_type="master_bl",
+    analysis_doc_type="bill_of_lading",
+    extracted_fields=None,
+    references=None,
+    field_sources=None,
+    findings=None,
+    freight_details=None,
+):
+    analysis_path = tmp_path / f"{filename}.analysis.json"
+    registry_path = tmp_path / f"{filename}.registry.json"
+    snapshot_path = tmp_path / f"{filename}.snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": filename,
+                "doc_type": analysis_doc_type,
+                "summary": "Uploaded document under test",
+                "references": references or [],
+                "extracted_fields": extracted_fields or {},
+                "field_sources": field_sources or {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "analyzed_documents": [
+                    {"filename": filename, "analysis_path": str(analysis_path), "analysis_doc_type": analysis_doc_type}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "freight_details": freight_details or {"pol_code": "CNNGB", "pod_code": "DEHAM", "mbl_number": "", "container_number": ""},
+                    "transport_legs": [],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    return _processor_result_from_report(
+        {
+            "order_id": "AN-11790",
+            "case_root": str(tmp_path / "orders" / "AN-11790"),
+            "tms_context": {"status": "customs_pending", "network": "sea"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": findings or []},
+        },
+        {"id": 9001, "changed_at": "2026-05-11T10:00:00Z", "metadata": {"file_name": filename, "document_type": event_doc_type}},
+    )
 
 
 def test_reconciliation_does_not_turn_missing_docs_alone_into_risk():
@@ -136,6 +204,82 @@ def test_processor_result_uses_human_document_message_without_risk_dump():
     assert result["pending_action_summary"]["review"] == 1
 
 
+def test_processor_result_escalates_blocker_finding_to_high_priority():
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-BLOCKER",
+            "tms_context": {"status": "customs_pending", "network": "sea"},
+            "lifecycle": {},
+            "registry_summary": {},
+            "reconciliation": {
+                "risk": "low",
+                "needs_human_review": True,
+                "findings": [
+                    {
+                        "type": "document_profile_blocker",
+                        "code": "proforma_invoice",
+                        "severity": "blocker",
+                        "filename": "invoice.pdf",
+                        "summary": "Commercial invoice is marked as proforma.",
+                    }
+                ],
+            },
+        },
+        {"id": 78, "metadata": {"file_name": "invoice.pdf", "document_type": "commercial_invoice"}},
+    )
+
+    assert result["analysis_priority"] == "high"
+    assert "Commercial invoice is marked as proforma" in result["message"]
+
+
+def test_reconciliation_treats_commercial_invoice_zero_value_as_blocker_high_risk(tmp_path):
+    analysis_path = tmp_path / "invoice_zero_analysis.json"
+    analysis_path.write_text(
+        json.dumps({"doc_type": "commercial_invoice", "extracted_fields": {"goods_value": "0", "currency": "EUR"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    report = reconcile_documents(
+        order_id="AN-CI",
+        tms_snapshot={"detail": {"network": "sea"}},
+        registry={
+            "expected_types": [],
+            "received_types": ["commercial_invoice"],
+            "received_documents": [{"filename": "invoice.pdf", "analysis_status": "ok"}],
+            "analyzed_documents": [
+                {"filename": "invoice.pdf", "analysis_doc_type": "commercial_invoice", "analysis_path": str(analysis_path)}
+            ],
+        },
+    )
+
+    assert report["risk"] == "high"
+    assert any(row.get("severity") == "blocker" and row.get("code") == "zero_value" for row in report["findings"])
+
+
+def test_reconciliation_treats_commercial_invoice_proforma_as_blocker_high_risk(tmp_path):
+    analysis_path = tmp_path / "invoice_proforma_analysis.json"
+    analysis_path.write_text(
+        json.dumps({"doc_type": "commercial_invoice", "summary": "Proforma invoice for customs preview", "extracted_fields": {"goods_value": "100", "currency": "EUR"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    report = reconcile_documents(
+        order_id="AN-CI",
+        tms_snapshot={"detail": {"network": "sea"}},
+        registry={
+            "expected_types": [],
+            "received_types": ["commercial_invoice"],
+            "received_documents": [{"filename": "proforma.pdf", "analysis_status": "ok"}],
+            "analyzed_documents": [
+                {"filename": "proforma.pdf", "analysis_doc_type": "commercial_invoice", "analysis_path": str(analysis_path)}
+            ],
+        },
+    )
+
+    assert report["risk"] == "high"
+    assert any(row.get("severity") == "blocker" and row.get("code") == "proforma_invoice" for row in report["findings"])
+
+
 def test_processor_result_prioritizes_uploaded_document_and_labels_master_bl():
     result = _processor_result_from_report(
         {
@@ -167,7 +311,321 @@ def test_processor_result_prioritizes_uploaded_document_and_labels_master_bl():
     assert "3100 kg" not in message
 
 
-def test_processor_result_compares_uploaded_bl_fields_against_tms(tmp_path):
+def test_processor_result_keeps_untrusted_invoice_mbl_text_but_skips_teams_card(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="invoice-with-mbl.pdf",
+        event_doc_type="commercial_invoice",
+        analysis_doc_type="commercial_invoice",
+        extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+    )
+
+    assert "MBL / B/L-Nr. fehlt im TMS" in result["message"]
+    assert result["teams_tms_review_cards"] == []
+
+
+def test_processor_result_queues_trusted_master_bl_mbl_card(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="master-bl.pdf",
+        event_doc_type="master_bl",
+        analysis_doc_type="master_bill_of_lading",
+        extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+    )
+
+    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+
+
+def test_processor_result_uses_analyzed_master_bl_type_when_event_has_legacy_bill_of_lading(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="legacy-event-bl.pdf",
+        event_doc_type="bill_of_lading",
+        analysis_doc_type="master_bill_of_lading",
+        extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+    )
+
+    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+
+
+def test_processor_result_allows_legacy_bill_of_lading_with_explicit_bl_field_evidence(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="legacy-explicit-bl.pdf",
+        event_doc_type="bill_of_lading",
+        analysis_doc_type="bill_of_lading",
+        extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+    )
+
+    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+
+
+def test_processor_result_uses_analyzed_master_bl_type_when_event_doc_type_missing(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="missing-event-type-bl.pdf",
+        event_doc_type="",
+        analysis_doc_type="master_bill_of_lading",
+        extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+    )
+
+    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+
+
+def test_processor_result_allows_missing_event_type_with_analyzed_legacy_bl_evidence(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="missing-event-legacy-bl.pdf",
+        event_doc_type="",
+        analysis_doc_type="bill_of_lading",
+        extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+    )
+
+    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+
+
+def test_processor_result_blocks_mbl_card_when_field_source_is_booking_number(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="booking-source-master-bl.pdf",
+        event_doc_type="master_bl",
+        analysis_doc_type="master_bill_of_lading",
+        extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+        field_sources={
+            "mbl_number": {
+                "value": "NGP3497068",
+                "label": "Booking No.",
+                "source": "carrier booking confirmation",
+                "raw_context": "Booking No. NGP3497068",
+            }
+        },
+    )
+
+    assert "MBL / B/L-Nr. fehlt im TMS" in result["message"]
+    assert result["teams_tms_review_cards"] == []
+
+
+def test_processor_result_blocks_mbl_card_when_field_source_is_invoice_number(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="invoice-source-master-bl.pdf",
+        event_doc_type="master_bl",
+        analysis_doc_type="master_bill_of_lading",
+        extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+        field_sources={
+            "mbl_number": {
+                "value": "NGP3497068",
+                "label": "Invoice No.",
+                "source": "invoice header",
+                "raw_context": "Invoice No. NGP3497068",
+            }
+        },
+    )
+
+    assert "MBL / B/L-Nr. fehlt im TMS" in result["message"]
+    assert result["teams_tms_review_cards"] == []
+
+
+def test_processor_result_queues_mbl_card_when_field_source_is_master_bl_number(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="master-bl-source.pdf",
+        event_doc_type="master_bl",
+        analysis_doc_type="master_bill_of_lading",
+        extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+        field_sources={
+            "mbl_number": {
+                "value": "NGP3497068",
+                "label": "Master B/L No.",
+                "source": "ocean bill of lading header",
+                "raw_context": "Master B/L No. NGP3497068",
+            }
+        },
+    )
+
+    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+
+
+def test_processor_result_queues_trusted_packing_list_valid_container_card(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="packing-list.pdf",
+        event_doc_type="packing_list",
+        analysis_doc_type="packing_list",
+        extracted_fields={"pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+        references=["XHCU2996441"],
+    )
+
+    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("container_number", "XHCU2996441")]
+
+
+def test_processor_result_blocks_master_bl_cards_when_uploaded_file_has_blocker_finding(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="blocked-master-bl.pdf",
+        event_doc_type="master_bl",
+        analysis_doc_type="master_bill_of_lading",
+        extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+        references=["XHCU2996441"],
+        findings=[
+            {
+                "type": "document_profile_blocker",
+                "severity": "blocker",
+                "filename": "blocked-master-bl.pdf",
+                "summary": "Dokument ist als Entwurf/Blocker markiert.",
+            }
+        ],
+    )
+
+    assert "MBL / B/L-Nr. fehlt im TMS" in result["message"]
+    assert "Container fehlt im TMS" in result["message"]
+    assert "Dokument ist als Entwurf/Blocker markiert" in result["message"]
+    assert result["teams_tms_review_cards"] == []
+
+
+def test_processor_result_rejects_date_like_document_number_as_mbl_but_keeps_container_card(tmp_path):
+    analysis_path = tmp_path / "date_like_analysis.json"
+    registry_path = tmp_path / "date_like_registry.json"
+    snapshot_path = tmp_path / "date_like_tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": "2026-05-0907MFD.pdf",
+                "doc_type": "bill_of_lading",
+                "summary": "B/L document with generic document code and container reference",
+                "references": ["2026-05-0907MFD", "XHCU2996441"],
+                "extracted_fields": {
+                    "document_number": "2026-05-0907MFD",
+                    "pol": "Ningbo, China",
+                    "pod": "Hamburg, Germany",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "analyzed_documents": [
+                    {"filename": "2026-05-0907MFD.pdf", "analysis_path": str(analysis_path), "analysis_doc_type": "bill_of_lading"}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "freight_details": {"pol_code": "CNNGB", "pod_code": "DEHAM", "mbl_number": "", "container_number": ""},
+                    "transport_legs": [],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-11790",
+            "case_root": str(tmp_path / "orders" / "AN-11790"),
+            "tms_context": {"status": "customs_pending", "network": "sea"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+        },
+        {"id": 1264, "changed_at": "2026-05-11T10:00:00Z", "metadata": {"file_name": "2026-05-0907MFD.pdf", "document_type": "master_bl"}},
+    )
+
+    message = result["message"]
+    assert "2026-05-0907MFD" not in "\n".join(
+        f"{card['target']}={card['value']}" for card in result["teams_tms_review_cards"]
+    )
+    assert "MBL / B/L-Nr. fehlt im TMS" not in message
+    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("container_number", "XHCU2996441")]
+
+
+@pytest.mark.parametrize(
+    "mbl_number",
+    [
+        "09.05MFD",
+        "09/05MFD",
+        "09-05ABC",
+        "31.12ABC",
+        "SEA-WAYBILL",
+        "MASTER-BL",
+        "BILL-OF-LADING",
+        "HAPAG-LLOYD",
+        "OCEAN/BL",
+    ],
+)
+def test_processor_result_rejects_false_positive_explicit_mbl_numbers(tmp_path, mbl_number):
+    analysis_path = tmp_path / "false_positive_mbl_analysis.json"
+    registry_path = tmp_path / "false_positive_mbl_registry.json"
+    snapshot_path = tmp_path / "false_positive_mbl_tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": f"{mbl_number}.pdf",
+                "doc_type": "bill_of_lading",
+                "summary": "B/L document with non-reference label in the MBL field",
+                "references": [],
+                "extracted_fields": {
+                    "mbl_number": mbl_number,
+                    "pol": "Ningbo, China",
+                    "pod": "Hamburg, Germany",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "analyzed_documents": [
+                    {"filename": f"{mbl_number}.pdf", "analysis_path": str(analysis_path), "analysis_doc_type": "bill_of_lading"}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "freight_details": {"pol_code": "CNNGB", "pod_code": "DEHAM", "mbl_number": "", "container_number": ""},
+                    "transport_legs": [],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-11790",
+            "case_root": str(tmp_path / "orders" / "AN-11790"),
+            "tms_context": {"status": "customs_pending", "network": "sea"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+        },
+        {"id": 1266, "changed_at": "2026-05-11T10:00:00Z", "metadata": {"file_name": f"{mbl_number}.pdf", "document_type": "master_bl"}},
+    )
+
+    message = result["message"]
+    assert "MBL / B/L-Nr. fehlt im TMS" not in message
+    assert [card for card in result["teams_tms_review_cards"] if card["target"] == "mbl_number"] == []
+
+
+@pytest.mark.parametrize("mbl_field_name", ["mbl_number", "master_bl_number", "bill_of_lading_number", "bl_number"])
+def test_processor_result_compares_uploaded_explicit_bl_fields_against_tms(tmp_path, mbl_field_name):
     analysis_path = tmp_path / "analysis.json"
     registry_path = tmp_path / "registry.json"
     snapshot_path = tmp_path / "tms_snapshot.json"
@@ -179,7 +637,7 @@ def test_processor_result_compares_uploaded_bl_fields_against_tms(tmp_path):
                 "summary": "Draft B/L EVER GREET",
                 "references": ["NGP3497068", "XHCU2996441"],
                 "extracted_fields": {
-                    "document_number": "NGP3497068",
+                    mbl_field_name: "NGP3497068",
                     "pol": "Ningbo, China",
                     "pod": "Hamburg, Germany",
                     "etd": "2026-05-06",
@@ -246,6 +704,132 @@ def test_processor_result_compares_uploaded_bl_fields_against_tms(tmp_path):
     assert all(card["action_id"] for card in cards)
     pending_path = tmp_path / "orders" / "AN-11790" / "teams" / "pending_tms_actions.jsonl"
     assert pending_path.exists()
+
+
+@pytest.mark.parametrize("placeholder", ["unknown", "nicht lesbar", "not readable", "unreadable", "n/a"])
+def test_processor_result_rejects_placeholder_explicit_mbl_fields(tmp_path, placeholder):
+    analysis_path = tmp_path / "placeholder_analysis.json"
+    registry_path = tmp_path / "placeholder_registry.json"
+    snapshot_path = tmp_path / "placeholder_tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": "draft-bl.pdf",
+                "doc_type": "bill_of_lading",
+                "summary": "B/L document with unreadable MBL field",
+                "references": [],
+                "extracted_fields": {
+                    "mbl_number": placeholder,
+                    "pol": "Ningbo, China",
+                    "pod": "Hamburg, Germany",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "analyzed_documents": [
+                    {"filename": "draft-bl.pdf", "analysis_path": str(analysis_path), "analysis_doc_type": "bill_of_lading"}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "freight_details": {"pol_code": "CNNGB", "pod_code": "DEHAM", "mbl_number": "", "container_number": ""},
+                    "transport_legs": [],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-11790",
+            "case_root": str(tmp_path / "orders" / "AN-11790"),
+            "tms_context": {"status": "customs_pending", "network": "sea"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+        },
+        {"id": 1265, "changed_at": "2026-05-11T10:00:00Z", "metadata": {"file_name": "draft-bl.pdf", "document_type": "master_bl"}},
+    )
+
+    message = result["message"]
+    assert "MBL / B/L-Nr. fehlt im TMS" not in message
+    assert result["teams_tms_review_cards"] == []
+
+
+@pytest.mark.parametrize("date_like_mbl", ["09.05.2026", "09/05/2026", "09.05.26", "09.05.2026MFD", "09-05-26ABC"])
+def test_processor_result_rejects_eu_date_like_explicit_mbl_fields(tmp_path, date_like_mbl):
+    analysis_path = tmp_path / "eu_date_like_analysis.json"
+    registry_path = tmp_path / "eu_date_like_registry.json"
+    snapshot_path = tmp_path / "eu_date_like_tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": "draft-bl.pdf",
+                "doc_type": "bill_of_lading",
+                "summary": "B/L document with date-like explicit MBL field",
+                "references": ["XHCU2996441"],
+                "extracted_fields": {
+                    "mbl_number": date_like_mbl,
+                    "pol": "Ningbo, China",
+                    "pod": "Hamburg, Germany",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "analyzed_documents": [
+                    {"filename": "draft-bl.pdf", "analysis_path": str(analysis_path), "analysis_doc_type": "bill_of_lading"}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "freight_details": {"pol_code": "CNNGB", "pod_code": "DEHAM", "mbl_number": "", "container_number": ""},
+                    "transport_legs": [],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-11790",
+            "case_root": str(tmp_path / "orders" / "AN-11790"),
+            "tms_context": {"status": "customs_pending", "network": "sea"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+        },
+        {"id": 1266, "changed_at": "2026-05-11T10:00:00Z", "metadata": {"file_name": "draft-bl.pdf", "document_type": "master_bl"}},
+    )
+
+    cards = result["teams_tms_review_cards"]
+    assert all(card["target"] != "mbl_number" for card in cards)
+    assert "MBL / B/L-Nr. fehlt im TMS" not in result["message"]
 
 
 

@@ -94,6 +94,27 @@ def _field_dict(row: dict[str, Any]) -> dict[str, Any]:
     return fields
 
 
+def _has_blocker_finding(findings: list[dict[str, Any]]) -> bool:
+    for row in findings:
+        if not isinstance(row, dict):
+            continue
+        severity = str(row.get("severity") or "").strip().lower()
+        finding_type = str(row.get("type") or "").strip().lower()
+        if severity == "blocker" or "blocker" in finding_type:
+            return True
+    return False
+
+
+def _append_profile_blocker(findings: list[dict[str, Any]], *, filename: Any, code: str, summary: str) -> None:
+    findings.append({
+        "type": "document_profile_blocker",
+        "code": code,
+        "severity": "blocker",
+        "filename": filename,
+        "summary": summary,
+    })
+
+
 def _append_content_reconciliation(findings: list[dict[str, Any]], *, tms_snapshot: dict[str, Any], registry: dict[str, Any]) -> None:
     totals = _tms_totals(tms_snapshot)
     tms_reference = _tms_customs_reference(tms_snapshot)
@@ -102,12 +123,33 @@ def _append_content_reconciliation(findings: list[dict[str, Any]], *, tms_snapsh
     for row in registry.get("analyzed_documents", []) or []:
         if not isinstance(row, dict):
             continue
-        fields = _field_dict(row)
-        if not fields:
-            continue
+        analysis = _load_analysis(row.get("analysis_path"))
+        fields: dict[str, Any] = {}
+        if isinstance(analysis.get("extracted_fields"), dict):
+            fields.update(analysis.get("extracted_fields") or {})
+        if isinstance(row.get("extracted_fields"), dict):
+            fields.update(row.get("extracted_fields") or {})
         filename = row.get("filename")
         doc_reference = str(_first_present(fields, "mrn", "customs_reference", "customs_mrn") or "").strip()
-        doc_type = str(row.get("analysis_doc_type") or row.get("doc_type") or "").lower()
+        doc_type = str(row.get("analysis_doc_type") or row.get("doc_type") or analysis.get("doc_type") or "").lower()
+        if doc_type == "commercial_invoice":
+            blob = "\n".join(
+                str(value or "")
+                for value in (
+                    filename,
+                    row.get("analysis_summary"),
+                    analysis.get("summary"),
+                    analysis.get("doc_type"),
+                    fields,
+                )
+            ).lower()
+            if "proforma" in blob or "pro forma" in blob:
+                _append_profile_blocker(
+                    findings,
+                    filename=filename,
+                    code="proforma_invoice",
+                    summary="Commercial invoice is marked as proforma; customs-ready commercial invoice required.",
+                )
         if tms_reference and doc_reference and _norm_reference(tms_reference) != _norm_reference(doc_reference):
             findings.append({
                 "type": "mrn_mismatch",
@@ -132,14 +174,22 @@ def _append_content_reconciliation(findings: list[dict[str, Any]], *, tms_snapsh
                 "summary": f"Packstückzahl im Dokument {_fmt_number(doc_pieces)} weicht vom TMS-Wert {_fmt_number(tms_pieces)} ab.",
             })
         amount = _number(_first_present(fields, "amount", "total_amount", "goods_value", "cargo_value"))
-        doc_type = str(row.get("analysis_doc_type") or row.get("doc_type") or "").lower()
+        doc_type = str(row.get("analysis_doc_type") or row.get("doc_type") or analysis.get("doc_type") or "").lower()
         if amount == 0 and doc_type in {"commercial_invoice", "customs_document"}:
-            findings.append({
-                "type": "implausible_goods_value",
-                "severity": "medium",
-                "filename": filename,
-                "summary": "Warenwert im Dokument ist 0; für Zoll/Versicherung nicht plausibel.",
-            })
+            if doc_type == "commercial_invoice":
+                _append_profile_blocker(
+                    findings,
+                    filename=filename,
+                    code="zero_value",
+                    summary="Commercial invoice goods value is 0; value must be greater than zero for customs use.",
+                )
+            else:
+                findings.append({
+                    "type": "implausible_goods_value",
+                    "severity": "medium",
+                    "filename": filename,
+                    "summary": "Warenwert im Dokument ist 0; für Zoll/Versicherung nicht plausibel.",
+                })
 
 
 def reconcile_documents(*, order_id: str, tms_snapshot: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
@@ -198,7 +248,7 @@ def reconcile_documents(*, order_id: str, tms_snapshot: dict[str, Any], registry
     _append_content_reconciliation(findings, tms_snapshot=tms_snapshot, registry=registry)
 
     max_severity = "low"
-    if any(row.get("severity") in {"high", "critical"} for row in findings):
+    if _has_blocker_finding(findings) or any(row.get("severity") in {"high", "critical"} for row in findings):
         max_severity = "high"
     elif any(row.get("severity") == "medium" for row in findings):
         max_severity = "medium"

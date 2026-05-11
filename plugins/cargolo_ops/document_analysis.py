@@ -18,6 +18,8 @@ from agent.auxiliary_client import _resolve_task_provider_model, call_llm, extra
 from hermes_cli.config import load_config
 
 from .models import utc_now_iso
+from .document_profiles import COMMON_FIELDS, DOCUMENT_PROFILES, DocumentProfile
+from .document_schema import normalize_document_type
 
 ANALYSIS_VERSION = "2026-04-13-doc-analysis-v2-native-openrouter"
 PRICING_KB_ROOT = Path(os.environ.get("CARGOLO_PRICING_KB_ROOT", "/root/.hermes/cargolo_pricing"))
@@ -251,6 +253,10 @@ def _pdf_engine() -> str:
 
 def _document_messages(*, order_id: str, filename: str, mime_type: str, registry_types: list[str], expected_types: list[str], tms_snapshot: dict[str, Any], file_data_url: str) -> list[dict[str, Any]]:
     tms_detail = tms_snapshot.get("detail") if isinstance(tms_snapshot, dict) else {}
+    extracted_schema = _extracted_fields_schema(registry_types, expected_types)
+    common_fields = _common_fields_prompt()
+    profile_guidance = _profile_guidance_prompt(registry_types, expected_types)
+    field_sources_instruction = _field_sources_instruction()
     return [
         {
             "role": "system",
@@ -275,7 +281,8 @@ def _document_messages(*, order_id: str, filename: str, mime_type: str, registry
                         '  "shipment_numbers": ["AN-..."],\n'
                         '  "references": ["..."],\n'
                         '  "suggested_registry_types": ["..."],\n'
-                        '  "extracted_fields": {"invoice_number": "", "document_number": "", "amount": "", "currency": "", "carrier": "", "pol": "", "pod": "", "eta": "", "etd": "", "mrn": ""},\n'
+                        f'  "extracted_fields": {json.dumps(extracted_schema, ensure_ascii=False)},\n'
+                        '  "field_sources": {"field_name": {"value": "...", "label": "...", "source": "...", "confidence": "low|medium|high", "raw_context": "...", "page": 1}},\n'
                         '  "missing_or_unreadable": ["..."],\n'
                         '  "consistency_notes": ["..."],\n'
                         '  "operational_flags": ["..."],\n'
@@ -283,6 +290,12 @@ def _document_messages(*, order_id: str, filename: str, mime_type: str, registry
                         "}\n\n"
                         "WICHTIGE REGEL: 'commercial_invoice' bedeutet nur die Handelsrechnung der Ware des Kunden. "
                         "Interne, agentenseitige oder Lieferanten-Rechnungen an CARGOLO, Hartmann oder andere Spediteure sind 'billing', nicht 'commercial_invoice'.\n\n"
+                        "B/L-Felder: document_number ist generisch. Trage in mbl_number/master_bl_number/bill_of_lading_number/bl_number "
+                        "nur echte B/L- oder MBL-Werte ein, wenn Label oder Kontext B/L/Master B/L/Ocean B/L ist; "
+                        "keine Datumswerte oder Dokumentdaten in mbl_number schreiben. Wenn nicht lesbar, Feld leer lassen und missing_or_unreadable nutzen.\n\n"
+                        f"{common_fields}\n\n"
+                        f"{profile_guidance}\n\n"
+                        f"{field_sources_instruction}\n\n"
                         f"Auftrag: {order_id}\n"
                         f"Datei: {filename}\n"
                         f"MIME: {mime_type}\n"
@@ -305,6 +318,10 @@ def _document_messages(*, order_id: str, filename: str, mime_type: str, registry
 
 def _image_document_messages(*, order_id: str, filename: str, mime_type: str, registry_types: list[str], expected_types: list[str], tms_snapshot: dict[str, Any], image_data_url: str) -> list[dict[str, Any]]:
     tms_detail = tms_snapshot.get("detail") if isinstance(tms_snapshot, dict) else {}
+    extracted_schema = _extracted_fields_schema(registry_types, expected_types)
+    common_fields = _common_fields_prompt()
+    profile_guidance = _profile_guidance_prompt(registry_types, expected_types)
+    field_sources_instruction = _field_sources_instruction()
     return [
         {
             "role": "system",
@@ -317,8 +334,12 @@ def _image_document_messages(*, order_id: str, filename: str, mime_type: str, re
                     "type": "text",
                     "text": (
                         "Analysiere dieses Dokumentbild. Gib strikt JSON zurück mit den Schlüsseln "
-                        "doc_type, confidence, summary, shipment_numbers, references, suggested_registry_types, extracted_fields, missing_or_unreadable, consistency_notes, operational_flags, reply_relevance.\n"
+                        "doc_type, confidence, summary, shipment_numbers, references, suggested_registry_types, extracted_fields, field_sources, missing_or_unreadable, consistency_notes, operational_flags, reply_relevance. "
+                        f"extracted_fields soll diese common und profilrelevanten Felder nutzen: {json.dumps(extracted_schema, ensure_ascii=False)}. "
+                        "Mindestens document_number, mbl_number, master_bl_number, bill_of_lading_number und bl_number berücksichtigen.\n"
                         "WICHTIGE REGEL: 'commercial_invoice' bedeutet nur die Handelsrechnung der Ware des Kunden. Interne, agentenseitige oder Lieferanten-Rechnungen an CARGOLO/Hartmann sind 'billing'.\n"
+                        "B/L-Felder: document_number ist generisch. Trage in mbl_number/master_bl_number/bill_of_lading_number/bl_number nur echte B/L- oder MBL-Werte ein, wenn Label oder Kontext B/L/Master B/L/Ocean B/L ist; keine Datumswerte oder Dokumentdaten in mbl_number schreiben. Wenn nicht lesbar, Feld leer lassen und missing_or_unreadable nutzen.\n"
+                        f"{common_fields}\n\n{profile_guidance}\n\n{field_sources_instruction}\n"
                         f"Auftrag: {order_id}\nDatei: {filename}\nHeuristische Typen: {registry_types}\nTMS-erwartet: {expected_types}\n"
                         f"TMS-Detail-Auszug: {json.dumps(tms_detail or {}, ensure_ascii=False)[:2000]}"
                     ),
@@ -383,6 +404,101 @@ def _document_extra_body(mime_type: str) -> dict[str, Any]:
             }
         ]
     }
+
+
+def _profile_candidates(registry_types: list[str], expected_types: list[str]) -> list[DocumentProfile]:
+    """Return compact, stable profile hints for known heuristic/expected document types."""
+    normalized_types: list[str] = []
+    for value in [*(registry_types or []), *(expected_types or [])]:
+        normalized = normalize_document_type(value)
+        if not normalized or normalized == "unknown" or normalized in normalized_types:
+            continue
+        normalized_types.append(normalized)
+
+    profiles: list[DocumentProfile] = []
+
+    def append_profiles(*keys: str) -> None:
+        for key in keys:
+            candidate = DOCUMENT_PROFILES.get(key)
+            if candidate is not None and candidate not in profiles:
+                profiles.append(candidate)
+
+    legacy_profile_fallbacks: dict[str, tuple[str, ...]] = {
+        # Legacy analysis type: there is no generic bill_of_lading profile because
+        # the richer registry distinguishes master/house B/L. Give the model both.
+        "bill_of_lading": ("master_bill_of_lading", "house_bill_of_lading"),
+        # Existing flows still surface these coarse legacy types. Map them to the
+        # closest bounded profile hints so prompt/schema guidance stays useful.
+        "customs_document": ("customs_instruction", "export_accompanying_document", "tax_assessment"),
+        "mrn": ("customs_instruction", "export_accompanying_document", "tax_assessment"),
+        "billing": ("outgoing_invoice", "freight_cost_invoice_cfr_cpt"),
+        "supplier_invoice": ("outgoing_invoice", "freight_cost_invoice_cfr_cpt"),
+        "agent_invoice": ("outgoing_invoice", "freight_cost_invoice_cfr_cpt"),
+        "air_waybill": ("shipment_advice", "customer_misc"),
+        "proof_of_delivery": ("shipment_advice", "customer_misc", "internal_misc"),
+    }
+
+    for normalized in normalized_types:
+        profile = DOCUMENT_PROFILES.get(normalized)
+        if profile is not None:
+            append_profiles(normalized)
+            continue
+        append_profiles(*legacy_profile_fallbacks.get(normalized, ()))
+    return profiles
+
+
+def _common_fields_prompt() -> str:
+    return "Gemeinsame Extraktionsfelder (COMMON_FIELDS): " + ", ".join(COMMON_FIELDS)
+
+
+def _profile_guidance_prompt(registry_types: list[str], expected_types: list[str]) -> str:
+    profiles = _profile_candidates(registry_types, expected_types)
+    if not profiles:
+        return "Profil-Hinweise: keine spezifischen bekannten/erwarteten Dokumentprofile; nutze COMMON_FIELDS und Speditionskontext."
+    lines = ["Profil-Hinweise für heuristische/erwartete Dokumenttypen (normalized types, relevant_fields, critical checks):"]
+    for profile in profiles[:8]:
+        aliases = ", ".join(profile.aliases[:4]) if profile.aliases else "-"
+        fields = ", ".join(profile.relevant_fields[:18])
+        checks = "; ".join(
+            f"{check.get('code')}:{check.get('severity')}" for check in profile.checks[:6] if isinstance(check, dict)
+        ) or "-"
+        lines.append(f"- {profile.document_type} (aliases: {aliases}) relevant_fields: {fields}; critical checks: {checks}")
+    return "\n".join(lines)
+
+
+def _extracted_fields_schema(registry_types: list[str], expected_types: list[str]) -> dict[str, str]:
+    fields: list[str] = []
+    for field_name in COMMON_FIELDS:
+        if field_name not in fields:
+            fields.append(field_name)
+    for profile in _profile_candidates(registry_types, expected_types):
+        for field_name in profile.relevant_fields:
+            if field_name not in fields:
+                fields.append(field_name)
+    for field_name in (
+        "amount",
+        "carrier",
+        "master_bl_number",
+        "bill_of_lading_number",
+        "bl_number",
+        "hawb_number",
+        "mawb_number",
+        "customs_reference",
+        "release_reference",
+    ):
+        if field_name not in fields:
+            fields.append(field_name)
+    return {field_name: "" for field_name in fields}
+
+
+def _field_sources_instruction() -> str:
+    return (
+        "Gib zusätzlich field_sources zurück, wenn möglich: pro extrahiertem Feld ein Objekt mit "
+        "value, label/source, confidence, raw_context/page. Beispiel: "
+        '"field_sources": {"invoice_number": {"value": "INV-1", "label": "Invoice No.", '
+        '"source": "document text", "confidence": "high", "raw_context": "Invoice No. INV-1", "page": 1}}. '
+        "Wenn Quelle/Seite nicht verfügbar ist, Feld weglassen; JSON bleibt trotzdem gültig."
+    )
 
 
 def _match_tokens(*values: Any) -> set[str]:
@@ -520,7 +636,8 @@ def _analyze_single_document(*, order_id: str, path: Path, received_doc: dict[st
     if doc_type == "billing":
         suggested_types = ["billing" if item == "commercial_invoice" else item for item in suggested_types]
     extracted_fields = payload.get("extracted_fields") if isinstance(payload.get("extracted_fields"), dict) else {}
-    return {
+    field_sources = payload.get("field_sources") if isinstance(payload.get("field_sources"), dict) else None
+    result = {
         "analysis_version": ANALYSIS_VERSION,
         "analyzed_at": utc_now_iso(),
         "provider": provider,
@@ -545,6 +662,9 @@ def _analyze_single_document(*, order_id: str, path: Path, received_doc: dict[st
         "operational_flags": [str(item) for item in (payload.get("operational_flags") or []) if str(item).strip()],
         "reply_relevance": str(payload.get("reply_relevance", "low") or "low"),
     }
+    if field_sources is not None:
+        result["field_sources"] = field_sources
+    return result
 
 
 def _load_pricing_ingest_adapter() -> Any:
