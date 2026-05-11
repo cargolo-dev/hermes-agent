@@ -27,6 +27,43 @@ def test_reconciliation_does_not_turn_missing_docs_alone_into_risk():
     assert report["missing_policy"] == "missing_documents_are_inventory_context_not_risk"
 
 
+def test_reconciliation_flags_present_document_weight_mismatch_against_tms(tmp_path):
+    analysis_path = tmp_path / "invoice_analysis.json"
+    analysis_path.write_text(
+        json.dumps({"extracted_fields": {"gross_weight": "123 kg"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    report = reconcile_documents(
+        order_id="AN-SEA",
+        tms_snapshot={"detail": {"network": "sea", "totals": {"total_weight_kg": 500}}},
+        registry={
+            "expected_types": [],
+            "received_types": ["commercial_invoice"],
+            "received_documents": [{"filename": "invoice.pdf", "analysis_status": "ok"}],
+            "analyzed_documents": [
+                {
+                    "filename": "invoice.pdf",
+                    "analysis_doc_type": "commercial_invoice",
+                    "analysis_path": str(analysis_path),
+                }
+            ],
+        },
+    )
+
+    assert report["version"] == 2
+    assert report["risk"] == "medium"
+    assert report["needs_human_review"] is True
+    assert report["findings"] == [
+        {
+            "type": "tms_document_weight_mismatch",
+            "severity": "medium",
+            "filename": "invoice.pdf",
+            "summary": "Gewicht im Dokument 123 kg weicht vom TMS-Wert 500 kg ab.",
+        }
+    ]
+
+
 def test_document_monitoring_uses_lifecycle_and_writes_single_report_location(tmp_path):
     lifecycle = {
         "status": "ok",

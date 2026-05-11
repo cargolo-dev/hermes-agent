@@ -510,6 +510,7 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
     bg = {"danger": "#3f1d1d", "warn": "#3a2b0a", "good": "#123524"}.get(tone, "#172554")
     issue_title = "Auffälligkeit" if status_is_issue else "Keine Auffälligkeit"
     issue_text = " · ".join(compact_details) if compact_details else "Keine fachlichen Dokumenten-Widersprüche erkannt."
+    assessment = "bitte fachlich prüfen" if status_is_issue else "fachlich unauffällig"
     question = "Ist der TMS-Wert korrekt oder sind die Dokumente Teil-/Vorversionen?"
     if any("pack" in x.lower() or "carton" in x.lower() or "palette" in x.lower() for x in compact_details):
         question = "Welche Werte sollen führend sein: TMS-Stammdaten oder Dokumentwerte?"
@@ -569,7 +570,7 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
         f"<div style='border:1px solid #475569;border-left:6px solid {border};border-radius:14px;"
         "padding:14px 16px;background:#111827;color:#f8fafc;font-family:Segoe UI,Arial,sans-serif;line-height:1.35;'>"
         f"<div style='font-size:18px;font-weight:800;margin-bottom:6px;color:#ffffff;'>📄 {_html_escape(str(model.get('order_id')))} · Dokumenten-Upload geprüft</div>"
-        f"<div style='font-size:13px;margin-bottom:10px;color:#cbd5e1;'>Upload: <b>{_html_escape(uploaded)}</b> · Typ: <b>{_html_escape(doc_type)}</b> · Risiko: <b>{_html_escape(risk)}</b></div>"
+        f"<div style='font-size:13px;margin-bottom:10px;color:#cbd5e1;'>Upload: <b>{_html_escape(uploaded)}</b> · Typ: <b>{_html_escape(doc_type)}</b> · Einschätzung: <b>{_html_escape(assessment)}</b></div>"
         f"<div style='background:{bg};border:1px solid {border};border-radius:10px;padding:10px 12px;margin-bottom:10px;color:#f8fafc;'>"
         f"<b>⚠️ {issue_title}:</b> {_html_escape(_truncate_sentence(issue_text, 230))}</div>"
         f"<div style='margin-bottom:8px;color:#f8fafc;'><b>TMS:</b> {_html_escape(_truncate(tms_line, 180))}<br>"
