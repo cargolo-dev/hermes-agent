@@ -1122,19 +1122,24 @@ class TeamsAdapter(BasePlatformAdapter):
     def _authorize_card_action_click(self, ctx: Any) -> tuple[bool, str | None, str | None, Any | None]:
         """Default-deny Teams Adaptive Card clicks unless explicitly allowed."""
         allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
+        allowed_chats_csv = os.getenv("TEAMS_ALLOWED_CHATS", "").strip() or os.getenv("TEAMS_GROUP_ALLOWED_CHATS", "").strip()
         allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in ("1", "true", "yes")
         from_account = ctx.activity.from_
         clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
         clicker_name = getattr(from_account, "name", None) or ""
+        conversation_id = str(getattr(getattr(ctx.activity, "conversation", None), "id", "") or "")
         if allow_all:
+            return True, str(clicker_id), str(clicker_name), None
+        allowed_chat_ids = {chat_id.strip() for chat_id in allowed_chats_csv.split(",") if chat_id.strip()}
+        if "*" in allowed_chat_ids or (conversation_id and conversation_id in allowed_chat_ids):
             return True, str(clicker_id), str(clicker_name), None
         if not allowed_csv:
             logger.warning(
-                "[teams] card action rejected: TEAMS_ALLOWED_USERS not configured "
+                "[teams] card action rejected: TEAMS_ALLOWED_USERS/TEAMS_ALLOWED_CHATS not configured "
                 "and TEAMS_ALLOW_ALL_USERS not set — default deny"
             )
             return False, str(clicker_id), str(clicker_name), AdaptiveCardActionMessageResponse(
-                value="⛔ Approval buttons require TEAMS_ALLOWED_USERS to be configured."
+                value="⛔ Approval buttons require TEAMS_ALLOWED_USERS or TEAMS_ALLOWED_CHATS to be configured."
             )
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         if "*" not in allowed_ids and str(clicker_id) not in allowed_ids:

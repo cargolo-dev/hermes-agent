@@ -34,6 +34,10 @@ optional_env:
     description: "Comma-separated Teams user IDs / UPNs allowed to talk to the bot"
     prompt: "Allowed users (comma-separated)"
     password: false
+  - name: TEAMS_ALLOWED_CHATS
+    description: "Comma-separated Teams conversation/channel IDs whose members may talk to the bot"
+    prompt: "Allowed chats/channels (comma-separated)"
+    password: false
   - name: TEAMS_ALLOW_ALL_USERS
     description: "Allow any Teams user to trigger the bot (dev only)"
     prompt: "Allow all users? (true/false)"

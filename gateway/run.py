@@ -4920,9 +4920,11 @@ class GatewayRunner:
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
         group_user_allowlist = ""
         group_chat_allowlist = ""
-        if source.chat_type in {"group", "forum"}:
+        if source.chat_type in {"group", "forum", "channel"}:
             group_user_allowlist = os.getenv(platform_group_user_env_map.get(source.platform, ""), "").strip()
             group_chat_allowlist = os.getenv(platform_group_chat_env_map.get(source.platform, ""), "").strip()
+            if source.platform and source.platform.value == "teams":
+                group_chat_allowlist = group_chat_allowlist or os.getenv("TEAMS_ALLOWED_CHATS", "").strip() or os.getenv("TEAMS_GROUP_ALLOWED_CHATS", "").strip()
         global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
@@ -4932,7 +4934,7 @@ class GatewayRunner:
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
         # the sender user ID for group/forum messages.
-        if group_chat_allowlist and source.chat_type in {"group", "forum"} and source.chat_id:
+        if group_chat_allowlist and source.chat_type in {"group", "forum", "channel"} and source.chat_id:
             allowed_group_ids = {
                 chat_id.strip() for chat_id in group_chat_allowlist.split(",") if chat_id.strip()
             }

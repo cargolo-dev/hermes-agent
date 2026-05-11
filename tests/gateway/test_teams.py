@@ -12,7 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from gateway.config import Platform, PlatformConfig, HomeChannel
+from gateway.config import Platform, PlatformConfig, HomeChannel, GatewayConfig
+from gateway.session import SessionSource
 from plugins.teams_pipeline.models import TeamsMeetingRef, TeamsMeetingSummaryPayload
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
@@ -329,6 +330,28 @@ class TestTeamsPluginRegistration:
         register(ctx)
         kwargs = ctx.register_platform.call_args[1]
         assert kwargs.get("platform_hint")
+
+    def test_teams_channel_allowlist_authorizes_channel_members(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        monkeypatch.delenv("TEAMS_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("TEAMS_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("TEAMS_ALLOWED_CHATS", "19:ops@thread.v2")
+        platform = Platform("teams")
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(platforms={platform: PlatformConfig(enabled=True)})
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+
+        source = SessionSource(
+            platform=platform,
+            chat_id="19:ops@thread.v2",
+            chat_type="channel",
+            user_id="aad-coworker",
+            user_name="Kollegin",
+        )
+
+        assert runner._is_user_authorized(source) is True
 
 
 # ---------------------------------------------------------------------------
@@ -1560,6 +1583,39 @@ async def test_cargolo_asr_approval_blocked_replaces_card_without_actions(monkey
     assert response.body.value.actions is None
     assert any("TMS-Write blockiert" in block.text for block in response.body.value.body)
     assert any("Buttons deaktiviert" in block.text for block in response.body.value.body)
+
+
+@pytest.mark.anyio
+async def test_cargolo_asr_button_allows_authorized_channel_member(monkeypatch):
+    adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
+    monkeypatch.delenv("TEAMS_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("TEAMS_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setenv("TEAMS_ALLOWED_CHATS", "chat-1")
+    _install_capture_card_response(monkeypatch)
+    calls = []
+
+    def fake_process(**kwargs):
+        calls.append(kwargs)
+        return {"handled": True, "status": "rejected", "response_text": "❌ abgelehnt"}
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.process_teams_tms_card_action", fake_process)
+
+    ctx = MagicMock()
+    ctx.activity.value.action.data = {
+        "hermes_action": "cargolo_asr_tms_reject",
+        "order_id": "AN-11755",
+        "action_id": "abc123",
+    }
+    ctx.activity.from_.aad_object_id = "aad-coworker"
+    ctx.activity.from_.id = "teams-user-id"
+    ctx.activity.from_.name = "Kollege"
+    ctx.activity.conversation.id = "chat-1"
+
+    response = await adapter._on_card_action(ctx)
+
+    assert response.status == 200
+    assert calls
+    assert calls[0]["user_id"] == "aad-coworker"
 
 
 @pytest.mark.anyio
