@@ -150,33 +150,38 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
                 "status": "document_uploaded_checked",
                 "history_sync_count": 3,
                 "last_email_at": "2026-05-08T08:22:00Z",
+                "message": "\n".join([
+                    "Lage: AN-12505 · Handelsrechnung 'invoice.pdf' wurde geprüft. Kontext: ASR · Ningbo CN → Hamburg DE.",
+                    "Auffällig: invoice.pdf: 123kg vs 500kg",
+                    "Empfehlung: Bitte Gewicht gegen TMS und Handelsrechnung prüfen.",
+                    "Nächster Schritt: Führenden Wert festlegen; danach TMS oder Dokumentstand sauber markieren.",
+                ]),
                 "document_monitoring_report_path": str(report_path),
             },
         },
     )
 
     assert body["message_format"] == "html"
-    assert "Dokumenten-Upload geprüft" in body["message"]
+    assert "Hermes · Dokument geprüft" in body["message"]
     assert "Kernpunkt" not in body["message"]  # no legacy long report section label
-    assert "Auffälligkeit" in body["message"]
-    assert "TMS:" in body["message"]
-    assert "Dokumente geprüft" in body["message"]
-    assert "Frage:" in body["message"]
-    assert "Vorschlag:" in body["message"]
+    assert "Auffällig" in body["message"]
+    assert "Lage" in body["message"]
+    assert "Empfehlung" in body["message"]
+    assert "Nächster Schritt" in body["message"]
     assert "Gesamtgewicht laut Dokument 123kg" not in body["message"]
     assert "123kg vs 500kg" in body["message"]
     assert "Handelsrechnung" in body["message"]
     assert "Risiko:" not in body["message_text"]
-    assert "Einschätzung:" in body["message_text"]
-    assert "bitte fachlich prüfen" in body["message_text"]
+    assert "Einschätzung:" not in body["message_text"]
+    assert "bitte fachlich prüfen" not in body["message_text"]
+    assert "Dokumente geprüft" not in body["message_text"]
+    assert "lokale Dok." not in body["message_text"]
+    assert "Findings" not in body["message_text"]
     assert "AN-12505" in body["message_text"]
     assert "<div" in body["message_text"]
-    assert "Dokumenten-Upload geprüft" in body["message_text"]
-    assert "TMS:" in body["message_text"]
-    assert "Dokumente geprüft" in body["message_text"]
-    assert "Frage:" in body["message_text"]
-    assert "Vorschlag:" in body["message_text"]
-    assert "Mail +3" in body["message_text"]
+    assert "Hermes · Dokument geprüft" in body["message_text"]
+    assert "Frage:" not in body["message_text"]
+    assert "Vorschlag:" not in body["message_text"]
     assert "123kg vs 500kg" in body["message_text"]
     assert "Erkannte Dokumente:" not in body["message_text"]
     assert len(body["message_text"]) < 2400

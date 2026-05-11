@@ -108,7 +108,7 @@ def _finding_rank(row: Any) -> tuple[int, str]:
     severity = str(row.get("severity") or "").lower()
     finding_type = str(row.get("type") or "").lower()
     text = str(row.get("summary") or "").lower()
-    if severity in {"critical", "high"} or any(token in finding_type for token in ("mrn", "wrong", "mismatch")):
+    if severity in {"critical", "high"} or "mrn" in finding_type or "customs" in finding_type:
         return (0, text)
     if any(token in finding_type + " " + text for token in ("weight", "gewicht", "piece", "packstück", "package")):
         return (1, text)
@@ -150,7 +150,7 @@ def _human_document_message(*, order_id: Any, filename: Any, doc_type: Any, cont
         row for row in findings
         if not isinstance(row, dict)
         or str(row.get("filename") or "").strip().lower() == uploaded_norm
-        or _finding_rank(row)[0] <= 1
+        or _finding_rank(row)[0] <= 0
     ]
     top_findings = sorted([row for row in usable_findings if row], key=_finding_rank)[:3]
     if top_findings:

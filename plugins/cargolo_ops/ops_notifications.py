@@ -397,197 +397,92 @@ def _document_line_from_analysis(row: dict[str, Any]) -> str:
     return f"- {filename}: {doc_type}; {summary}{flag_text}"
 
 
-def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any]) -> str:
-    """Return the compact Teams-facing document-upload card.
+def _section_from_hermes_message(message: str, label: str) -> str:
+    pattern = rf"(?:^|\n){re.escape(label)}:\s*(.*?)(?=\n(?:Lage|Auffällig|Empfehlung|Nächster Schritt):|\Z)"
+    match = re.search(pattern, message or "", flags=re.DOTALL)
+    if not match:
+        return ""
+    return " ".join(str(match.group(1) or "").strip().split())
 
-    The native Teams webhook route currently delivers ``message_text``.  For
-    Teams this is intentionally HTML, not a long plaintext audit block: the
-    adapter passes known HTML through unchanged, giving us stable line breaks,
-    emphasis, and compact visual grouping without requiring a separate Adaptive
-    Card delivery path for this operational alert.
-    """
-    model = _build_document_activity_model(payload, report)
-    context = model.get("context") if isinstance(model.get("context"), dict) else {}
-    route = _format_route_from_context(context)
-    history_delta = model.get("history_sync_count") or 0
-    total_mails = _read_email_index_count(report.get("case_root"))
-    history_bits = [f"Mail +{history_delta}"]
-    if total_mails is not None:
-        history_bits.append(f"gesamt {total_mails}")
-    if model.get("last_email_at"):
-        history_bits.append(f"Stand {model.get('last_email_at')}")
-    history_status = " / ".join(history_bits)
 
-    lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
-    registry = _load_json_file(lifecycle.get("document_registry_path"))
-    latest_summary = {}
-    try:
-        case_root = Path(str(report.get("case_root") or ""))
-        candidate = case_root / "documents" / "analysis" / "latest_summary.json"
-        if candidate.exists():
-            latest_summary = _load_json_file(candidate)
-    except Exception:
-        latest_summary = {}
-    analyzed_docs = latest_summary.get("documents") if isinstance(latest_summary.get("documents"), list) else []
-    if not analyzed_docs and isinstance(registry.get("analyzed_documents"), list):
-        analyzed_docs = registry.get("analyzed_documents") or []
-
-    uploaded_name = str(model.get("filename") or "")
-    selected_docs: list[dict[str, Any]] = []
-    for row in analyzed_docs:
-        if isinstance(row, dict) and uploaded_name and str(row.get("filename") or "").strip().lower() == uploaded_name.strip().lower():
-            selected_docs.append(row)
-            break
-    for row in analyzed_docs:
-        if isinstance(row, dict) and row not in selected_docs and _deviation_notes_from_doc(row):
-            selected_docs.append(row)
-        if len(selected_docs) >= 3:
-            break
-    for row in analyzed_docs:
-        if isinstance(row, dict) and row not in selected_docs:
-            selected_docs.append(row)
-        if len(selected_docs) >= 3:
-            break
-
-    findings = model.get("findings") if isinstance(model.get("findings"), list) else []
-
-    def _finding_rank(row: Any) -> tuple[int, str]:
-        text = _finding_text(row).lower()
-        if "weight" in text or "gewicht" in text:
-            return (0, text)
-        if any(token in text for token in ("menge", "quantity", "packstück", "pieces", "packages")):
-            return (1, text)
-        return (2, text)
-
-    major_findings = [row for row in findings if _is_weight_or_quantity_finding(row)]
-    if not major_findings:
-        major_findings = [row for row in findings if isinstance(row, dict) and str(row.get("severity") or "").lower() in {"medium", "high", "critical"}]
-    major_findings = sorted(major_findings, key=_finding_rank)[:4]
-
-    concrete_deviations: list[str] = []
-    for row in selected_docs:
-        if isinstance(row, dict):
-            filename = _truncate(str(row.get("filename") or "Dokument"), 38)
-            for note in _deviation_notes_from_doc(row):
-                line = f"{filename}: {note}"
-                if line not in concrete_deviations:
-                    concrete_deviations.append(line)
-    if not concrete_deviations:
-        for row in major_findings:
-            text = _finding_text(row)
-            lower = text.lower()
-            if any(token in lower for token in ("abweich", " vs ", "kg", "gewicht", "discrep")) and text not in concrete_deviations:
-                concrete_deviations.append(text)
-
-    def _compact_deviation_item(item: str) -> str:
-        text = str(item or "").strip()
-        filename, _, note = text.partition(": ")
-        prefix = filename if note else ""
-        body = note or text
-        weights = re.findall(r"\d+(?:[,.]\d+)?\s*kg", body, flags=re.IGNORECASE)
-        packages = re.findall(r"\d+\s*(?:Cartons?|Packages?|Packstücke|Packstuecke|Paletten)", body, flags=re.IGNORECASE)
-        if len(weights) >= 2:
-            compact = f"{weights[0]} vs {weights[-1]}"
-        elif len(packages) >= 2:
-            compact = f"{packages[0]} vs {packages[-1]}"
-        else:
-            compact = _truncate_sentence(body, 105)
-        return f"{prefix}: {compact}" if prefix else compact
-
-    compact_details: list[str] = []
-    seen_compact: set[str] = set()
-    for item in concrete_deviations or [_finding_text(x) for x in major_findings]:
-        compact = _compact_deviation_item(item)
-        compact_key = compact.lower()
-        value_key = compact.split(": ", 1)[-1].lower()
-        if compact and compact_key not in seen_compact and value_key not in seen_compact:
-            compact_details.append(compact)
-            seen_compact.add(compact_key)
-            seen_compact.add(value_key)
-        if len(compact_details) >= 3:
-            break
-
-    risk = str(model.get("risk") or "low").strip().lower() or "low"
-    status_is_issue = bool(compact_details or major_findings or risk in {"medium", "high", "critical"})
-    tone = "danger" if risk in {"high", "critical"} else "warn" if status_is_issue else "good"
-    border = {"danger": "#f87171", "warn": "#fbbf24", "good": "#34d399"}.get(tone, "#60a5fa")
-    bg = {"danger": "#3f1d1d", "warn": "#3a2b0a", "good": "#123524"}.get(tone, "#172554")
-    issue_title = "Auffälligkeit" if status_is_issue else "Keine Auffälligkeit"
-    issue_text = " · ".join(compact_details) if compact_details else "Keine fachlichen Dokumenten-Widersprüche erkannt."
-    assessment = "bitte fachlich prüfen" if status_is_issue else "fachlich unauffällig"
-    question = "Ist der TMS-Wert korrekt oder sind die Dokumente Teil-/Vorversionen?"
-    if any("pack" in x.lower() or "carton" in x.lower() or "palette" in x.lower() for x in compact_details):
-        question = "Welche Werte sollen führend sein: TMS-Stammdaten oder Dokumentwerte?"
-    suggestion = "Wenn TMS korrekt ist, markiere ich die Dokumentwerte als Vorversion/Schreibweise; sonst bereite ich die TMS-Korrektur vor."
-    doc_type = _doc_type_label(model.get("analysis_doc_type") or model.get("event_doc_type"))
-
-    def _context_value(*keys: str) -> str:
-        for key in keys:
-            if context.get(key) not in (None, "", [], {}):
-                return str(context.get(key))
-        return "-"
-
-    def _short_doc(row: dict[str, Any]) -> str:
-        filename = _truncate(str(row.get("filename") or "Dokument"), 34)
-        analysis = _load_json_file(row.get("analysis_path")) if row.get("analysis_path") else {}
-        fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
-        label = _display_doc_type_for_row(row)
-        pieces = [filename, label]
-        amount = _first_present(fields.get("amount"), fields.get("total_amount"), empty="")
-        currency = _first_present(fields.get("currency"), empty="")
-        if amount:
-            pieces.append(f"{amount} {currency}".strip())
-        doc_number = _first_present(fields.get("document_number"), fields.get("invoice_number"), fields.get("awb"), fields.get("hawb"), empty="")
-        if doc_number:
-            pieces.append(f"Nr. {doc_number}")
-        notes = _deviation_notes_from_doc(row)
-        if notes:
-            pieces.append("Hinweis: " + _compact_deviation_item(notes[0]))
-        return " · ".join(_html_escape(str(part)) for part in pieces if part)
-
-    doc_lines = [_short_doc(row) for row in selected_docs[:3] if isinstance(row, dict)]
-    if not doc_lines:
-        doc_lines = ["Keine analysierten Dokumentdetails gefunden."]
-    if len(analyzed_docs) > len(selected_docs):
-        doc_lines.append(f"+{len(analyzed_docs) - len(selected_docs)} weitere Dokumente nur lokal im Order-Artefakt")
-
-    tms_line = (
-        f"{_context_value('network', 'mode')} · {_context_value('status')} · {route}"
-        f" · Incoterms {_context_value('incoterms')}"
-    )
-    cargo_bits = []
-    if _context_value('cargo_description') != "-":
-        cargo_bits.append(_truncate(str(_context_value('cargo_description')), 80))
-    if _context_value('weight_kg') != "-":
-        cargo_bits.append(f"TMS-Gewicht {_context_value('weight_kg')} kg")
-    if _context_value('pieces') != "-":
-        cargo_bits.append(f"Packstücke {_context_value('pieces')}")
-    cargo_line = " · ".join(cargo_bits) if cargo_bits else "TMS-Cargo: keine Gewichts-/Packstückwerte im Snapshot"
-
-    footer = (
-        f"{model.get('received_documents')} lokale Dok. / {model.get('mirrored_tms_documents')} TMS-Dok. · "
-        f"{history_status} · Findings {len(findings)}"
-    )
-    uploaded = _truncate(uploaded_name, 58)
-
+def _html_hermes_section(title: str, body: str, *, tone: str = "neutral") -> str:
+    palette = {
+        "neutral": ("#1f2937", "#334155"),
+        "good": ("#123524", "#166534"),
+        "warn": ("#3a2b0a", "#92400e"),
+        "danger": ("#3f1d1d", "#991b1b"),
+    }
+    bg, border = palette.get(tone, palette["neutral"])
     return (
-        f"<div style='border:1px solid #475569;border-left:6px solid {border};border-radius:14px;"
-        "padding:14px 16px;background:#111827;color:#f8fafc;font-family:Segoe UI,Arial,sans-serif;line-height:1.35;'>"
-        f"<div style='font-size:18px;font-weight:800;margin-bottom:6px;color:#ffffff;'>📄 {_html_escape(str(model.get('order_id')))} · Dokumenten-Upload geprüft</div>"
-        f"<div style='font-size:13px;margin-bottom:10px;color:#cbd5e1;'>Upload: <b>{_html_escape(uploaded)}</b> · Typ: <b>{_html_escape(doc_type)}</b> · Einschätzung: <b>{_html_escape(assessment)}</b></div>"
-        f"<div style='background:{bg};border:1px solid {border};border-radius:10px;padding:10px 12px;margin-bottom:10px;color:#f8fafc;'>"
-        f"<b>⚠️ {issue_title}:</b> {_html_escape(_truncate_sentence(issue_text, 230))}</div>"
-        f"<div style='margin-bottom:8px;color:#f8fafc;'><b>TMS:</b> {_html_escape(_truncate(tms_line, 180))}<br>"
-        f"<span style='color:#cbd5e1;'>{_html_escape(cargo_line)}</span></div>"
-        "<div style='margin-bottom:8px;color:#f8fafc;'><b>Dokumente geprüft:</b><br>"
-        + "<br>".join(f"• {line}" for line in doc_lines[:4])
-        + "</div>"
-        f"<div style='background:#1f2937;border:1px solid #374151;border-radius:10px;padding:10px 12px;margin-bottom:8px;color:#f8fafc;'>"
-        f"<b>Frage:</b> {_html_escape(question)}<br>"
-        f"<b>Vorschlag:</b> {_html_escape(suggestion)}</div>"
-        f"<div style='font-size:12px;color:#94a3b8;'>{_html_escape(footer)}</div>"
+        f"<div style='background:{bg};border:1px solid {border};border-radius:12px;"
+        "padding:10px 12px;margin-top:10px;color:#f8fafc;'>"
+        f"<div style='font-size:12px;font-weight:800;color:#cbd5e1;text-transform:uppercase;letter-spacing:.03em;margin-bottom:4px;'>{_html_escape(title)}</div>"
+        f"<div style='font-size:14px;color:#ffffff;'>{body}</div>"
         "</div>"
     )
+
+
+def _html_bullets(items: list[str]) -> str:
+    clean = [str(item or "").strip() for item in items if str(item or "").strip()]
+    if not clean:
+        return _html_escape("Keine fachlichen Dokumenten-Widersprüche erkannt.")
+    return "<ul style='margin:0;padding-left:18px;color:#ffffff;'>" + "".join(
+        f"<li style='margin:3px 0;color:#ffffff;'>{_html_escape(_truncate_sentence(item, 190))}</li>" for item in clean[:3]
+    ) + "</ul>"
+
+
+def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any]) -> str:
+    """Return the Teams-facing document-upload message in Hermes colleague style.
+
+    Keep the notification intentionally close to the human `processor_result.message`.
+    The old renderer rebuilt a second audit-style card with document counts, local
+    artifact details and raw context. That made the Teams post look hard-coded and
+    noisy. This renderer treats the processor message as Hermes' spoken conclusion
+    and only adds minimal visual grouping around it.
+    """
+    model = _build_document_activity_model(payload, report)
+    result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}
+    hermes_message = str(result.get("message") or result.get("analysis_summary") or "").strip()
+    if not hermes_message:
+        findings = model.get("findings") if isinstance(model.get("findings"), list) else []
+        hermes_message = "\n".join([
+            f"Lage: {model.get('order_id')} · {_doc_type_label(model.get('analysis_doc_type') or model.get('event_doc_type'))} '{model.get('filename')}' wurde geprüft.",
+            "Auffällig: " + (" | ".join(_finding_text(row) for row in findings[:3]) if findings else "Keine fachlichen Dokumenten-Widersprüche erkannt."),
+            "Empfehlung: Vor Übernahme oder Folgeaktion bitte die auffälligen Werte gegen TMS/Mailverlauf prüfen." if findings else "Empfehlung: Keine direkte Aktion nötig; Case-Kontext und Dokumentenstand sind aktualisiert.",
+            "Nächster Schritt: Führenden Wert festlegen; bei TMS-Korrektur anschließend bewusst freigeben." if findings else "Nächster Schritt: Nur weiter beobachten, bis ein fachlicher Trigger entsteht.",
+        ])
+
+    lage = _section_from_hermes_message(hermes_message, "Lage") or hermes_message
+    auffaellig = _section_from_hermes_message(hermes_message, "Auffällig")
+    empfehlung = _section_from_hermes_message(hermes_message, "Empfehlung")
+    naechster = _section_from_hermes_message(hermes_message, "Nächster Schritt")
+
+    risk = str(model.get("risk") or "low").strip().lower() or "low"
+    has_issue = bool(auffaellig and "keine fachlichen" not in auffaellig.lower())
+    tone = "danger" if risk in {"high", "critical"} else "warn" if has_issue else "good"
+    border = {"danger": "#f87171", "warn": "#fbbf24", "good": "#34d399"}.get(tone, "#60a5fa")
+    doc_type = _doc_type_label(model.get("analysis_doc_type") or model.get("event_doc_type"))
+    uploaded = _truncate(str(model.get("filename") or "Dokument"), 58)
+    order_id = str(model.get("order_id") or "-")
+
+    issue_items = [item.strip() for item in re.split(r"\s+\|\s+", auffaellig or "") if item.strip()]
+    if not issue_items and auffaellig:
+        issue_items = [auffaellig]
+
+    html_parts = [
+        f"<div style='border:1px solid #475569;border-left:6px solid {border};border-radius:14px;"
+        "padding:14px 16px;background:#111827;color:#f8fafc;font-family:Segoe UI,Arial,sans-serif;line-height:1.35;'>",
+        f"<div style='font-size:18px;font-weight:800;margin-bottom:4px;color:#ffffff;'>Hermes · Dokument geprüft</div>",
+        f"<div style='font-size:13px;margin-bottom:10px;color:#cbd5e1;'>{_html_escape(order_id)} · <b>{_html_escape(uploaded)}</b> · {_html_escape(doc_type)}</div>",
+        _html_hermes_section("Lage", _html_escape(_truncate_sentence(lage, 260)), tone="neutral"),
+        _html_hermes_section("Auffällig", _html_bullets(issue_items), tone=tone),
+    ]
+    if empfehlung:
+        html_parts.append(_html_hermes_section("Empfehlung", _html_escape(_truncate_sentence(empfehlung, 230)), tone="neutral"))
+    if naechster:
+        html_parts.append(_html_hermes_section("Nächster Schritt", _html_escape(_truncate_sentence(naechster, 230)), tone="neutral"))
+    html_parts.append("</div>")
+    return "".join(html_parts)
 
 def _build_document_activity_model(payload: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
     result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}

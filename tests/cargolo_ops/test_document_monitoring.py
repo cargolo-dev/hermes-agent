@@ -148,6 +148,7 @@ def test_processor_result_prioritizes_uploaded_document_and_labels_master_bl():
                 "needs_human_review": True,
                 "findings": [
                     {"type": "document_flag", "severity": "medium", "filename": "old.gif", "summary": "not_a_logistics_document"},
+                    {"type": "tms_document_weight_mismatch", "severity": "medium", "filename": "BKGCONF_NGP3497068.pdf", "summary": "Gesamtgewicht im Dokument mit '5' angegeben (evtl. Tonnen), im TMS stehen 3100 kg."},
                     {"type": "document_open_question", "severity": "low", "filename": "NGP3497068.pdf", "summary": "ETA nicht explizit auf dem Dokument angegeben"},
                     {"type": "document_flag", "severity": "medium", "filename": "NGP3497068.pdf", "summary": "Entwurf (Draft) - Original BL prüfen"},
                 ],
@@ -162,6 +163,8 @@ def test_processor_result_prioritizes_uploaded_document_and_labels_master_bl():
     assert "ETA nicht explizit" in message
     assert "old.gif" not in message
     assert "not_a_logistics_document" not in message
+    assert "BKGCONF_NGP3497068.pdf" not in message
+    assert "3100 kg" not in message
 
 
 def test_document_monitoring_uses_lifecycle_and_writes_single_report_location(tmp_path):
