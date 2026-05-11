@@ -433,9 +433,63 @@ def _compact_value(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
-    if not text or text in {"0", "0.0", "None", "null"}:
+    if not text or text in {"0", "0.0", "None", "none", "null", "NULL", "?", "-", "--", "n/a", "N/A", "unknown", "unbekannt"}:
         return None
     return text
+
+
+def _human_status(value: Any) -> str:
+    raw = str(value or "").strip()
+    lower = raw.lower()
+    labels = {
+        "in_transit": "unterwegs / im Hauptlauf",
+        "docs pending": "Dokumente offen",
+        "documents pending": "Dokumente offen",
+        "pending": "offen",
+        "booked": "gebucht",
+        "delivered": "zugestellt",
+        "cancelled": "storniert",
+    }
+    return labels.get(lower, raw or "Status im TMS nicht eindeutig")
+
+
+def _human_doc_point(item: str, *, has_transport_id: bool = False) -> str:
+    text = str(item or "").strip()
+    lower = text.lower()
+    if not text:
+        return ""
+    if "abgangsort" in lower or "origin" in lower or "pol" in lower:
+        if "?" in text or "nur als" in lower:
+            return "Abgangsort ist in einem Dokument/Datensatz nicht sauber lesbar; für die operative Lage ist die Sendung trotzdem identifizierbar, bei Freigabe oder Abrechnung bitte Ursprung gegenprüfen."
+        return "Abgangsort/Routing bitte gegen TMS und Frachtpapier prüfen."
+    if "steuernummer" in lower or "tax" in lower or "vat" in lower or "eori" in lower:
+        return "Empfänger-Steuernummer fehlt bzw. ist nicht belastbar; relevant für Zoll-/Rechnungsangaben, nicht als Transport-Identitätsblocker."
+    if "warenwert" in lower or "goods value" in lower or "cargo value" in lower:
+        if "0" in lower:
+            return "Warenwert wurde mit 0 erkannt; das ist für Zoll/Versicherung nicht plausibel und sollte aus Handelsrechnung oder Kundenangabe geklärt werden."
+        return "Warenwert ist nicht belastbar; für Zoll/Versicherung aus Handelsrechnung oder Kundenangabe klären."
+    if "commercial_invoice" in lower or "commercial invoice" in lower:
+        return "Handelsrechnung ist noch nicht belastbar verfügbar."
+    if "packing_list" in lower or "packing list" in lower:
+        return "Packliste ist noch nicht belastbar verfügbar."
+    if "mrn" in lower:
+        return "MRN/Zollreferenz braucht fachlichen Abgleich mit TMS und Zollbeleg."
+    if has_transport_id and any(token in lower for token in ("carrier", "container", "hbl", "mbl", "eta", "etd")):
+        return ""
+    return text
+
+
+def _human_mail_line(subject: Any, sender: Any) -> str:
+    subject_text = str(subject or "").strip()
+    sender_text = str(sender or "").strip()
+    if not subject_text:
+        return ""
+    cleaned = re.sub(r"^(re|aw|fw|fwd)\s*:\s*", "", subject_text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(re|aw|fw|fwd)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+    sender_hint = f" ({sender_text})" if sender_text else ""
+    if len(cleaned) > 90:
+        cleaned = cleaned[:87].rstrip() + "…"
+    return f"Letzter Mailstand: {cleaned}{sender_hint}."
 
 
 def _extract_mrn_candidates_from_analysis(analysis: dict[str, Any]) -> list[str]:
@@ -536,15 +590,21 @@ def _build_decision_context(
         if customs_status:
             green.append(f"TMS-Zollstatus: {customs_status}.")
 
-    if container or hbl:
+    has_transport_id = bool(container or hbl)
+    if has_transport_id:
         parts = []
         if hbl:
             parts.append(f"HBL {hbl}")
         if container:
             parts.append(f"Container {container}" + (f" ({container_type})" if container_type else ""))
         if pol or pod:
-            parts.append(f"Routing {pol or '?'} → {pod or '?'}")
-        green.append("Transport-Identifikation ist vorhanden: " + ", ".join(parts) + ".")
+            if pol and pod:
+                parts.append(f"Routing {pol} → {pod}")
+            elif pod:
+                parts.append(f"Zielhafen {pod}")
+            elif pol:
+                parts.append(f"Abgangsort {pol}")
+        green.append("Sendung ist eindeutig zuordenbar: " + ", ".join(parts) + ".")
 
     if pieces or weight or volume:
         green.append(
@@ -568,10 +628,15 @@ def _build_decision_context(
             continue
         if "mrn" in lower and (current_mrn or doc_mrns):
             continue
-        if item not in open_items:
-            open_items.append(item)
+        human_item = _human_doc_point(item, has_transport_id=has_transport_id)
+        if human_item and human_item not in open_items:
+            open_items.append(human_item)
 
-    flags = [item for item in _short_list(raw_discrepancies, limit=10)[0] if item not in green]
+    flags = []
+    for item in _short_list(raw_discrepancies, limit=10)[0]:
+        human_item = _human_doc_point(item, has_transport_id=has_transport_id)
+        if human_item and human_item not in green and human_item not in flags:
+            flags.append(human_item)
     should_hold = bool(decision or open_items or flags)
     if decision:
         recommendation = "Nicht freigeben, bevor die MRN-Quelle geklärt ist."
@@ -673,17 +738,13 @@ def _format_case_lage(response: EmployeeResponse, results: list[SpecialistResult
     title = html.escape(order_id)
     route_text = f" · {html.escape(' / '.join(route_bits))}" if route_bits else ""
 
-    status_html = html.escape(str(tms_status or "unbekannt"))
-    pickup_html = f"<br><small>Pickup: {html.escape(str(pickup))}</small>" if pickup else ""
+    status_html = html.escape(_human_status(tms_status))
+    pickup_text = f"; Pickup {pickup}" if pickup else ""
     mail_html = html.escape(str(mail_count if mail_count is not None else "–"))
     docs_html = html.escape(str(docs_count if docs_count is not None else "–"))
 
-    latest_mail = ""
-    if latest_subject:
-        latest_mail = f"<br><small>Letzte Mail: „{html.escape(str(latest_subject))}“"
-        if latest_from:
-            latest_mail += f" von {html.escape(str(latest_from))}"
-        latest_mail += "</small>"
+    latest_mail = _human_mail_line(latest_subject, latest_from)
+    latest_mail_html = f"<p>{html.escape(latest_mail)}</p>" if latest_mail else ""
 
     missing_sources = [result.agent for result in results if result.status == SpecialistStatus.NEEDS_REVIEW and any(risk.get("type") == "missing_local_source" for risk in result.risks)]
     source_note = ""
@@ -727,8 +788,8 @@ def _format_case_lage(response: EmployeeResponse, results: list[SpecialistResult
     body = f"""
 <div>
   <h2>🔎 Fallprüfung {title}{route_text}</h2>
-  <p><strong>Lage:</strong> TMS {status_html}; Mails {mail_html}; Dokumente {docs_html}.{pickup_html}</p>
-  {latest_mail and f'<p><strong>Letzte Mail:</strong> {html.escape(str(latest_subject))}' + (f' von {html.escape(str(latest_from))}' if latest_from else '') + '</p>'}
+  <p><strong>Lage:</strong> Ich sehe die Sendung im TMS als {status_html}{html.escape(pickup_text)}. Zur Akte liegen {mail_html} Mails und {docs_html} Dokumente vor.</p>
+  {latest_mail_html}
 
   <h3>Auffällig</h3>
   {findings_html}

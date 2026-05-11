@@ -627,8 +627,8 @@ def test_teams_button_case_check_runs_read_only_case_summary_without_changing_pe
     assert result["status"] == "case_check_completed"
     assert "<h2>🔎 Fallprüfung AN-11755" in result["response_text"]
     assert "Read-only ausgeführt" not in result["response_text"]
-    assert "<strong>Lage:</strong> TMS in_transit" in result["response_text"]
-    assert "Mails 1" in result["response_text"]
+    assert "<strong>Lage:</strong> Ich sehe die Sendung im TMS als unterwegs / im Hauptlauf" in result["response_text"]
+    assert "Zur Akte liegen 1 Mails" in result["response_text"]
     assert "<h3>Auffällig</h3>" in result["response_text"]
     assert "<h3>Empfehlung</h3>" in result["response_text"]
     assert "Offene Freigabe" in result["response_text"]

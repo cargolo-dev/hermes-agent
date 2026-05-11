@@ -56,8 +56,8 @@ def test_employee_runtime_cli_outputs_compact_text_and_writes_audit(tmp_path: Pa
 
     assert result.returncode == 0, result.stderr
     assert "Fallprüfung AN-11755" in result.stdout
-    assert "docs pending" in result.stdout
-    assert "commercial_invoice" in result.stdout
+    assert "Dokumente offen" in result.stdout
+    assert "Handelsrechnung" in result.stdout
     assert "<h3>Nächster Schritt</h3>" in result.stdout
     assert "Read-only ausgeführt" not in result.stdout
     assert "should_send_to_teams" not in result.stdout

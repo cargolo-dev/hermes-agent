@@ -209,7 +209,7 @@ def _context_needs_for(text: str, order_id: str | None) -> list[ContextNeed]:
     if not order_id:
         return []
     needs = [ContextNeed.CASE_FOLDER]
-    if _has_any(text, ("mail", "historie", "kunde", "kunden", "antwort")):
+    if _has_any(text, ("mail", "historie", "kunde", "kunden", "antwort", "alles", "komplett", "übersicht", "uebersicht")):
         needs.append(ContextNeed.MAIL_HISTORY)
     if _has_any(text, ("tms", "status", "stand", "lage", "alles", "komplett", "übersicht", "uebersicht")):
         needs.append(ContextNeed.TMS_SNAPSHOT)

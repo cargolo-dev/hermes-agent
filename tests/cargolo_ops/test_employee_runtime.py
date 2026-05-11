@@ -192,8 +192,8 @@ def test_case_assist_reads_structured_local_sources_and_synthesizes_compact_ops_
     assert "AN-11755" in (result.draft_response or "")
     assert "<h3>Auffällig</h3>" in (result.draft_response or "")
     assert "AN-11755" in (result.draft_response or "")
-    assert "docs pending" in (result.draft_response or "")
-    assert "commercial_invoice" in (result.draft_response or "")
+    assert "Dokumente offen" in (result.draft_response or "")
+    assert "Handelsrechnung" in (result.draft_response or "")
     assert "Read-only ausgeführt" not in (result.draft_response or "")
     assert result.should_send_to_teams is False
     assert result.should_write_tms is False
@@ -332,3 +332,68 @@ def test_document_reader_requires_review_when_only_raw_files_exist_without_analy
     assert docs.requires_human is True
     assert docs.findings[0]["files"] == ["packing_list.pdf"]
     assert docs.write_intents == []
+
+
+def test_teams_case_answer_humanizes_document_findings_instead_of_raw_debug_points(tmp_path: Path) -> None:
+    root = tmp_path / "cargolo_asr"
+    case_dir = root / "orders" / "AN-12432"
+    (case_dir / "mail").mkdir(parents=True)
+    (case_dir / "documents" / "analysis").mkdir(parents=True)
+    (case_dir / "tms").mkdir(parents=True)
+    (case_dir / "mail" / "history.json").write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        "from": "doc@mfd-group.com.cn",
+                        "subject": "Re: AW: Re: AW: AN-12432 // Rail LCL CN-DE // Cnee: Deters/Ivality ZIHWBK260503LH120-Q",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (case_dir / "tms" / "shipment_detail.json").write_text(
+        json.dumps(
+            {
+                "shipment_status": "in_transit",
+                "dates": {"pickup_date": "2026-04-22"},
+                "freight_details": {"hbl_number": "ZIHWBK260503LH120-Q", "container_number": "CICU1036576", "pol_code": "?", "pod_code": "DEHAM"},
+                "totals": {"total_packages": 170, "total_weight_kg": 2745, "total_volume_m3": 20},
+                "cargo": [{"goods_description": "Handtücher"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (case_dir / "documents" / "analysis" / "latest_summary.json").write_text(
+        json.dumps(
+            {
+                "documents": [
+                    {
+                        "doc_type": "bill_of_lading",
+                        "filename": "draft-ZIHWBK260503LH120-Q.doc",
+                        "summary": "Haus-Konnossement für Bahntransport Zhengzhou, China nach Hamburg, Deutschland.",
+                    }
+                ],
+                "missing": ["Abgangsort (nur als '?' angegeben)", "Steuernummer des Empfängers", "Warenwert (als 0 angegeben)"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_employee_runtime(
+        EmployeeRequest(text="Gib mir alles zu AN-12432", channel="teams"),
+        root=root,
+    )
+
+    response = result.draft_response or ""
+    assert "unterwegs / im Hauptlauf" in response
+    assert "Ich sehe die Sendung im TMS" in response
+    assert "Letzter Mailstand:" in response
+    assert "Re: AW: Re: AW" not in response
+    assert "Routing ?" not in response
+    assert "Abgangsort (nur als '?' angegeben)" not in response
+    assert "Warenwert wurde mit 0 erkannt" in response
+    assert "Empfänger-Steuernummer fehlt" in response
+    assert "Sendung ist eindeutig zuordenbar" in response
+
