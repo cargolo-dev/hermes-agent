@@ -110,6 +110,16 @@ def _parse_bool(value: Any, *, default: bool = False) -> bool:
     return default
 
 
+def _parse_csv_set(value: Any) -> set[str]:
+    """Parse config/env list values into a normalized string set."""
+    if value is None:
+        return set()
+    if isinstance(value, (set, list, tuple)):
+        return {str(item).strip() for item in value if str(item).strip()}
+    raw = str(value or "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
 class _StaticAccessTokenProvider:
     """Minimal token-provider shim so outbound Graph delivery can reuse the shared client."""
 
@@ -620,6 +630,16 @@ class TeamsAdapter(BasePlatformAdapter):
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
         self._conv_refs: Dict[str, Any] = {}
+        self._cargolo_employee_handoff_enabled = _parse_bool(
+            extra.get("cargolo_employee_handoff_enabled")
+            if "cargolo_employee_handoff_enabled" in extra
+            else os.getenv("CARGOLO_TEAMS_EMPLOYEE_HANDOFF_ENABLED"),
+            default=False,
+        )
+        self._cargolo_employee_dedicated_channel_ids = _parse_csv_set(
+            extra.get("cargolo_employee_dedicated_channel_ids")
+            or os.getenv("CARGOLO_TEAMS_EMPLOYEE_DEDICATED_CHANNEL_IDS")
+        )
 
     def format_message(self, content: str) -> str:
         """Format plain Hermes text so Teams keeps paragraph/list breaks.
@@ -747,7 +767,8 @@ class TeamsAdapter(BasePlatformAdapter):
         if hasattr(activity, "text") and activity.text:
             text = activity.text
         # Strip <at>BotName</at> HTML tags that Teams prepends for @mentions
-        if "<at>" in text:
+        had_teams_at_mention = "<at>" in text
+        if had_teams_at_mention:
             import re
             text = re.sub(r"<at>[^<]*</at>\s*", "", text).strip()
 
@@ -779,6 +800,79 @@ class TeamsAdapter(BasePlatformAdapter):
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
         )
 
+        handoff_channel_id = ""
+        conv_handoff_id = str(getattr(conv, "id", "") or "").strip()
+        if self._cargolo_employee_handoff_enabled:
+            handoff_channel_id = self._extract_cargolo_handoff_channel_id(activity)
+            # Some Teams payloads expose both a human channel id in channelData and
+            # the Bot Framework thread id in conversation.id. Operators usually
+            # discover the latter from gateway logs, so allow that ID to drive
+            # dedicated mode even when channelData is also present.
+            if (
+                handoff_channel_id not in self._cargolo_employee_dedicated_channel_ids
+                and conv_handoff_id in self._cargolo_employee_dedicated_channel_ids
+            ):
+                handoff_channel_id = conv_handoff_id
+
+        # Dedicated CARGOLO/Hermes channel front door:
+        # 1) deterministic safe ops commands (e.g. "offene Freigaben") must be
+        #    handled before the free employee runtime, otherwise the runtime's
+        #    always-handled free-chat fallback swallows them.
+        # 2) all other top-level employee messages go to the agent-first handoff.
+        if (
+            self._cargolo_employee_handoff_enabled
+            and handoff_channel_id in self._cargolo_employee_dedicated_channel_ids
+            and not reply_to_message_id
+            and not self._looks_like_quoted_cargolo_operator_card(text)
+        ):
+            from hermes_constants import get_hermes_home
+            from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message
+
+            ops_result = route_teams_ops_message(
+                text=text,
+                root=get_hermes_home() / "cargolo_asr",
+                chat_id=str(conv.id),
+                user_id=str(user_id),
+                user_name=user_name,
+                message_id=str(msg_id) if msg_id else None,
+            )
+            if ops_result.get("handled"):
+                await self.send(
+                    str(conv.id),
+                    str(ops_result.get("response_text") or "Gespeichert."),
+                    reply_to=str(msg_id) if msg_id else None,
+                )
+                for pending_action in ops_result.get("teams_tms_review_cards") or []:
+                    if isinstance(pending_action, dict):
+                        await self.send_cargolo_asr_tms_review_card(
+                            str(conv.id), pending_action, reply_to=str(msg_id) if msg_id else None
+                        )
+                return
+
+            from plugins.cargolo_ops.teams_employee_handoff import (
+                TeamsHandoffConfig,
+                handle_teams_employee_message,
+            )
+
+            handoff_result = handle_teams_employee_message(
+                root=get_hermes_home() / "cargolo_asr",
+                text=text,
+                channel_id=handoff_channel_id,
+                message_id=str(msg_id) if msg_id else "",
+                user_id=str(user_id) if user_id else None,
+                user_name=user_name or None,
+                config=TeamsHandoffConfig(
+                    dedicated_channel_ids=self._cargolo_employee_dedicated_channel_ids,
+                ),
+            )
+            if handoff_result.get("handled"):
+                await self.send(
+                    str(conv.id),
+                    str(handoff_result.get("response_text") or "Gespeichert."),
+                    reply_to=str(msg_id) if msg_id else None,
+                )
+                return
+
         # CARGOLO ASR Teams reply loop: replies to operator cards are
         # deterministic case-learning/control events, not generic chat.
         try:
@@ -800,6 +894,35 @@ class TeamsAdapter(BasePlatformAdapter):
                 asr_agent_prompt = str(reply_result.get("agent_prompt"))
                 text = asr_agent_prompt
             else:
+                if self._cargolo_employee_handoff_enabled:
+                    from hermes_constants import get_hermes_home
+                    from plugins.cargolo_ops.teams_employee_handoff import (
+                        TeamsHandoffConfig,
+                        handle_teams_employee_message,
+                    )
+
+                    handoff_text = text
+                    if had_teams_at_mention and handoff_channel_id not in self._cargolo_employee_dedicated_channel_ids:
+                        handoff_text = f"@Hermes {text}".strip()
+                    handoff_result = handle_teams_employee_message(
+                        root=get_hermes_home() / "cargolo_asr",
+                        text=handoff_text,
+                        channel_id=handoff_channel_id,
+                        message_id=str(msg_id) if msg_id else "",
+                        user_id=str(user_id) if user_id else None,
+                        user_name=user_name or None,
+                        config=TeamsHandoffConfig(
+                            dedicated_channel_ids=self._cargolo_employee_dedicated_channel_ids,
+                        ),
+                    )
+                    if handoff_result.get("handled"):
+                        await self.send(
+                            str(conv.id),
+                            str(handoff_result.get("response_text") or "Gespeichert."),
+                            reply_to=str(msg_id) if msg_id else None,
+                        )
+                        return
+
                 from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message
 
                 ops_result = route_teams_ops_message(
@@ -862,6 +985,82 @@ class TeamsAdapter(BasePlatformAdapter):
             reply_to_message_id=reply_to_message_id,
         )
         await self.handle_message(event)
+
+    @staticmethod
+    def _extract_cargolo_handoff_channel_id(activity: Any) -> str:
+        """Return the best Teams channel identifier for CARGOLO dedicated-channel gating.
+
+        Teams can expose the human channel id in channelData.channel.id while the
+        Bot Framework conversation id is a thread id.  The handoff allowlist may
+        intentionally use either, so prefer channelData and fall back to the
+        conversation id.
+        """
+
+        def _coerce(value: Any) -> str | None:
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()
+            return None
+
+        def _from_mapping(data: Any) -> str | None:
+            if not isinstance(data, dict):
+                return None
+            for key in ("channel_id", "channelId", "teamsChannelId", "id"):
+                value = _coerce(data.get(key))
+                if value:
+                    return value
+            channel = data.get("channel")
+            if isinstance(channel, dict):
+                for key in ("id", "channel_id", "channelId"):
+                    value = _coerce(channel.get(key))
+                    if value:
+                        return value
+            return None
+
+        channel_data = getattr(activity, "channel_data", None)
+        channel_id = _from_mapping(channel_data)
+        if channel_id:
+            return channel_id
+
+        channel_obj = getattr(channel_data, "channel", None)
+        for attr in ("id", "channel_id", "channelId"):
+            value = _coerce(getattr(channel_obj, attr, None))
+            if value:
+                return value
+
+        conversation = getattr(activity, "conversation", None)
+        return _coerce(getattr(conversation, "id", None)) or ""
+
+    @staticmethod
+    def _looks_like_quoted_cargolo_operator_card(text: str) -> bool:
+        """Detect Teams quote payloads that should stay in the ASR card reply loop.
+
+        Teams sometimes sends quote+mention replies as one flattened text blob
+        without a reliable reply_to id.  In that case the quoted card normally
+        carries card-specific wording/metadata before the operator's own line.
+        A plain top-level channel question that merely mentions AN/BU must not
+        match this helper.
+        """
+        raw = str(text or "")
+        if not raw.strip():
+            return False
+        if "ASRCTX:" in raw:
+            return True
+        card_markers = (
+            "Dokument-Check",
+            "Dokumenten-Upload",
+            "TMS-Aktion",
+            "Review",
+            "Offen",
+            "MRN",
+            "teams_reply_",
+            "Lage:",
+            "Vorschlag",
+            "Frage",
+        )
+        has_order = bool(re.search(r"(?:AN|BU)-\d{3,}", raw, re.IGNORECASE))
+        has_card_marker = any(marker.lower() in raw.lower() for marker in card_markers)
+        looks_flattened_quote = bool(re.search(r"\b[A-ZÄÖÜ][\wÄÖÜäöüß .,'-]{2,60}(?:AN|BU)-\d{3,}", raw))
+        return has_order and has_card_marker and ("\n" in raw or looks_flattened_quote)
 
     @staticmethod
     def _looks_like_cargolo_asr_control_message(text: str) -> bool:
@@ -972,7 +1171,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 TextBlock(text=f"CARGOLO ASR · TMS-Freigabe {order_id}", wrap=True, weight="Bolder"),
                 TextBlock(text=f"Vorschlag: {target} = {value}", wrap=True),
                 TextBlock(text=f"Quelle: {operator} · Status: pending_review", wrap=True, isSubtle=True),
-                TextBlock(text="Bitte prüfen: ✅ schreibt nach Live-Writeback + frischer Verifikation ins TMS; ❌ lehnt ohne TMS-Write ab.", wrap=True),
+                TextBlock(text="Bitte prüfen: ✅ schreibt nur nach Live-Writeback + frischer Verifikation ins TMS; ❌/✏️/🔎 schreiben nie ins TMS.", wrap=True),
             ])
             .with_actions([
                 ExecuteAction(
@@ -980,6 +1179,16 @@ class TeamsAdapter(BasePlatformAdapter):
                     verb="cargolo_asr_tms_approve",
                     data={**data_base, "hermes_action": "cargolo_asr_tms_approve"},
                     style="positive",
+                ),
+                ExecuteAction(
+                    title="✏️ Korrektur nötig",
+                    verb="cargolo_asr_tms_correct",
+                    data={**data_base, "hermes_action": "cargolo_asr_tms_correct"},
+                ),
+                ExecuteAction(
+                    title="🔎 Fall prüfen",
+                    verb="cargolo_asr_case_check",
+                    data={**data_base, "hermes_action": "cargolo_asr_case_check"},
                 ),
                 ExecuteAction(
                     title="❌ Ablehnen",
@@ -997,6 +1206,46 @@ class TeamsAdapter(BasePlatformAdapter):
             logger.error("[teams] send_cargolo_asr_tms_review_card failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e), retryable=True)
 
+    def _build_cargolo_asr_tms_review_status_card(
+        self,
+        *,
+        data: dict[str, Any],
+        result: dict[str, Any],
+        response_text: str,
+        clicker_name: str | None = None,
+    ) -> "AdaptiveCard":
+        """Build a button-free replacement card after a CARGOLO TMS review decision.
+
+        Teams Adaptive Card invoke responses can return a card response to replace
+        the card that was clicked. Use that for terminal review outcomes so stale
+        approve/reject/correction buttons no longer look selectable after an
+        operator decision.
+        """
+        order_id = str(result.get("order_id") or data.get("order_id") or "AN/BU?").strip().upper()
+        target = str(data.get("target") or "Feld?").strip()
+        value = str(data.get("value") or "Wert?").strip()
+        status = str(result.get("status") or "resolved").strip()
+        status_label = {
+            "rejected": "❌ Abgelehnt",
+            "correction_requested": "✏️ Korrektur angefordert",
+            "applied": "✅ Ins TMS geschrieben und verifiziert",
+            "verification_failed": "⚠️ TMS-Write nicht sauber verifiziert",
+            "apply_failed": "⚠️ TMS-Write fehlgeschlagen",
+            "approval_blocked": "⚠️ TMS-Write blockiert",
+            "validation_error": "⛔ Ungültige Aktion",
+            "already_resolved": "ℹ️ Bereits erledigt",
+            "not_found": "ℹ️ Nicht mehr offen",
+        }.get(status, f"ℹ️ Status: {status}")
+        decided_by = str(clicker_name or "Teams Operator").strip()
+        body = [
+            TextBlock(text=f"CARGOLO ASR · TMS-Freigabe {order_id}", wrap=True, weight="Bolder"),
+            TextBlock(text=f"Vorschlag: {target} = {value}", wrap=True),
+            TextBlock(text=status_label, wrap=True, weight="Bolder"),
+            TextBlock(text=response_text, wrap=True),
+            TextBlock(text=f"Entschieden durch: {decided_by} · Buttons deaktiviert", wrap=True, isSubtle=True),
+        ]
+        return AdaptiveCard().with_version("1.4").with_body(body)
+
     async def _on_card_action(
         self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
     ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
@@ -1008,21 +1257,92 @@ class TeamsAdapter(BasePlatformAdapter):
         hermes_action = data.get("hermes_action", "")
         session_key = data.get("session_key", "")
 
-        if str(hermes_action or "").startswith("cargolo_asr_tms_"):
+        cargolo_card_actions = {
+            "cargolo_asr_tms_approve",
+            "cargolo_asr_tms_reject",
+            "cargolo_asr_tms_correct",
+            "cargolo_asr_case_check",
+        }
+        if str(hermes_action or "") in cargolo_card_actions:
             allowed, clicker_id, clicker_name, deny_body = self._authorize_card_action_click(ctx)
             if not allowed:
                 return InvokeResponse(status=200, body=deny_body)
             try:
                 from plugins.cargolo_ops.teams_reply_loop import process_teams_tms_card_action
 
+                if str(hermes_action or "") == "cargolo_asr_case_check":
+                    conv = getattr(ctx.activity, "conversation", None)
+                    conv_id = str(getattr(conv, "id", "") or "").strip()
+                    order_id = str(data.get("order_id") or "AN/BU").strip().upper()
+                    ack_text = (
+                        f"🔎 Fallprüfung für {order_id} läuft. Ich poste die Entscheidungshilfe gleich hier; "
+                        "kein TMS-Write, keine Kundenmail."
+                    )
+                    if conv_id and self._app:
+                        try:
+                            await self.send(conv_id, ack_text)
+                        except Exception:
+                            logger.debug("[teams] case-check immediate ack send failed", exc_info=True)
+
+                    async def _run_case_check_background() -> None:
+                        try:
+                            result = await asyncio.to_thread(
+                                process_teams_tms_card_action,
+                                data=data,
+                                user_id=clicker_id,
+                                user_name=clicker_name,
+                            )
+                            response_text = str(result.get("response_text") or "Fallprüfung abgeschlossen.")
+                        except Exception as bg_exc:
+                            logger.error("[teams] CARGOLO ASR case-check background failed: %s", bg_exc, exc_info=True)
+                            response_text = (
+                                "⚠️ CARGOLO ASR Fallprüfung konnte nicht sicher abgeschlossen werden; "
+                                "nichts wurde ins TMS geschrieben."
+                            )
+                        if conv_id and self._app:
+                            try:
+                                await self.send(conv_id, response_text)
+                            except Exception:
+                                logger.debug("[teams] case-check result send failed", exc_info=True)
+
+                    asyncio.create_task(_run_case_check_background())
+                    return InvokeResponse(
+                        status=200,
+                        body=AdaptiveCardActionMessageResponse(value=ack_text),
+                    )
+
                 result = process_teams_tms_card_action(
                     data=data,
                     user_id=clicker_id,
                     user_name=clicker_name,
                 )
+                response_text = str(result.get("response_text") or "Gespeichert.")
+                terminal_statuses = {
+                    "rejected",
+                    "correction_requested",
+                    "applied",
+                    "verification_failed",
+                    "apply_failed",
+                    "approval_blocked",
+                    "validation_error",
+                    "already_resolved",
+                    "not_found",
+                }
+                if str(result.get("status") or "") in terminal_statuses:
+                    return InvokeResponse(
+                        status=200,
+                        body=AdaptiveCardActionCardResponse(
+                            value=self._build_cargolo_asr_tms_review_status_card(
+                                data=data,
+                                result=result,
+                                response_text=response_text,
+                                clicker_name=clicker_name,
+                            )
+                        ),
+                    )
                 return InvokeResponse(
                     status=200,
-                    body=AdaptiveCardActionMessageResponse(value=str(result.get("response_text") or "Gespeichert.")),
+                    body=AdaptiveCardActionMessageResponse(value=response_text),
                 )
             except Exception as exc:
                 logger.error("[teams] CARGOLO ASR card action failed: %s", exc, exc_info=True)

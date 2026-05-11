@@ -537,6 +537,139 @@ def test_teams_button_reject_marks_pending_without_tms_write(tmp_path: Path) -> 
     assert queue[-1]["value"] == "26DE99999"
 
 
+def test_teams_button_correct_marks_pending_as_correction_requested_without_tms_write(tmp_path: Path) -> None:
+    from plugins.cargolo_ops.teams_reply_loop import record_agent_tms_update_intent, process_teams_tms_card_action
+
+    root = tmp_path / "cargolo_asr"
+    queued = record_agent_tms_update_intent(
+        root=root,
+        order_id="AN-11755",
+        target="customs_reference",
+        value="26DE99999",
+        text="MRN ändern",
+        operator="Hermes Agent",
+        context_id="AN-11755:card",
+    )
+
+    result = process_teams_tms_card_action(
+        root=root,
+        data={
+            "hermes_action": "cargolo_asr_tms_correct",
+            "order_id": "AN-11755",
+            "action_id": queued["action_id"],
+            "target": "customs_reference",
+            "value": "26DE99999",
+        },
+        user_id="u-1",
+        user_name="Dominik",
+        apply_tms_update=lambda *_: (_ for _ in ()).throw(AssertionError("must not apply")),
+    )
+
+    assert result["status"] == "correction_requested"
+    assert "Korrektur" in result["response_text"]
+    assert "nicht ins TMS geschrieben" in result["response_text"]
+    queue = _read_jsonl(root / "orders" / "AN-11755" / "teams" / "pending_tms_actions.jsonl")
+    assert queue[-1]["status"] == "correction_requested"
+    assert queue[-1]["correction_requested_by"] == "Dominik"
+    assert not (root / "orders" / "AN-11755" / "teams" / "applied_tms_actions.jsonl").exists()
+    audit = _read_jsonl(root / "orders" / "AN-11755" / "audit" / "actions.jsonl")
+    assert any(row["action"] == "teams_tms_update_correction_requested" for row in audit)
+
+
+def test_teams_button_case_check_runs_read_only_case_summary_without_changing_pending_status(tmp_path: Path) -> None:
+    from plugins.cargolo_ops.teams_reply_loop import record_agent_tms_update_intent, process_teams_tms_card_action
+
+    root = tmp_path / "cargolo_asr"
+    case_root = root / "orders" / "AN-11755"
+    (case_root / "documents" / "analysis").mkdir(parents=True)
+    (case_root / "tms_snapshot.json").write_text(
+        json.dumps({"status": "in_transit", "pickup_date": "2026-05-07"}),
+        encoding="utf-8",
+    )
+    (case_root / "email_index.jsonl").write_text(
+        json.dumps({"subject": "AW: AN-11755 // Zolldokumente", "sender": "asr@cargolo.com", "received_at": "2026-05-08T07:24:10Z"}) + "\n",
+        encoding="utf-8",
+    )
+    (case_root / "documents" / "analysis" / "latest_summary.json").write_text(
+        json.dumps({
+            "documents": [{
+                "filename": "CommercialInvoice.pdf",
+                "operational_flags": ["MRN prüfen"],
+                "missing_or_unreadable": ["HS-Code"],
+            }]
+        }),
+        encoding="utf-8",
+    )
+    queued = record_agent_tms_update_intent(
+        root=root,
+        order_id="AN-11755",
+        target="customs_reference",
+        value="26DE99999",
+        text="MRN ändern",
+        operator="Hermes Agent",
+        context_id="AN-11755:card",
+    )
+
+    result = process_teams_tms_card_action(
+        root=root,
+        data={
+            "hermes_action": "cargolo_asr_case_check",
+            "order_id": "AN-11755",
+            "action_id": queued["action_id"],
+            "target": "customs_reference",
+            "value": "26DE99999",
+        },
+        user_id="u-1",
+        user_name="Dominik",
+        apply_tms_update=lambda *_: (_ for _ in ()).throw(AssertionError("must not apply")),
+    )
+
+    assert result["status"] == "case_check_completed"
+    assert "<h2>🔎 Fallprüfung AN-11755" in result["response_text"]
+    assert "Read-only ausgeführt: kein TMS-Write" in result["response_text"]
+    assert "<strong>TMS:</strong> in_transit" in result["response_text"]
+    assert "<strong>Mails:</strong> 1 Nachrichten" in result["response_text"]
+    assert "Entscheidungshilfe" in result["response_text"]
+    assert "Noch offen, aber nach Relevanz gefiltert" in result["response_text"]
+    assert "Offene Freigabe" in result["response_text"]
+    assert "Zollreferenz / MRN" in result["response_text"]
+    assert "26DE99999" in result["response_text"]
+    assert "document_analyst" not in result["response_text"]
+    assert " | " not in result["response_text"]
+    queue = _read_jsonl(root / "orders" / "AN-11755" / "teams" / "pending_tms_actions.jsonl")
+    assert queue[-1]["status"] == "pending_review"
+    case_checks = _read_jsonl(root / "orders" / "AN-11755" / "teams" / "case_check_requests.jsonl")
+    assert case_checks[-1]["action_id"] == queued["action_id"]
+    assert case_checks[-1]["status"] == "completed_read_only"
+    assert case_checks[-1]["case_check"]["should_write_tms"] is False
+    audit = _read_jsonl(root / "orders" / "AN-11755" / "audit" / "actions.jsonl")
+    assert any(row["action"] == "teams_case_check_completed" for row in audit)
+    assert not (root / "orders" / "AN-11755" / "teams" / "applied_tms_actions.jsonl").exists()
+
+
+def test_teams_button_correct_missing_pending_action_does_not_create_new_action(tmp_path: Path) -> None:
+    from plugins.cargolo_ops.teams_reply_loop import process_teams_tms_card_action
+
+    root = tmp_path / "cargolo_asr"
+    result = process_teams_tms_card_action(
+        root=root,
+        data={
+            "hermes_action": "cargolo_asr_tms_correct",
+            "order_id": "AN-11755",
+            "action_id": "missing",
+            "target": "customs_reference",
+            "value": "26DE99999",
+        },
+        user_id="u-1",
+        user_name="Dominik",
+        apply_tms_update=lambda *_: (_ for _ in ()).throw(AssertionError("must not apply")),
+    )
+
+    assert result["status"] == "not_found"
+    assert not (root / "orders" / "AN-11755" / "teams" / "pending_tms_actions.jsonl").exists()
+    assert not (root / "orders" / "AN-11755" / "teams" / "applied_tms_actions.jsonl").exists()
+
+
 def test_teams_button_approve_applies_and_verifies_pending_action(tmp_path: Path) -> None:
     from plugins.cargolo_ops.teams_reply_loop import record_agent_tms_update_intent, process_teams_tms_card_action
 

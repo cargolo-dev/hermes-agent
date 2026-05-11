@@ -12,6 +12,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .models import utc_now_iso
+
 try:
     from hermes_constants import get_hermes_home
 except Exception:  # pragma: no cover - test/import fallback
@@ -25,6 +27,7 @@ _PENDING_RE = re.compile(r"\b(offene?|pending|freigaben?|review|tms[-\s]?freigab
 _CASE_CHECK_RE = re.compile(r"\b(prüf(?:e|en)?|pruef(?:e|en)?|check|aktualisier(?:e|en)?|sync|zieh(?:e|en)?)\b", re.IGNORECASE)
 _WRITE_RE = re.compile(r"\b(schreib(?:e|en)?|setz(?:e|en)?|eintragen|ändern|aendern|update|aktualisier(?:e|en)?)\b", re.IGNORECASE)
 _TMS_FIELD_RE = re.compile(r"\b(TMS|MRN|HBL|MBL|HAWB|Zollreferenz|customs)\b", re.IGNORECASE)
+_MRN_VALUE_RE = re.compile(r"\b([0-9]{2}[A-Z]{2}[A-Z0-9]{3,})\b", re.IGNORECASE)
 
 
 def default_case_root() -> Path:
@@ -103,6 +106,184 @@ def _collect_pending_tms_actions(root: Path, limit: int = 8) -> list[dict[str, A
     return pending[:limit]
 
 
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _collect_correction_requested_tms_actions(root: Path, limit: int = 8) -> list[dict[str, Any]]:
+    orders_root = root / "orders"
+    if not orders_root.exists():
+        return []
+    corrections: list[dict[str, Any]] = []
+    for path in sorted(orders_root.glob("*/teams/pending_tms_actions.jsonl")):
+        for item in _read_jsonl(path):
+            if str(item.get("status") or "").lower() != "correction_requested":
+                continue
+            target = str(item.get("target") or "").strip()
+            order_id = str(item.get("order_id") or "").strip().upper()
+            if target not in _SUPPORTED_TMS_REVIEW_TARGETS or not _ORDER_RE.fullmatch(order_id):
+                continue
+            corrections.append(dict(item))
+    corrections.sort(key=lambda x: str(x.get("correction_requested_at") or x.get("timestamp") or ""), reverse=True)
+    return corrections[:limit]
+
+
+def _extract_correction_value(raw: str, *, target: str) -> str | None:
+    text = str(raw or "")
+    if target == "customs_reference":
+        match = _MRN_VALUE_RE.search(text)
+        return match.group(1).upper() if match else None
+    field_patterns = {
+        "hbl_number": r"\bHBL\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{2,})\b",
+        "mbl_number": r"\bMBL\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{2,})\b",
+        "hawb_number": r"\bHAWB\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{2,})\b",
+    }
+    pattern = field_patterns.get(target)
+    if not pattern:
+        return None
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else None
+
+
+def _has_pending_review_value(root: Path, *, order_id: str, target: str, value: str) -> bool:
+    queue_path = root / "orders" / order_id / "teams" / "pending_tms_actions.jsonl"
+    for item in _read_jsonl(queue_path):
+        if str(item.get("status") or "") != "pending_review":
+            continue
+        if str(item.get("order_id") or "").strip().upper() != order_id:
+            continue
+        if str(item.get("target") or "").strip() == target and str(item.get("value") or "").strip().upper() == value.upper():
+            return True
+    return False
+
+
+def _record_correction_followup(
+    *,
+    root: Path,
+    correction: dict[str, Any],
+    value: str,
+    text: str,
+    user_id: str | None,
+    user_name: str | None,
+    message_id: str | None,
+) -> dict[str, Any]:
+    order_id = str(correction.get("order_id") or "").strip().upper()
+    target = str(correction.get("target") or "").strip()
+    now = utc_now_iso()
+    context_id = str(correction.get("context_id") or f"{order_id}:correction").strip()
+    row = {
+        "timestamp": now,
+        "action_id": _pending_action_id_for_row({
+            "order_id": order_id,
+            "target": target,
+            "value": value,
+            "context_id": context_id,
+            "timestamp": now,
+        }),
+        "status": "pending_review",
+        "order_id": order_id,
+        "context_id": context_id,
+        "activity_id": correction.get("activity_id"),
+        "target": target,
+        "value": value,
+        "previous_value": correction.get("value"),
+        "correction_of_action_id": correction.get("action_id"),
+        "confidence": "operator_correction_followup",
+        "source": "teams_correction_followup",
+        "source_message_id": message_id,
+        "reply_to_message_id": None,
+        "operator": user_name,
+        "operator_user_id": user_id,
+        "text": text,
+        "write_policy": "no_auto_write_without_review",
+    }
+    teams_dir = root / "orders" / order_id / "teams"
+    _append_jsonl(teams_dir / "pending_tms_actions.jsonl", row)
+    _append_jsonl(teams_dir / "case_learning.jsonl", {
+        "timestamp": now,
+        "source": "teams_correction_followup",
+        "order_id": order_id,
+        "operator": user_name,
+        "classification": "tms_correction_followup",
+        "learning": text,
+        "context_id": context_id,
+        "derived_action": {"type": "pending_tms_update", "target": target, "value": value, "previous_value": correction.get("value")},
+    })
+    _append_jsonl(root / "orders" / order_id / "audit" / "actions.jsonl", {
+        "timestamp": now,
+        "actor": user_name or "Teams Operator",
+        "action": "teams_tms_correction_followup_recorded",
+        "result": "pending_review",
+        "target": target,
+        "value": value,
+        "previous_value": correction.get("value"),
+        "order_id": order_id,
+        "files": [str(teams_dir / "pending_tms_actions.jsonl")],
+    })
+    return row
+
+
+def _route_correction_followup(
+    *,
+    raw: str,
+    root: Path,
+    order_id: str | None,
+    user_id: str | None,
+    user_name: str | None,
+    message_id: str | None,
+) -> dict[str, Any] | None:
+    corrections = _collect_correction_requested_tms_actions(root, limit=8)
+    if order_id:
+        corrections = [item for item in corrections if str(item.get("order_id") or "").strip().upper() == order_id]
+    if len(corrections) != 1:
+        return None
+    correction = corrections[0]
+    target = str(correction.get("target") or "").strip()
+    value = _extract_correction_value(raw, target=target)
+    if not value:
+        return None
+    old_value = str(correction.get("value") or "").strip().upper()
+    normalized_order = str(correction.get("order_id") or "").strip().upper()
+    if value == old_value:
+        return {
+            "handled": True,
+            "classification": "correction_followup_unchanged",
+            "order_id": normalized_order,
+            "response_text": (
+                f"Ich sehe denselben Wert wie vorher ({target} = {value}). "
+                "Bitte sende den korrigierten neuen Wert oder lehne die Freigabe ab. Kein TMS-Write."
+            ),
+        }
+    if _has_pending_review_value(root, order_id=normalized_order, target=target, value=value):
+        return {
+            "handled": True,
+            "classification": "correction_followup_duplicate",
+            "order_id": normalized_order,
+            "response_text": f"ℹ️ Für {normalized_order} ist {target} = {value} bereits als offene TMS-Freigabe vorgemerkt.",
+        }
+    row = _record_correction_followup(
+        root=root,
+        correction=correction,
+        value=value,
+        text=raw,
+        user_id=user_id,
+        user_name=user_name,
+        message_id=message_id,
+    )
+    return {
+        "handled": True,
+        "classification": "correction_followup_recorded",
+        "order_id": normalized_order,
+        "response_text": (
+            f"✏️ Korrektur übernommen für {normalized_order}: {target} = {value} ist wieder als pending_review vorgemerkt. "
+            "Kein TMS-Write; bitte die neue Karte bestätigen oder ablehnen."
+        ),
+        "teams_tms_review_cards": [row],
+    }
+
+
 def _status_response(root: Path) -> str:
     jobs = _load_cron_jobs()
     doc_jobs = [j for j in jobs if "cargolo" in str(j.get("name") or j.get("job_id") or "").lower()]
@@ -179,7 +360,7 @@ def route_teams_ops_message(
     - {handled: False, allow_generic_chat: True, agent_prompt: ...} for agent work
     - {handled: False} for unrelated Teams chat
     """
-    del chat_id, user_id, user_name, message_id  # reserved for audit extension
+    del chat_id  # reserved for audit extension
     raw = str(text or "").strip()
     if not raw:
         return {"handled": False}
@@ -187,6 +368,17 @@ def route_teams_ops_message(
     lowered = raw.lower()
     order_match = _ORDER_RE.search(raw)
     order_id = order_match.group(0).upper() if order_match else None
+
+    correction_followup = _route_correction_followup(
+        raw=raw,
+        root=case_root,
+        order_id=order_id,
+        user_id=user_id,
+        user_name=user_name,
+        message_id=message_id,
+    )
+    if correction_followup:
+        return correction_followup
 
     # Deterministic, read-only commands for the operations surface.
     if _STATUS_RE.search(raw) and ("cargolo" in lowered or "asr" in lowered or raw.strip().lower() in {"status", "health", "cron status"}):

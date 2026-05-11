@@ -491,6 +491,52 @@ def _button_event(*, user_id: str | None, user_name: str | None) -> dict[str, An
     }
 
 
+def _run_read_only_case_check(
+    *,
+    root: Path,
+    order_id: str,
+    pending_action: dict[str, Any],
+    actor: str | None,
+) -> dict[str, Any]:
+    """Run the employee case-assist loop for a Teams `Fall prüfen` button.
+
+    This is intentionally read-only: local case/TMS/mail/doc context may be
+    read and local audit/specialist-result files may be written, but no TMS
+    write, Teams-send decision, or customer mail is executed here.
+    """
+    from .employee_agent import EmployeeRequest
+    from .employee_runtime import run_employee_runtime
+
+    target = str(pending_action.get("target") or "").strip()
+    value = str(pending_action.get("value") or "").strip()
+    check_text = (
+        f"Fall prüfen {order_id}: komplette read-only Lage mit TMS Status Stand, "
+        f"Mail Historie, Dokumente komplett und offene Freigabe prüfen. "
+        f"Offene Freigabe: {target} = {value}."
+    )
+    runtime_result = run_employee_runtime(
+        EmployeeRequest(
+            text=check_text,
+            channel="teams",
+            order_id=order_id,
+            actor=actor,
+            context_refs=[str(pending_action.get("context_id") or "")],
+            pending_action_target=target,
+            pending_action_value=value,
+        ),
+        root=root,
+    )
+    return {
+        "response_text": runtime_result.draft_response or f"Lage: {order_id} | Keine externe Aktion ausgeführt.",
+        "result_path": runtime_result.result_path,
+        "specialist_results": [result.to_dict() for result in runtime_result.specialist_results],
+        "employee_response": runtime_result.employee_response.to_audit_row(),
+        "should_send_to_teams": runtime_result.should_send_to_teams,
+        "should_write_tms": runtime_result.should_write_tms,
+        "should_send_customer_message": runtime_result.should_send_customer_message,
+    }
+
+
 def _button_response_text(order_id: str, action: dict[str, Any]) -> str:
     if action.get("type") == "tms_update_applied":
         return f"✅ Freigabe umgesetzt für {order_id}: {action.get('target')} = {action.get('value')} wurde ins TMS geschrieben und frisch verifiziert."
@@ -498,6 +544,15 @@ def _button_response_text(order_id: str, action: dict[str, Any]) -> str:
         return f"⚠️ TMS-Write für {order_id} nicht sauber verifiziert: erwartet {action.get('value')}, gesehen {action.get('verified_value')}. Ich lasse das als Review-Fehler offen."
     if action.get("type") == "tms_update_rejected":
         return f"❌ Abgelehnt für {order_id}: {action.get('target')} = {action.get('value')} wurde nicht ins TMS geschrieben."
+    if action.get("type") == "tms_update_correction_requested":
+        return f"✏️ Korrektur angefordert für {order_id}: {action.get('target')} = {action.get('value')} wurde nicht ins TMS geschrieben. Bitte mit korrigiertem Ziel/Wert antworten."
+    if action.get("type") == "case_check_requested":
+        summary = str(action.get("summary") or "").strip()
+        if summary:
+            if summary.lstrip().startswith("<"):
+                return summary
+            return f"🔎 Fallprüfung für {order_id}\n{summary}"
+        return f"🔎 Read-only Fallprüfung für {order_id} vorgemerkt. Kein TMS-Write, keine Kundenmail; die offene Freigabe bleibt zur Prüfung stehen."
     if action.get("reason") == "writeback_disabled":
         return f"⚠️ Freigabe für {order_id} erkannt, aber Live-TMS-Writeback ist deaktiviert. Ich schreibe nichts ins TMS."
     return f"⚠️ Aktion für {order_id} konnte nicht umgesetzt werden; nichts wurde als erfolgreich markiert."
@@ -522,7 +577,7 @@ def process_teams_tms_card_action(
     root = root or _default_root()
     hermes_action = str(data.get("hermes_action") or "").strip()
     order_id = str(data.get("order_id") or "").strip().upper()
-    if hermes_action not in {"cargolo_asr_tms_approve", "cargolo_asr_tms_reject"}:
+    if hermes_action not in {"cargolo_asr_tms_approve", "cargolo_asr_tms_reject", "cargolo_asr_tms_correct", "cargolo_asr_case_check"}:
         return {"handled": False, "status": "unknown_action", "response_text": "Unknown action."}
     if not order_id or not _ORDER_RE.fullmatch(order_id):
         return {"handled": True, "status": "validation_error", "response_text": "⛔ Ungültige oder fehlende AN/BU in der Teams-Aktion."}
@@ -569,6 +624,81 @@ def process_teams_tms_card_action(
             "files": [str(pending_path), str(teams_dir / "rejected_tms_actions.jsonl")],
         })
         return {"handled": True, "status": "rejected", "order_id": order_id, "derived_action": action, "response_text": _button_response_text(order_id, action)}
+
+    if hermes_action == "cargolo_asr_tms_correct":
+        updated = {
+            **pending_action,
+            "status": "correction_requested",
+            "correction_requested_at": event["timestamp"],
+            "correction_requested_by": user_name,
+            "correction_requested_by_user_id": user_id,
+        }
+        rows[pending_index] = updated
+        _write_jsonl(pending_path, rows)
+        action = {
+            "type": "tms_update_correction_requested",
+            "target": pending_action.get("target"),
+            "value": pending_action.get("value"),
+            "status": "correction_requested",
+        }
+        correction_path = teams_dir / "correction_requested_tms_actions.jsonl"
+        _append_jsonl(correction_path, {**updated, "source": "teams_adaptive_card"})
+        _append_jsonl(root / "orders" / order_id / "audit" / "actions.jsonl", {
+            "timestamp": event["timestamp"],
+            "actor": user_name or "Teams Operator",
+            "action": "teams_tms_update_correction_requested",
+            "result": "correction_requested",
+            "target": action.get("target"),
+            "value": action.get("value"),
+            "order_id": order_id,
+            "files": [str(pending_path), str(correction_path)],
+        })
+        return {"handled": True, "status": "correction_requested", "order_id": order_id, "derived_action": action, "response_text": _button_response_text(order_id, action)}
+
+    if hermes_action == "cargolo_asr_case_check":
+        check_result = _run_read_only_case_check(
+            root=root,
+            order_id=order_id,
+            pending_action=pending_action,
+            actor=user_name or user_id,
+        )
+        action = {
+            "type": "case_check_requested",
+            "target": pending_action.get("target"),
+            "value": pending_action.get("value"),
+            "status": "completed_read_only",
+            "summary": check_result.get("response_text"),
+            "result_path": check_result.get("result_path"),
+        }
+        case_check_path = teams_dir / "case_check_requests.jsonl"
+        request_row = {
+            "timestamp": event["timestamp"],
+            "source": "teams_adaptive_card",
+            "order_id": order_id,
+            "action_id": pending_action.get("action_id") or data.get("action_id"),
+            "context_id": pending_action.get("context_id") or data.get("context_id"),
+            "target": pending_action.get("target"),
+            "value": pending_action.get("value"),
+            "requested_by": user_name,
+            "requested_by_user_id": user_id,
+            "status": "completed_read_only",
+            "pending_status": pending_action.get("status"),
+            "case_check": check_result,
+        }
+        _append_jsonl(case_check_path, request_row)
+        _append_jsonl(root / "orders" / order_id / "audit" / "actions.jsonl", {
+            "timestamp": event["timestamp"],
+            "actor": user_name or "Teams Operator",
+            "action": "teams_case_check_completed",
+            "result": "completed_read_only",
+            "target": action.get("target"),
+            "value": action.get("value"),
+            "order_id": order_id,
+            "files": [str(case_check_path), str(pending_path)] + ([str(check_result.get("result_path"))] if check_result.get("result_path") else []),
+            "should_write_tms": check_result.get("should_write_tms"),
+            "should_send_customer_message": check_result.get("should_send_customer_message"),
+        })
+        return {"handled": True, "status": "case_check_completed", "order_id": order_id, "derived_action": action, "response_text": _button_response_text(order_id, action), "case_check": check_result}
 
     if enable_tms_writeback is None:
         writeback_enabled = str(os.getenv("CARGOLO_ASR_TEAMS_TMS_WRITEBACK") or "").strip().lower() in {"1", "true", "yes", "on"}

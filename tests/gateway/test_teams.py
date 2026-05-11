@@ -782,6 +782,346 @@ class TestTeamsMessageHandling:
         assert (tmp_path / "cargolo_asr" / "orders" / "AN-11755" / "teams" / "replies.jsonl").exists()
 
     @pytest.mark.asyncio
+    async def test_cargolo_employee_dedicated_channel_routes_to_safe_handoff(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {"handled": False, "reason": "no_card_context"}
+
+        handoff_calls = []
+
+        def fake_handle_teams_employee_message(**kwargs):
+            handoff_calls.append(kwargs)
+            return {
+                "handled": True,
+                "response_text": "Lage: AN-11755 | Keine externe Aktion ausgeführt.",
+                "should_write_tms": False,
+                "should_send_customer_message": False,
+            }
+
+        route_calls = []
+
+        def fake_route_teams_ops_message(**kwargs):
+            route_calls.append(kwargs)
+            return {"handled": False, "reason": "no_deterministic_ops_command"}
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", fake_route_teams_ops_message, raising=False)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids=["cargolo-hermes"],
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "employee-ack"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="Was ist mit AN-11755 los?",
+            activity_id="msg-employee-dedicated",
+            conversation_type="channel",
+            channel_data={"channel": {"id": "cargolo-hermes"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert "Lage: AN-11755" in mock_app.send.call_args[0][1]
+        assert route_calls[0]["text"] == "Was ist mit AN-11755 los?"
+        assert handoff_calls[0]["channel_id"] == "cargolo-hermes"
+        assert handoff_calls[0]["text"] == "Was ist mit AN-11755 los?"
+        assert handoff_calls[0]["user_id"] == "aad-456"
+        assert handoff_calls[0]["user_name"] == "Test User"
+
+    @pytest.mark.asyncio
+    async def test_cargolo_employee_dedicated_free_chat_falls_through_to_generic_hermes(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {"handled": False, "reason": "no_card_context"}
+
+        handoff_calls = []
+
+        def fake_handle_teams_employee_message(**kwargs):
+            handoff_calls.append(kwargs)
+            return {
+                "handled": False,
+                "reason": "generic_hermes_chat",
+                "classification": "free_chat",
+                "passthrough_text": kwargs.get("text"),
+                "response_text": None,
+            }
+
+        route_calls = []
+
+        def fake_route_teams_ops_message(**kwargs):
+            route_calls.append(kwargs)
+            return {"handled": False, "reason": "no_deterministic_ops_command"}
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", fake_route_teams_ops_message, raising=False)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids=["cargolo-hermes"],
+        ))
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock()
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="erzähl mal einen witz",
+            activity_id="msg-employee-free-chat",
+            conversation_type="channel",
+            channel_data={"channel": {"id": "cargolo-hermes"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        mock_app.send.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == "erzähl mal einen witz"
+        assert len(handoff_calls) >= 1
+        assert route_calls[0]["text"] == "erzähl mal einen witz"
+
+    @pytest.mark.asyncio
+    async def test_cargolo_employee_dedicated_pending_command_uses_ops_router_before_handoff(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {"handled": False, "reason": "no_card_context"}
+
+        def fake_handle_teams_employee_message(**kwargs):
+            raise AssertionError("deterministic pending command must not fall through to employee free-chat handoff")
+
+        route_calls = []
+
+        def fake_route_teams_ops_message(**kwargs):
+            route_calls.append(kwargs)
+            return {
+                "handled": True,
+                "classification": "pending_tms_reviews",
+                "response_text": "CARGOLO Teams Ops · Offene TMS-Freigaben",
+                "teams_tms_review_cards": [{
+                    "action_id": "abc123",
+                    "order_id": "AN-11755",
+                    "target": "customs_reference",
+                    "value": "26DE99999",
+                    "operator": "Dominik",
+                }],
+            }
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", fake_route_teams_ops_message, raising=False)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids=["cargolo-hermes"],
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "pending-ack"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+        adapter.send_cargolo_asr_tms_review_card = AsyncMock(return_value=MagicMock(success=True))
+
+        activity = self._make_activity(
+            text="offene Freigaben",
+            activity_id="msg-dedicated-pending",
+            conversation_type="channel",
+            channel_data={"channel": {"id": "cargolo-hermes"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert "Offene TMS-Freigaben" in mock_app.send.call_args[0][1]
+        adapter.send_cargolo_asr_tms_review_card.assert_awaited_once()
+        assert route_calls[0]["text"] == "offene Freigaben"
+        assert route_calls[0]["root"].name == "cargolo_asr"
+
+    @pytest.mark.asyncio
+    async def test_cargolo_employee_shared_channel_requires_teams_mention(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {"handled": False, "reason": "no_card_context"}
+
+        handoff_calls = []
+
+        def fake_handle_teams_employee_message(**kwargs):
+            handoff_calls.append(kwargs)
+            return {"handled": True, "response_text": "Lage: AN-11755 | Keine externe Aktion ausgeführt."}
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids=["cargolo-hermes"],
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "employee-mention-ack"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="<at>Hermes CARGOLO</at> Was ist mit AN-11755 los?",
+            activity_id="msg-employee-mention",
+            conversation_type="channel",
+            channel_data={"channel": {"id": "shared-ops"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert handoff_calls[0]["channel_id"] == "shared-ops"
+        assert handoff_calls[0]["text"] == "@Hermes Was ist mit AN-11755 los?"
+
+    @pytest.mark.asyncio
+    async def test_cargolo_employee_dedicated_allowlist_can_use_conversation_id_when_channel_data_differs(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {"handled": False, "reason": "no_card_context"}
+
+        handoff_calls = []
+
+        def fake_handle_teams_employee_message(**kwargs):
+            handoff_calls.append(kwargs)
+            return {"handled": True, "response_text": "Lage: AN-11755 | Keine externe Aktion ausgeführt."}
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids=["19:logged-thread@thread.v2"],
+        ))
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock()
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="Was ist mit AN-11755 los?",
+            activity_id="msg-employee-conv-allowlist",
+            conversation_id="19:logged-thread@thread.v2",
+            conversation_type="channel",
+            channel_data={"channel": {"id": "opaque-real-channel-id"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert handoff_calls[0]["channel_id"] == "19:logged-thread@thread.v2"
+        assert handoff_calls[0]["text"] == "Was ist mit AN-11755 los?"
+
+    @pytest.mark.asyncio
+    async def test_cargolo_employee_dedicated_top_level_an_message_bypasses_card_fallback(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            raise AssertionError("top-level dedicated-channel messages must not enter ASR card reply fallback")
+
+        handoff_calls = []
+
+        def fake_handle_teams_employee_message(**kwargs):
+            handoff_calls.append(kwargs)
+            return {"handled": True, "response_text": "Employee-Handoff ok"}
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids=["19:logged-thread@thread.v2"],
+        ))
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock()
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="<at>CARGOLO Hermes</at> channel-check AN-11755 read-only",
+            activity_id="msg-employee-top-level-an",
+            conversation_id="19:logged-thread@thread.v2",
+            conversation_type="channel",
+            channel_data={"channel": {"id": "opaque-real-channel-id"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert handoff_calls[0]["channel_id"] == "19:logged-thread@thread.v2"
+        assert handoff_calls[0]["text"] == "channel-check AN-11755 read-only"
+
+    @pytest.mark.asyncio
+    async def test_cargolo_dedicated_flattened_card_quote_stays_in_reply_loop(self, monkeypatch):
+        reply_calls = []
+
+        def fake_handle_teams_message(**kwargs):
+            reply_calls.append(kwargs)
+            return {"handled": True, "response_text": "Reply-Loop ok"}
+
+        def fake_handle_teams_employee_message(**kwargs):
+            raise AssertionError("flattened quoted cards must stay in reply loop")
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids=["19:logged-thread@thread.v2"],
+        ))
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock()
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text=(
+                "<at>CARGOLO Hermes</at> Display NameAN-11755 | Dokument-Check | "
+                "TMS-Aktion: Review | MRN 26DE12345\nBitte TMS MRN 26DE99999 eintragen"
+            ),
+            activity_id="msg-flattened-card-quote",
+            conversation_id="19:logged-thread@thread.v2",
+            conversation_type="channel",
+            channel_data={"channel": {"id": "opaque-real-channel-id"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert reply_calls[0]["text"].startswith("Display NameAN-11755")
+
+    @pytest.mark.asyncio
     async def test_cargolo_ops_status_command_is_handled_before_generic_chat(self, monkeypatch):
         def fake_handle_teams_message(**kwargs):
             return {"handled": False, "reason": "no_card_context"}
@@ -949,16 +1289,45 @@ class TestTeamsMessageHandling:
         assert adapter.handle_message.await_count == 1
 
 
+def _install_capture_card_response(monkeypatch):
+    class CaptureCard:
+        def __init__(self):
+            self.version = None
+            self.body = None
+            self.actions = None
+
+        def with_version(self, value):
+            self.version = value
+            return self
+
+        def with_body(self, body):
+            self.body = body
+            return self
+
+        def with_actions(self, actions):
+            self.actions = actions
+            return self
+
+    monkeypatch.setattr(_teams_mod, "AdaptiveCard", CaptureCard)
+    monkeypatch.setattr(_teams_mod, "TextBlock", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(
+        _teams_mod,
+        "AdaptiveCardActionCardResponse",
+        lambda value: SimpleNamespace(kind="card", value=value),
+    )
+    return CaptureCard
+
 
 @pytest.mark.anyio
 async def test_cargolo_asr_approve_button_routes_to_safe_handler(monkeypatch):
     adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
     monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-1")
+    _install_capture_card_response(monkeypatch)
     calls = []
 
     def fake_process(**kwargs):
         calls.append(kwargs)
-        return {"handled": True, "status": "applied", "response_text": "✅ umgesetzt"}
+        return {"handled": True, "status": "applied", "order_id": "AN-11755", "response_text": "✅ umgesetzt"}
 
     monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.process_teams_tms_card_action", fake_process)
 
@@ -981,6 +1350,216 @@ async def test_cargolo_asr_approve_button_routes_to_safe_handler(monkeypatch):
     assert calls[0]["data"]["hermes_action"] == "cargolo_asr_tms_approve"
     assert calls[0]["user_id"] == "aad-1"
     assert calls[0]["user_name"] == "Dominik"
+    assert response.body.kind == "card"
+    assert response.body.value.actions is None
+    assert any("Ins TMS geschrieben" in block.text for block in response.body.value.body)
+    assert any("Buttons deaktiviert" in block.text for block in response.body.value.body)
+
+
+@pytest.mark.anyio
+async def test_cargolo_asr_reject_button_replaces_card_without_actions(monkeypatch):
+    adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
+    monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-1")
+    _install_capture_card_response(monkeypatch)
+    calls = []
+
+    def fake_process(**kwargs):
+        calls.append(kwargs)
+        return {
+            "handled": True,
+            "status": "rejected",
+            "order_id": "AN-11755",
+            "response_text": "❌ Abgelehnt für AN-11755: customs_reference = 26DE99999 wurde nicht ins TMS geschrieben.",
+        }
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.process_teams_tms_card_action", fake_process)
+
+    ctx = MagicMock()
+    ctx.activity.value.action.data = {
+        "hermes_action": "cargolo_asr_tms_reject",
+        "order_id": "AN-11755",
+        "action_id": "abc123",
+        "target": "customs_reference",
+        "value": "26DE99999",
+    }
+    ctx.activity.from_.aad_object_id = "aad-1"
+    ctx.activity.from_.id = "teams-user-id"
+    ctx.activity.from_.name = "Dominik"
+
+    response = await adapter._on_card_action(ctx)
+
+    assert response.status == 200
+    assert calls
+    assert response.body.kind == "card"
+    assert response.body.value.actions is None
+    assert any("Buttons deaktiviert" in block.text for block in response.body.value.body)
+
+
+@pytest.mark.anyio
+async def test_cargolo_asr_case_check_button_keeps_review_card_active(monkeypatch):
+    adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
+    adapter._app = MagicMock()
+    adapter.send = AsyncMock()
+    monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-1")
+    calls = []
+
+    monkeypatch.setattr(
+        _teams_mod,
+        "AdaptiveCardActionMessageResponse",
+        lambda value: SimpleNamespace(kind="message", value=value),
+    )
+    monkeypatch.setattr(
+        _teams_mod,
+        "AdaptiveCardActionCardResponse",
+        lambda value: SimpleNamespace(kind="card", value=value),
+    )
+
+    def fake_process(**kwargs):
+        calls.append(kwargs)
+        return {"handled": True, "status": "case_check_completed", "response_text": "🔎 Fall geprüft"}
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.process_teams_tms_card_action", fake_process)
+
+    ctx = MagicMock()
+    ctx.activity.value.action.data = {
+        "hermes_action": "cargolo_asr_case_check",
+        "order_id": "AN-11755",
+        "action_id": "abc123",
+        "target": "customs_reference",
+        "value": "26DE99999",
+    }
+    ctx.activity.from_.aad_object_id = "aad-1"
+    ctx.activity.from_.id = "teams-user-id"
+    ctx.activity.from_.name = "Dominik"
+    ctx.activity.conversation.id = "chat-1"
+
+    response = await adapter._on_card_action(ctx)
+    for _ in range(20):
+        if calls:
+            break
+        await asyncio.sleep(0.01)
+
+    assert response.status == 200
+    assert response.body.kind == "message"
+    assert "Fallprüfung für AN-11755 läuft" in response.body.value
+
+
+@pytest.mark.anyio
+async def test_cargolo_asr_case_check_button_routes_to_safe_handler(monkeypatch):
+    adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
+    adapter._app = MagicMock()
+    adapter.send = AsyncMock()
+    monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-1")
+    calls = []
+
+    def fake_process(**kwargs):
+        calls.append(kwargs)
+        return {"handled": True, "status": "case_check_requested", "response_text": "🔎 queued"}
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.process_teams_tms_card_action", fake_process)
+
+    ctx = MagicMock()
+    ctx.activity.value.action.data = {
+        "hermes_action": "cargolo_asr_case_check",
+        "order_id": "AN-11755",
+        "action_id": "abc123",
+        "target": "customs_reference",
+        "value": "26DE99999",
+    }
+    ctx.activity.from_.aad_object_id = "aad-1"
+    ctx.activity.from_.id = "teams-user-id"
+    ctx.activity.from_.name = "Dominik"
+    ctx.activity.conversation.id = "chat-1"
+
+    response = await adapter._on_card_action(ctx)
+    for _ in range(20):
+        if adapter.send.await_count >= 2 and calls:
+            break
+        await asyncio.sleep(0.01)
+
+    assert response.status == 200
+    assert adapter.send.await_count == 2
+    first_send = adapter.send.await_args_list[0]
+    assert first_send.args[0] == "chat-1"
+    assert "Fallprüfung für AN-11755 läuft" in first_send.args[1]
+    adapter.send.assert_any_await("chat-1", "🔎 queued")
+    assert calls
+    assert calls[0]["data"]["hermes_action"] == "cargolo_asr_case_check"
+    assert calls[0]["user_id"] == "aad-1"
+    assert calls[0]["user_name"] == "Dominik"
+
+
+@pytest.mark.anyio
+async def test_cargolo_asr_correct_button_routes_to_safe_handler(monkeypatch):
+    adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
+    monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-1")
+    _install_capture_card_response(monkeypatch)
+    calls = []
+
+    def fake_process(**kwargs):
+        calls.append(kwargs)
+        return {"handled": True, "status": "correction_requested", "order_id": "AN-11755", "response_text": "✏️ correction"}
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.process_teams_tms_card_action", fake_process)
+
+    ctx = MagicMock()
+    ctx.activity.value.action.data = {
+        "hermes_action": "cargolo_asr_tms_correct",
+        "order_id": "AN-11755",
+        "action_id": "abc123",
+        "target": "customs_reference",
+        "value": "26DE99999",
+    }
+    ctx.activity.from_.aad_object_id = "aad-1"
+    ctx.activity.from_.id = "teams-user-id"
+    ctx.activity.from_.name = "Dominik"
+
+    response = await adapter._on_card_action(ctx)
+
+    assert response.status == 200
+    assert calls
+    assert calls[0]["data"]["hermes_action"] == "cargolo_asr_tms_correct"
+    assert response.body.kind == "card"
+    assert response.body.value.actions is None
+    assert any("Korrektur angefordert" in block.text for block in response.body.value.body)
+    assert any("Buttons deaktiviert" in block.text for block in response.body.value.body)
+
+
+@pytest.mark.anyio
+async def test_cargolo_asr_approval_blocked_replaces_card_without_actions(monkeypatch):
+    adapter = TeamsAdapter(_make_config(client_id="id", client_secret="x", tenant_id="tenant"))
+    monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-1")
+    _install_capture_card_response(monkeypatch)
+
+    def fake_process(**kwargs):
+        return {
+            "handled": True,
+            "status": "approval_blocked",
+            "order_id": "AN-11755",
+            "response_text": "⚠️ Freigabe erkannt, aber Live-TMS-Writeback ist deaktiviert. Ich schreibe nichts ins TMS.",
+        }
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.process_teams_tms_card_action", fake_process)
+
+    ctx = MagicMock()
+    ctx.activity.value.action.data = {
+        "hermes_action": "cargolo_asr_tms_approve",
+        "order_id": "AN-11755",
+        "action_id": "abc123",
+        "target": "customs_reference",
+        "value": "26DE99999",
+    }
+    ctx.activity.from_.aad_object_id = "aad-1"
+    ctx.activity.from_.id = "teams-user-id"
+    ctx.activity.from_.name = "Dominik"
+
+    response = await adapter._on_card_action(ctx)
+
+    assert response.status == 200
+    assert response.body.kind == "card"
+    assert response.body.value.actions is None
+    assert any("TMS-Write blockiert" in block.text for block in response.body.value.body)
+    assert any("Buttons deaktiviert" in block.text for block in response.body.value.body)
 
 
 @pytest.mark.anyio
