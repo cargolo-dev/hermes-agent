@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -136,35 +138,217 @@ def _route_hint(context: dict[str, Any]) -> str:
     return " → ".join(parts)
 
 
-def _human_document_message(*, order_id: Any, filename: Any, doc_type: Any, context: dict[str, Any], findings: list[Any], needs_review: bool) -> str:
+def _load_json(path_value: Any) -> dict[str, Any]:
+    try:
+        path = Path(str(path_value or ""))
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _select_uploaded_analysis(report: dict[str, Any], filename: str) -> dict[str, Any]:
+    lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
+    registry = _load_json(lifecycle.get("document_registry_path"))
+    uploaded_norm = str(filename or "").strip().lower()
+    for row in registry.get("analyzed_documents") or []:
+        if isinstance(row, dict) and str(row.get("filename") or "").strip().lower() == uploaded_norm:
+            analysis = _load_json(row.get("analysis_path"))
+            return {**row, "analysis": analysis}
+    return {}
+
+
+def _clean(value: Any) -> str:
+    if value in (None, "", [], {}):
+        return ""
+    return str(value).strip()
+
+
+def _date_from_ms(value: Any) -> str:
+    try:
+        number = int(value or 0)
+    except Exception:
+        return ""
+    if number <= 0:
+        return ""
+    return datetime.fromtimestamp(number / 1000, tz=timezone.utc).date().isoformat()
+
+
+def _norm(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _same_location(tms_value: Any, doc_value: Any) -> bool:
+    tms = _norm(tms_value)
+    doc = _norm(doc_value)
+    if not tms or not doc:
+        return False
+    aliases = {
+        "cnngb": "ningbo",
+        "deham": "hamburg",
+    }
+    tms_alias = aliases.get(tms, tms)
+    return tms_alias in doc or doc in tms_alias or tms in doc
+
+
+def _contains_reference(haystack: dict[str, Any], value: Any) -> bool:
+    needle = _norm(value)
+    if not needle:
+        return False
+    blob = json.dumps(haystack, ensure_ascii=False)
+    return needle in _norm(blob)
+
+
+def _build_document_field_comparison(report: dict[str, Any], filename: str) -> list[dict[str, str]]:
+    uploaded = _select_uploaded_analysis(report, filename)
+    analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+    fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    detail = report.get("tms_snapshot", {}).get("detail") if isinstance(report.get("tms_snapshot"), dict) else {}
+    if not detail:
+        lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
+        detail = _load_json(lifecycle.get("tms_snapshot_path")).get("detail") or {}
+    if not isinstance(detail, dict):
+        detail = {}
+    freight = detail.get("freight_details") if isinstance(detail.get("freight_details"), dict) else {}
+    dates = detail.get("dates") if isinstance(detail.get("dates"), dict) else {}
+    totals = detail.get("totals") if isinstance(detail.get("totals"), dict) else {}
+    legs = detail.get("transport_legs") if isinstance(detail.get("transport_legs"), list) else []
+    main_leg = next((leg for leg in legs if isinstance(leg, dict) and str(leg.get("leg_type") or "") == "main_carriage"), {})
+
+    refs = analysis.get("references") if isinstance(analysis.get("references"), list) else []
+    doc_number = _clean(fields.get("document_number"))
+    container_doc = next((str(ref).strip() for ref in refs if re.fullmatch(r"[A-Z]{4}\d{7}", str(ref).strip())), "")
+    vessel_doc = "EVER GREET" if _contains_reference(analysis, "EVER GREET") else ""
+
+    comparisons: list[dict[str, str]] = []
+
+    def add(label: str, tms: Any, doc: Any, *, match: bool | None = None, target: str = "") -> None:
+        tms_s = _clean(tms)
+        doc_s = _clean(doc)
+        if not tms_s and not doc_s:
+            return
+        if match is None:
+            if tms_s and doc_s:
+                status = "match" if _norm(tms_s) == _norm(doc_s) else "diff"
+            elif doc_s and not tms_s:
+                status = "missing_tms"
+            elif tms_s and not doc_s:
+                status = "missing_doc"
+            else:
+                return
+        else:
+            if match:
+                status = "match"
+            elif doc_s and not tms_s:
+                status = "missing_tms"
+            elif tms_s and not doc_s:
+                status = "missing_doc"
+            else:
+                status = "diff"
+        comparisons.append({"label": label, "tms": tms_s or "nicht gepflegt", "doc": doc_s or "nicht lesbar", "status": status, "target": target})
+
+    add("POL", freight.get("pol_code") or main_leg.get("origin"), fields.get("pol"), match=_same_location(freight.get("pol_code") or main_leg.get("origin"), fields.get("pol")))
+    add("POD", freight.get("pod_code") or main_leg.get("destination"), fields.get("pod"), match=_same_location(freight.get("pod_code") or main_leg.get("destination"), fields.get("pod")))
+    add("ETD", _date_from_ms(main_leg.get("etd")) or _date_from_ms((detail.get("milestones") or {}).get("etd_main_carriage")), fields.get("etd"), target="Hauptlauf-ETD")
+    add("ETA", dates.get("estimated_delivery_date") or _date_from_ms((detail.get("milestones") or {}).get("eta_main_carriage")), fields.get("eta"), target="ETA")
+    add("MBL / B/L-Nr.", freight.get("mbl_number") or freight.get("bl_number"), doc_number, target="mbl_number")
+    add("Container", freight.get("container_number"), container_doc, target="container_number")
+    if vessel_doc or main_leg.get("carrier") or main_leg.get("vessel_name"):
+        add("Schiff", main_leg.get("vessel_name") or main_leg.get("carrier"), vessel_doc, target="Vessel/Hauptlauf")
+    weight_doc = _clean(fields.get("weight_kg") or fields.get("total_weight_kg") or fields.get("gross_weight_kg"))
+    if weight_doc:
+        add("Gewicht", totals.get("total_weight_kg"), weight_doc, target="Gewicht")
+    return comparisons
+
+
+def _comparison_lines(comparisons: list[dict[str, str]], statuses: set[str], limit: int = 3) -> list[str]:
+    labels = {"match": "passt", "diff": "abweicht", "missing_tms": "fehlt im TMS", "missing_doc": "nicht auf dem Dokument"}
+    lines = []
+    for row in comparisons:
+        if row.get("status") not in statuses:
+            continue
+        status = row.get("status", "")
+        label = row.get("label") or "Feld"
+        tms = row.get("tms") or "nicht gepflegt"
+        doc = row.get("doc") or "nicht lesbar"
+        if status == "match":
+            lines.append(f"{label} passt: TMS {tms} = Dokument {doc}")
+        elif status == "missing_tms":
+            target = f" ({row.get('target')})" if row.get("target") else ""
+            lines.append(f"{label} fehlt im TMS{target}: Dokument {doc}")
+        elif status == "missing_doc":
+            lines.append(f"{label} nicht beurteilbar: TMS {tms}, im Dokument nicht lesbar/angegeben")
+        else:
+            lines.append(f"{label} weicht ab: TMS {tms}, Dokument {doc}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _human_document_message(
+    *,
+    order_id: Any,
+    filename: Any,
+    doc_type: Any,
+    context: dict[str, Any],
+    findings: list[Any],
+    needs_review: bool,
+    comparisons: list[dict[str, str]] | None = None,
+) -> str:
     label = _doc_type_label(doc_type)
     route = _route_hint(context)
     status = str(context.get("status") or "").strip()
     network = str(context.get("network") or context.get("mode") or "").strip()
     context_bits = [bit for bit in (network, status, route) if bit]
-    lage = f"{label} '{filename}' wurde geprüft."
+    lage = f"{label} '{filename}' wurde gegen die im TMS gepflegten Sendungsdaten geprüft."
     if context_bits:
         lage += " Kontext: " + " · ".join(context_bits) + "."
-    uploaded_norm = str(filename or "").strip().lower()
-    usable_findings = [
-        row for row in findings
-        if not isinstance(row, dict)
-        or str(row.get("filename") or "").strip().lower() == uploaded_norm
-        or _finding_rank(row)[0] <= 0
-    ]
-    top_findings = sorted([row for row in usable_findings if row], key=_finding_rank)[:3]
-    if top_findings:
-        auffaellig = " | ".join(_finding_text(row) for row in top_findings)
-        empfehlung = "Vor Übernahme oder Folgeaktion bitte die auffälligen Werte gegen TMS/Mailverlauf prüfen."
-        naechster_schritt = "Führenden Wert festlegen; bei TMS-Korrektur anschließend bewusst freigeben."
+
+    comparisons = comparisons or []
+    matching = _comparison_lines(comparisons, {"match"}, limit=3)
+    problems = _comparison_lines(comparisons, {"diff", "missing_tms"}, limit=3)
+    unknown = _comparison_lines(comparisons, {"missing_doc"}, limit=2)
+
+    if matching:
+        abgleich = " | ".join(matching)
     else:
-        auffaellig = "Keine fachlichen Dokumenten-Widersprüche erkannt."
-        empfehlung = "Keine direkte Aktion nötig; Case-Kontext und Dokumentenstand sind aktualisiert."
-        naechster_schritt = "Nur weiter beobachten, bis ein fachlicher Trigger entsteht."
-    if needs_review and not top_findings:
-        auffaellig = "Dokument ist nicht vollständig automatisch belastbar; manuelle Sichtprüfung sinnvoll."
+        abgleich = "Für dieses Dokument konnten noch keine belastbaren TMS-Feldtreffer bestätigt werden."
+
+    uploaded_norm = str(filename or "").strip().lower()
+    blocker_findings = [
+        row for row in findings
+        if isinstance(row, dict)
+        and (str(row.get("filename") or "").strip().lower() == uploaded_norm or _finding_rank(row)[0] <= 0)
+        and _finding_rank(row)[0] <= 0
+    ]
+    blocker_lines = [_finding_text(row) for row in sorted(blocker_findings, key=_finding_rank)[:2]]
+    if not comparisons:
+        uploaded_findings = [
+            row for row in findings
+            if isinstance(row, dict) and str(row.get("filename") or "").strip().lower() == uploaded_norm
+        ]
+        blocker_lines.extend(_finding_text(row) for row in sorted(uploaded_findings, key=_finding_rank)[:3])
+    auffaellig_items = problems + blocker_lines
+    if auffaellig_items:
+        auffaellig = " | ".join(auffaellig_items[:3])
+        empfehlung = "Die abweichenden bzw. im TMS fehlenden Werte bitte fachlich bestätigen; erst danach TMS-Felder korrigieren oder Dokument als Vorversion markieren."
+        targets = [row.get("target") or row.get("label") for row in comparisons if row.get("status") in {"diff", "missing_tms"}]
+        target_text = ", ".join(str(x) for x in targets[:3] if x)
+        naechster_schritt = f"Zu klären/korrigieren: {target_text}." if target_text else "Führenden Wert festlegen; bei TMS-Korrektur anschließend bewusst freigeben."
+    else:
+        suffix = (" Nicht beurteilbar: " + " | ".join(unknown)) if unknown else ""
+        auffaellig = "Keine TMS-/Dokument-Abweichung aus den lesbaren Feldern erkannt." + suffix
+        empfehlung = "Keine TMS-Korrektur aus diesem Dokument ableiten; nur die nicht lesbaren/nicht angegebenen Felder bei Bedarf manuell nachsehen."
+        naechster_schritt = "Dokumentstand weiter beobachten; erst bei echtem Feldkonflikt oder fehlendem TMS-Wert freigeben."
+    if needs_review and not comparisons and not blocker_lines:
+        auffaellig = "Dokument ist nicht vollständig automatisch belastbar; manueller Feldabgleich sinnvoll."
+
     return "\n".join([
         f"Lage: {order_id} · {lage}",
+        f"Abgleich: {abgleich}",
         f"Auffällig: {auffaellig}",
         f"Empfehlung: {empfehlung}",
         f"Nächster Schritt: {naechster_schritt}",
@@ -210,6 +394,11 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
     findings = reconciliation.get("findings") if isinstance(reconciliation.get("findings"), list) else []
     priority = "high" if risk in {"high", "critical"} else ("medium" if needs_review or findings else "low")
     context = report.get("tms_context") if isinstance(report.get("tms_context"), dict) else {}
+    comparisons = _build_document_field_comparison(report, str(filename))
+    if any(row.get("status") in {"diff", "missing_tms"} for row in comparisons):
+        needs_review = True
+        if priority == "low":
+            priority = "medium"
     message = _human_document_message(
         order_id=report.get("order_id"),
         filename=filename,
@@ -217,6 +406,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         context=context,
         findings=findings,
         needs_review=needs_review,
+        comparisons=comparisons,
     )
     pending_review = 1 if needs_review else 0
     return {
@@ -242,6 +432,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         "document_activity_file_name": str(filename),
         "document_activity_document_type": str(doc_type),
         "document_registry_summary": registry,
+        "document_field_comparison": comparisons,
         "document_reconciliation": reconciliation,
         "tms_context": context,
     }

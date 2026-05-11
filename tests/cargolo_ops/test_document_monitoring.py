@@ -167,6 +167,81 @@ def test_processor_result_prioritizes_uploaded_document_and_labels_master_bl():
     assert "3100 kg" not in message
 
 
+def test_processor_result_compares_uploaded_bl_fields_against_tms(tmp_path):
+    analysis_path = tmp_path / "analysis.json"
+    registry_path = tmp_path / "registry.json"
+    snapshot_path = tmp_path / "tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": "NGP3497068.pdf",
+                "doc_type": "bill_of_lading",
+                "summary": "Draft B/L EVER GREET",
+                "references": ["NGP3497068", "XHCU2996441"],
+                "extracted_fields": {
+                    "document_number": "NGP3497068",
+                    "pol": "Ningbo, China",
+                    "pod": "Hamburg, Germany",
+                    "etd": "2026-05-06",
+                    "eta": None,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "analyzed_documents": [
+                    {"filename": "NGP3497068.pdf", "analysis_path": str(analysis_path), "analysis_doc_type": "bill_of_lading"}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "dates": {"estimated_delivery_date": "2026-06-22"},
+                    "freight_details": {"pol_code": "CNNGB", "pod_code": "DEHAM", "mbl_number": "", "container_number": ""},
+                    "transport_legs": [
+                        {"leg_type": "main_carriage", "etd": 1777852800000, "carrier": "Ever Greet"}
+                    ],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-11790",
+            "tms_context": {"status": "customs_pending", "network": "sea", "origin_city": "Jinhua", "origin_country": "CN", "destination_city": "Kißlegg", "destination_country": "DE"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+        },
+        {"id": 1263, "metadata": {"file_name": "NGP3497068.pdf", "document_type": "master_bl"}},
+    )
+
+    message = result["message"]
+    assert "Abgleich:" in message
+    assert "POL passt" in message
+    assert "POD passt" in message
+    assert "Schiff passt" in message
+    assert "ETD weicht ab" in message
+    assert "MBL / B/L-Nr. fehlt im TMS" in message
+    assert "Container fehlt im TMS" in message
+    assert "ETA nicht explizit" not in message
+    assert "Entwurf (Draft)" not in message
+    assert result["pending_action_summary"]["review"] == 1
+
+
+
 def test_document_monitoring_uses_lifecycle_and_writes_single_report_location(tmp_path):
     lifecycle = {
         "status": "ok",

@@ -398,7 +398,7 @@ def _document_line_from_analysis(row: dict[str, Any]) -> str:
 
 
 def _section_from_hermes_message(message: str, label: str) -> str:
-    pattern = rf"(?:^|\n){re.escape(label)}:\s*(.*?)(?=\n(?:Lage|Auffällig|Empfehlung|Nächster Schritt):|\Z)"
+    pattern = rf"(?:^|\n){re.escape(label)}:\s*(.*?)(?=\n(?:Lage|Abgleich|Auffällig|Empfehlung|Nächster Schritt):|\Z)"
     match = re.search(pattern, message or "", flags=re.DOTALL)
     if not match:
         return ""
@@ -454,6 +454,7 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
 
     lage = _section_from_hermes_message(hermes_message, "Lage") or hermes_message
     auffaellig = _section_from_hermes_message(hermes_message, "Auffällig")
+    abgleich = _section_from_hermes_message(hermes_message, "Abgleich")
     empfehlung = _section_from_hermes_message(hermes_message, "Empfehlung")
     naechster = _section_from_hermes_message(hermes_message, "Nächster Schritt")
 
@@ -475,8 +476,13 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
         f"<div style='font-size:18px;font-weight:800;margin-bottom:4px;color:#ffffff;'>Hermes · Dokument geprüft</div>",
         f"<div style='font-size:13px;margin-bottom:10px;color:#cbd5e1;'>{_html_escape(order_id)} · <b>{_html_escape(uploaded)}</b> · {_html_escape(doc_type)}</div>",
         _html_hermes_section("Lage", _html_escape(_truncate_sentence(lage, 260)), tone="neutral"),
-        _html_hermes_section("Auffällig", _html_bullets(issue_items), tone=tone),
     ]
+    if abgleich:
+        abgleich_items = [item.strip() for item in re.split(r"\s+\|\s+", abgleich) if item.strip()]
+        html_parts.append(_html_hermes_section("Abgleich TMS ↔ Dokument", _html_bullets(abgleich_items), tone="good"))
+    html_parts.append(
+        _html_hermes_section("Auffällig / TMS-Aktion", _html_bullets(issue_items), tone=tone)
+    )
     if empfehlung:
         html_parts.append(_html_hermes_section("Empfehlung", _html_escape(_truncate_sentence(empfehlung, 230)), tone="neutral"))
     if naechster:
