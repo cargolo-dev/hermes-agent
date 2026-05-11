@@ -74,6 +74,32 @@ def test_customer_draft_runtime_returns_draft_only_without_customer_send(tmp_pat
     assert "Entwurf" in result.draft_response
 
 
+def test_business_draft_uses_read_only_case_context_without_sending(tmp_path: Path) -> None:
+    root = tmp_path / "cargolo_asr"
+    case_dir = root / "orders" / "AN-11755"
+    (case_dir / "mail").mkdir(parents=True)
+    (case_dir / "docs").mkdir(parents=True)
+    (case_dir / "case_summary.json").write_text(json.dumps({"shipment_number": "AN-11755", "mode": "Sea"}), encoding="utf-8")
+    (case_dir / "mail" / "history.json").write_text(json.dumps({"messages": [{"from": "kunde@example.com", "subject": "Bitte Status"}]}), encoding="utf-8")
+    (case_dir / "tms_snapshot.json").write_text(json.dumps({"shipment_number": "AN-11755", "status": "docs pending", "pickup_date": "2026-05-12"}), encoding="utf-8")
+    (case_dir / "docs" / "analysis.json").write_text(json.dumps({"documents": [], "missing": ["commercial_invoice"]}), encoding="utf-8")
+
+    result = run_employee_runtime(
+        EmployeeRequest(text="Schreib dem Kunden ein kurzes Update zu AN-11755 mit Mails, TMS und Docs", channel="teams"),
+        root=root,
+    )
+
+    assert result.employee_response.mode == ResponseMode.DRAFT_ONLY
+    assert [row.agent for row in result.specialist_results] == ["case_context", "document_analyst", "mail_history", "tms_snapshot"]
+    assert "Entwurf für Kunde" in (result.draft_response or "")
+    assert "Nicht gesendet" in (result.draft_response or "")
+    assert "docs pending" in (result.draft_response or "")
+    assert "commercial_invoice" in (result.draft_response or "")
+    assert result.should_send_customer_message is False
+    assert result.should_write_tms is False
+    assert not (case_dir / "employee" / "specialist_results.jsonl").exists()
+
+
 def test_teams_send_runtime_is_guarded_and_does_not_send(tmp_path: Path) -> None:
     result = run_employee_runtime(
         EmployeeRequest(text="Poste das Update zu AN-11755 in Teams: Dokumente sind in Prüfung", channel="telegram"),

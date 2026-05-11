@@ -754,13 +754,86 @@ def _format_case_lage(response: EmployeeResponse, results: list[SpecialistResult
     return "".join(line.strip() for line in body.splitlines() if line.strip())
 
 
+def _format_business_draft(response: EmployeeResponse, results: list[SpecialistResult], request: EmployeeRequest) -> str:
+    order_id = response.order_id or "unbekannte Sendung"
+    text_lower = (request.text or "").lower()
+    recipient = "Dienstleister/Partner" if any(token in text_lower for token in ("dienstleister", "partner", "carrier", "reederei", "spedition")) else "Kunde"
+
+    tms_status = None
+    pickup = None
+    docs_missing: Any = []
+    latest_subject = None
+    latest_from = None
+
+    tms = _first_result(results, "tms_snapshot")
+    if tms and tms.findings:
+        snapshot = tms.findings[0].get("snapshot")
+        if isinstance(snapshot, dict):
+            detail = snapshot.get("detail") if isinstance(snapshot.get("detail"), dict) else {}
+            dates = detail.get("dates") if isinstance(detail.get("dates"), dict) else {}
+            tms_status = snapshot.get("status") or detail.get("status") or detail.get("shipment_status")
+            pickup = snapshot.get("pickup_date") or detail.get("pickup_date") or dates.get("pickup_date")
+
+    mail = _first_result(results, "mail_history")
+    if mail and mail.findings:
+        latest_subject = mail.findings[0].get("latest_subject")
+        latest_from = mail.findings[0].get("latest_from")
+
+    docs = _first_result(results, "document_analyst")
+    if docs and docs.findings:
+        docs_missing = docs.findings[0].get("missing")
+
+    facts: list[str] = []
+    if tms_status:
+        facts.append(f"aktueller TMS-Status: {tms_status}")
+    if pickup:
+        facts.append(f"Pickup: {pickup}")
+    missing_text = _fmt_short_list(docs_missing, limit=3, empty="keine konkrete Dokumentenlücke aus lokaler Analyse")
+    if latest_subject:
+        mail_part = f"letzte Mail: {latest_subject}"
+        if latest_from:
+            mail_part += f" von {latest_from}"
+        facts.append(mail_part)
+
+    fact_sentence = "; ".join(facts) if facts else "lokal liegen noch nicht genug belastbare Fakten für Details vor"
+    subject = f"Status zu {order_id}"
+    greeting = "Guten Tag," if recipient == "Kunde" else "Hallo zusammen,"
+    draft_lines = [
+        greeting,
+        "",
+        f"zu {order_id} ein kurzes Update: {fact_sentence}.",
+        f"Dokumentenstand aus unserer lokalen Prüfung: {missing_text}.",
+        "",
+        "Wir prüfen die offenen Punkte intern weiter und melden uns, sobald der nächste belastbare Schritt feststeht.",
+        "",
+        "Viele Grüße",
+        "CARGOLO ASR",
+    ]
+    draft_body = "<br>".join(html.escape(line) for line in draft_lines)
+    source_note = ""
+    missing_sources = [result.agent for result in results if result.status == SpecialistStatus.NEEDS_REVIEW and any(risk.get("type") == "missing_local_source" for risk in result.risks)]
+    if missing_sources:
+        source_note = "<p><small>Hinweis: Lokal fehlend/nicht verfügbar: " + html.escape(", ".join(missing_sources)) + ". Entwurf daher vor Versand fachlich prüfen.</small></p>"
+
+    return (
+        "<div>"
+        f"<h2>✍️ Entwurf für {html.escape(recipient)} · {html.escape(order_id)}</h2>"
+        "<p><strong>Nicht gesendet.</strong> Kein Kunden-/Partnerkontakt wurde ausgelöst.</p>"
+        f"<p><strong>Betreff:</strong> {html.escape(subject)}</p>"
+        f"<p>{draft_body}</p>"
+        f"{source_note}"
+        "<p><small>Draft-only ausgeführt: keine Mail gesendet, kein TMS-Write.</small></p>"
+        "</div>"
+    )
+
+
 def _draft_for(response: EmployeeResponse, results: list[SpecialistResult], memory: HonchoMemorySnapshot, request: EmployeeRequest) -> str:
     # Honcho is currently kept outside the critical path. Only mention it when a caller explicitly supplied usable context.
     memory_note = " Honcho-Kontext berücksichtigt." if memory.available else ""
     if response.mode == ResponseMode.FREE_CHAT:
         return "Normale Hermes-Antwort möglich; keine CARGOLO-Side-Effects vorbereitet." + memory_note
     if response.mode == ResponseMode.DRAFT_ONLY:
-        return "Entwurf möglich — nicht gesendet. Bitte Inhalt final prüfen." + memory_note
+        return _format_business_draft(response, results, request) + memory_note
     if response.mode == ResponseMode.GUARDED_ACTION_REQUIRED:
         if response.boundary_action == BoundaryAction.TEAMS_SEND:
             return "Teams Guard erforderlich; keine Teams-Nachricht gesendet. Draft/Review bleibt möglich." + memory_note
@@ -832,15 +905,17 @@ def run_employee_runtime(
     results: list[SpecialistResult] = []
     result_path: Path | None = None
 
-    if response.mode == ResponseMode.CASE_ASSIST:
+    if response.mode in (ResponseMode.CASE_ASSIST, ResponseMode.DRAFT_ONLY):
         for task in response.specialist_plan.tasks:
             if task.get("mode") != "read_only":
                 continue
             results.append(_execute_stub_specialist(task, root=case_root))
-        if response.order_id and results:
-            result_path = case_root / "orders" / response.order_id / "employee" / "specialist_results.jsonl"
-            for result in results:
-                _append_jsonl(result_path, result.to_dict())
+
+    if response.mode == ResponseMode.CASE_ASSIST:
+        result_path = case_root / "orders" / str(response.order_id) / "employee" / "specialist_results.jsonl"
+        for row in results:
+            _append_jsonl(result_path, row.to_dict())
+
 
     draft_response = _draft_for(response, results, memory, request)
     _sync_review_marker(case_root, response, results, draft_response)

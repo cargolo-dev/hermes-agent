@@ -160,7 +160,7 @@ def _is_tms_write_request(text: str) -> bool:
 
 def _is_customer_draft_request(text: str) -> bool:
     draft_semantics = _has_any(text, ("schreib", "formulier", "entwurf", "draft", "vorschlag"))
-    customer_context = _has_any(text, ("kunde", "kunden", "customer"))
+    customer_context = _has_any(text, ("kunde", "kunden", "customer", "dienstleister", "partner", "carrier", "reederei", "spedition"))
     return draft_semantics and customer_context
 
 
@@ -255,12 +255,17 @@ def handle_employee_request(request: EmployeeRequest) -> EmployeeResponse:
         )
 
     if _is_customer_draft_request(text):
+        draft_needs = _context_needs_for(text, order_id)
+        if order_id and (not draft_needs or draft_needs == [ContextNeed.CASE_FOLDER]):
+            draft_needs = [ContextNeed.CASE_FOLDER, ContextNeed.MAIL_HISTORY, ContextNeed.TMS_SNAPSHOT]
         return EmployeeResponse(
             mode=ResponseMode.DRAFT_ONLY,
             order_id=order_id,
             boundary_action=BoundaryAction.CUSTOMER_MESSAGE_DRAFT,
-            draft_instruction="Draft a customer-facing message, but do not send it.",
-            safety_notes=["Nur Entwurf: nicht senden, keine Kundenmail auslösen."],
+            draft_instruction="Draft a business-facing message, but do not send it.",
+            context_needs=draft_needs,
+            specialist_plan=_specialist_plan_for(request, order_id, draft_needs),
+            safety_notes=["Nur Entwurf: nicht senden, keine Kundenmail/Partnernachricht auslösen."],
         )
 
     if _is_document_upload_request(text):

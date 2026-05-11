@@ -73,6 +73,19 @@ def test_explicit_customer_draft_request_stays_draft_only() -> None:
     assert response.should_send_customer_message is False
 
 
+def test_partner_draft_request_is_draft_only_not_sent() -> None:
+    request = EmployeeRequest(text="Formulier dem Dienstleister ein Update zu AN-11755", channel="teams")
+
+    response = handle_employee_request(request)
+
+    assert response.mode == ResponseMode.DRAFT_ONLY
+    assert response.boundary_action is BoundaryAction.CUSTOMER_MESSAGE_DRAFT
+    assert response.order_id == "AN-11755"
+    assert response.should_send_customer_message is False
+    assert response.context_needs == [ContextNeed.CASE_FOLDER, ContextNeed.MAIL_HISTORY, ContextNeed.TMS_SNAPSHOT]
+    assert [task["agent"] for task in response.specialist_plan.tasks] == ["case_context", "mail_history", "tms_snapshot"]
+
+
 def test_case_question_builds_dynamic_context_plan_without_being_stiff() -> None:
     request = EmployeeRequest(text="Was ist mit AN-11755 los? Schau bitte kurz in Mails und TMS.", channel="telegram")
 
