@@ -230,6 +230,8 @@ def run_document_activity_monitor(
                     "order_id": order_id,
                     "report_json_path": report.get("report_json_path"),
                     "report_md_path": report.get("report_md_path"),
+                    "processor_result": processor_result,
+                    "document_reconciliation": processor_result.get("document_reconciliation") if isinstance(processor_result, dict) else {},
                     "notification": notification_result,
                 }
             )

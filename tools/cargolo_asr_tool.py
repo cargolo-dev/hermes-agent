@@ -52,6 +52,46 @@ def _parse_payload(args: dict[str, Any]) -> dict[str, Any]:
     raise ValueError("Provide either 'payload' or 'payload_json'")
 
 
+def _live_shipment_exists_for_tool(order_id: str) -> bool | None:
+    """TMS-first guard for direct agent tools.
+
+    Returns False only when the live TMS shipment list authoritatively says the
+    AN/BU does not exist. None keeps degraded/offline setups working.
+    """
+    provider = build_tms_provider_from_env()
+    if provider is None or not hasattr(provider, "shipments_list"):
+        return None
+    normalized = str(order_id or "").strip().upper()
+    if not normalized:
+        return None
+    try:
+        rows = provider.shipments_list(
+            transport_category="asr",
+            shipment_number=normalized,
+            limit=20,
+        )
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        if str(row.get("shipment_number") or "").strip().upper() == normalized:
+            return True
+    return False
+
+
+def _shipment_not_found_payload(order_id: str, *, source: str) -> str:
+    return json.dumps({
+        "status": "skipped",
+        "code": "shipment_not_found_in_tms",
+        "an": order_id,
+        "source": source,
+        "message": f"{order_id} ist im ASR-TMS nicht zu finden. Keine n8n-/Mail-Historie-Suche ausgeführt.",
+    }, ensure_ascii=False)
+
+
 PROCESS_EVENT_SCHEMA = {
     "name": "cargolo_asr_process_event",
     "description": (
@@ -98,7 +138,10 @@ PROCESS_EVENT_SCHEMA = {
 
 MAIL_HISTORY_SCHEMA = {
     "name": "cargolo_asr_mail_history",
-    "description": "Call the configured n8n ASR mail-history endpoint by AN and return the normalized response.",
+    "description": (
+        "Call the configured n8n ASR mail-history endpoint by AN and return the normalized response. "
+        "TMS-first guard: if the AN/BU is not present in the ASR TMS shipment list, this returns shipment_not_found_in_tms and does not call n8n."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -368,12 +411,17 @@ def cargolo_asr_process_event_tool(args: dict[str, Any], **_: Any) -> str:
 
 
 def cargolo_asr_mail_history_tool(args: dict[str, Any], **_: Any) -> str:
+    an = str(args.get("an") or "").strip().upper()
+    if not an:
+        return tool_error("Missing required parameter 'an'")
+    if _live_shipment_exists_for_tool(an) is False:
+        return _shipment_not_found_payload(an, source="cargolo_asr_mail_history")
     client = build_mail_history_client_from_env()
     if client is None:
         return tool_error("HERMES_CARGOLO_ASR_MAIL_HISTORY_URL is not configured")
     try:
         result = client.fetch_history(
-            args["an"],
+            an,
             first_sync=bool(args.get("first_sync", False)),
             since=args.get("since"),
             mailbox=args.get("mailbox") or "asr@cargolo.com",

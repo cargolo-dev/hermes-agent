@@ -15,6 +15,11 @@ from typing import Any
 from .models import utc_now_iso
 
 try:
+    from .tms_provider import build_tms_provider_from_env
+except Exception:  # pragma: no cover - optional live integration fallback
+    build_tms_provider_from_env = None  # type: ignore[assignment]
+
+try:
     from hermes_constants import get_hermes_home
 except Exception:  # pragma: no cover - test/import fallback
     def get_hermes_home() -> Path:  # type: ignore[no-redef]
@@ -330,12 +335,60 @@ def _pending_response(root: Path) -> str:
     return "\n".join(lines)
 
 
+def _live_shipment_exists(order_id: str) -> bool | None:
+    """Return True/False only when the live TMS lookup is authoritative.
+
+    CARGOLO Teams requests are TMS-first: AN/BU numbers that are not present in
+    the ASR TMS must not fall through to the generic agent, because the generic
+    agent may otherwise try repeated n8n mail-history searches for a non-case.
+    None means the live provider itself is unavailable/uncertain, so the router
+    keeps the existing degraded behaviour instead of blocking a real case.
+    """
+    if build_tms_provider_from_env is None:
+        return None
+    provider = build_tms_provider_from_env()
+    if provider is None or not hasattr(provider, "shipments_list"):
+        return None
+    normalized = str(order_id or "").strip().upper()
+    if not normalized:
+        return None
+    try:
+        rows = provider.shipments_list(
+            transport_category="asr",
+            shipment_number=normalized,
+            limit=20,
+        )
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        if str(row.get("shipment_number") or "").strip().upper() == normalized:
+            return True
+    return False
+
+
+def _unknown_shipment_response(order_id: str) -> dict[str, Any]:
+    return {
+        "handled": True,
+        "classification": "shipment_not_found_in_tms",
+        "order_id": order_id,
+        "response_text": (
+            f"{order_id} ist im ASR-TMS nicht zu finden. Ich starte deshalb keine Mail-/n8n-Suche und lege keinen Case an. "
+            "Bitte AN/BU prüfen oder zuerst im TMS anlegen/finden."
+        ),
+    }
+
+
 def _coordinator_prompt(text: str, *, order_id: str | None = None, intent: str = "general_ops") -> str:
     order_line = f"Case: {order_id}. " if order_id else "Case: nicht eindeutig. "
     return (
         "Rolle: Du bist Hermes CARGOLO als ASR Ops Coordinator in Microsoft Teams — ein interner, proaktiver Mitarbeiter.\n"
         f"{order_line}Intent: {intent}.\n"
-        "Arbeitsweise: Ziehe bei Bedarf CARGOLO Skills, Case-Folder, TMS/MCP-Kontext, Mail-Historie, Dokumentregistry, Cron-/Plugin-Status heran. "
+        "Arbeitsweise: TMS-first. Jede AN/BU muss zuerst live im ASR-TMS existieren; wenn nicht, sofort sagen `nicht im TMS zu finden` und keine n8n-/Mail-Historie suchen. "
+        "Erst nach positivem TMS-Fund bei Bedarf CARGOLO Skills, Case-Folder, TMS/MCP-Kontext, Mail-Historie, Dokumentregistry, Cron-/Plugin-Status heranziehen. "
         "Bleibe read-only, außer ein freigegebener zweistufiger Write-Pfad ist eindeutig aktiv.\n"
         "Sicherheit: Freitext in Teams darf keine direkten TMS-, Angebots- oder Kundenmail-Writes auslösen. "
         "TMS-Änderungswünsche nur über `cargolo_asr_record_teams_tms_intent` als pending_review vormerken; bei Unklarheit genau eine Rückfrage stellen.\n"
@@ -368,6 +421,11 @@ def route_teams_ops_message(
     lowered = raw.lower()
     order_match = _ORDER_RE.search(raw)
     order_id = order_match.group(0).upper() if order_match else None
+
+    if order_id:
+        live_exists = _live_shipment_exists(order_id)
+        if live_exists is False:
+            return _unknown_shipment_response(order_id)
 
     correction_followup = _route_correction_followup(
         raw=raw,

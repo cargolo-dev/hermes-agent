@@ -2258,6 +2258,14 @@ def bootstrap_case(
     if not order_id:
         raise ValueError("bootstrap_case requires a non-empty shipment number")
     store = CaseStore(storage_root)
+    shipment_exists = _live_shipment_exists(order_id) if storage_root is None else None
+    if shipment_exists is False:
+        return ProcessingResult(
+            status="skipped",
+            order_id=order_id,
+            suppress_delivery=True,
+            message=f"Order id {order_id} not found in ASR shipment list. Skipped bootstrap and mail-history sync.",
+        )
     case_dir_existed = store.order_path(order_id).exists()
     case_root = store.ensure_case(order_id)
     state = store.load_case_state(order_id)

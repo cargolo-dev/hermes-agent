@@ -6,6 +6,7 @@ from plugins.cargolo_ops.ops_notifications import build_manual_ops_notification_
 from tools.cargolo_asr_tool import (
     cargolo_asr_bootstrap_case_tool,
     cargolo_asr_bootstrap_cases_from_tms_tool,
+    cargolo_asr_mail_history_tool,
     cargolo_asr_process_event_tool,
 )
 
@@ -345,3 +346,27 @@ def test_bootstrap_cases_from_tms_tool_includes_ops_notification(tmp_path):
     assert payload["success_count"] == 2
     assert payload["ops_notification"]["delivered"] == 1
     assert mock_notify.call_args.kwargs["run_type"] == "bootstrap_cases_from_tms"
+
+
+class _FakeShipmentListProvider:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def shipments_list(self, **kwargs):
+        return self.rows
+
+
+def test_mail_history_tool_skips_n8n_when_an_is_not_in_tms():
+    class FailClient:
+        def fetch_history(self, *args, **kwargs):
+            raise AssertionError("n8n mail history must not be called for unknown TMS shipment")
+
+    with patch("tools.cargolo_asr_tool.build_tms_provider_from_env", return_value=_FakeShipmentListProvider([])), patch(
+        "tools.cargolo_asr_tool.build_mail_history_client_from_env", return_value=FailClient()
+    ):
+        payload = json.loads(cargolo_asr_mail_history_tool({"an": "AN-914458534581"}))
+
+    assert payload["status"] == "skipped"
+    assert payload["code"] == "shipment_not_found_in_tms"
+    assert payload["an"] == "AN-914458534581"
+    assert "Keine n8n" in payload["message"]

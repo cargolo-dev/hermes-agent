@@ -51,8 +51,18 @@ def _format_report(result: dict) -> str:
             note = row.get("notification") if isinstance(row.get("notification"), dict) else {}
             delivered = note.get("delivered") if note else None
             delivery = f", Teams-Notify={delivered}" if delivered is not None else ""
+            processor = row.get("processor_result") if isinstance(row.get("processor_result"), dict) else {}
+            reconciliation = row.get("document_reconciliation") if isinstance(row.get("document_reconciliation"), dict) else {}
+            risk = str(reconciliation.get("risk") or "low").strip().lower()
+            review = bool(reconciliation.get("needs_human_review"))
+            priority = processor.get("analysis_priority") or ("medium" if review else "low")
+            status_bits = [f"Prio={priority}", f"Risk={risk}"]
+            if review:
+                status_bits.append("Review nötig")
+            findings = reconciliation.get("findings") if isinstance(reconciliation.get("findings"), list) else []
+            finding_text = f"; Auffällig: {str(findings[0])[:120]}" if findings else ""
             lines.append(
-                f"- {row.get('order_id') or '-'} / Activity {row.get('activity_id') or '-'}{delivery}; Report: {_short_path(row.get('report_md_path') or row.get('report_json_path'))}"
+                f"- {row.get('order_id') or '-'} / Activity {row.get('activity_id') or '-'} ({', '.join(status_bits)}){delivery}{finding_text}; Report: {_short_path(row.get('report_md_path') or row.get('report_json_path'))}"
             )
 
     if lines:

@@ -149,7 +149,8 @@ def test_correction_followup_with_explicit_order_disambiguates(tmp_path: Path) -
     assert result["teams_tms_review_cards"][0]["value"] == "26DE888888"
 
 
-def test_case_deep_dive_routes_to_employee_agent_prompt_without_direct_write(tmp_path: Path) -> None:
+def test_case_deep_dive_routes_to_employee_agent_prompt_without_direct_write(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.build_tms_provider_from_env", lambda: None)
     result = route_teams_ops_message(text="prüfe AN-12345 komplett", root=tmp_path / "cargolo_asr")
 
     assert result["handled"] is False
@@ -179,3 +180,42 @@ def test_unrelated_message_is_not_intercepted(tmp_path: Path) -> None:
     result = route_teams_ops_message(text="was gibt es zum Mittag?", root=tmp_path / "cargolo_asr")
 
     assert result == {"handled": False}
+
+
+class _FakeTMSProvider:
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    def shipments_list(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.rows
+
+
+def test_unknown_tms_case_is_answered_without_generic_agent_or_n8n(tmp_path: Path, monkeypatch) -> None:
+    provider = _FakeTMSProvider([])
+    monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.build_tms_provider_from_env", lambda: provider)
+
+    result = route_teams_ops_message(
+        text="Hermes CARGOLO Sag mir alles zu AN-914458534581",
+        root=tmp_path / "cargolo_asr",
+    )
+
+    assert result["handled"] is True
+    assert result["classification"] == "shipment_not_found_in_tms"
+    assert result["order_id"] == "AN-914458534581"
+    assert "nicht zu finden" in result["response_text"]
+    assert "keine Mail-/n8n-Suche" in result["response_text"]
+    assert provider.calls[0]["shipment_number"] == "AN-914458534581"
+
+
+def test_existing_tms_case_still_flows_to_employee_prompt(tmp_path: Path, monkeypatch) -> None:
+    provider = _FakeTMSProvider([{"shipment_number": "AN-12345"}])
+    monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.build_tms_provider_from_env", lambda: provider)
+
+    result = route_teams_ops_message(text="prüfe AN-12345 komplett", root=tmp_path / "cargolo_asr")
+
+    assert result["handled"] is False
+    assert result["allow_generic_chat"] is True
+    assert result["classification"] == "case_deep_dive_request"
+    assert "TMS-first" in result["agent_prompt"]
