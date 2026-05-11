@@ -52,12 +52,36 @@ def _fmt_number(value: float) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
-def _tms_totals(tms_snapshot: dict[str, Any]) -> dict[str, Any]:
+def _tms_detail(tms_snapshot: dict[str, Any]) -> dict[str, Any]:
     detail = tms_snapshot.get("detail") if isinstance(tms_snapshot, dict) else {}
-    if not isinstance(detail, dict):
-        detail = {}
+    return detail if isinstance(detail, dict) else {}
+
+
+def _tms_totals(tms_snapshot: dict[str, Any]) -> dict[str, Any]:
+    detail = _tms_detail(tms_snapshot)
     totals = detail.get("totals") if isinstance(detail.get("totals"), dict) else tms_snapshot.get("totals") if isinstance(tms_snapshot.get("totals"), dict) else {}
     return totals if isinstance(totals, dict) else {}
+
+
+def _norm_reference(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _tms_customs_reference(tms_snapshot: dict[str, Any]) -> str:
+    detail = _tms_detail(tms_snapshot)
+    candidates = [
+        detail.get("customs_reference"),
+        detail.get("mrn"),
+        detail.get("customs_mrn"),
+        tms_snapshot.get("customs_reference") if isinstance(tms_snapshot, dict) else None,
+    ]
+    customs = detail.get("customs") if isinstance(detail.get("customs"), dict) else {}
+    candidates.extend([customs.get("mrn"), customs.get("customs_reference")])
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _field_dict(row: dict[str, Any]) -> dict[str, Any]:
@@ -72,6 +96,7 @@ def _field_dict(row: dict[str, Any]) -> dict[str, Any]:
 
 def _append_content_reconciliation(findings: list[dict[str, Any]], *, tms_snapshot: dict[str, Any], registry: dict[str, Any]) -> None:
     totals = _tms_totals(tms_snapshot)
+    tms_reference = _tms_customs_reference(tms_snapshot)
     tms_weight = _number(_first_present(totals, "total_weight_kg", "weight_kg", "gross_weight_kg", "gross_weight"))
     tms_pieces = _number(_first_present(totals, "total_packages", "total_pieces", "packages", "pieces"))
     for row in registry.get("analyzed_documents", []) or []:
@@ -81,6 +106,15 @@ def _append_content_reconciliation(findings: list[dict[str, Any]], *, tms_snapsh
         if not fields:
             continue
         filename = row.get("filename")
+        doc_reference = str(_first_present(fields, "mrn", "customs_reference", "customs_mrn") or "").strip()
+        doc_type = str(row.get("analysis_doc_type") or row.get("doc_type") or "").lower()
+        if tms_reference and doc_reference and _norm_reference(tms_reference) != _norm_reference(doc_reference):
+            findings.append({
+                "type": "mrn_mismatch",
+                "severity": "high",
+                "filename": filename,
+                "summary": f"MRN im Dokument {doc_reference} passt nicht zur TMS-Zollreferenz {tms_reference}.",
+            })
         doc_weight = _number(_first_present(fields, "total_weight_kg", "weight_kg", "gross_weight_kg", "gross_weight", "weight"))
         if tms_weight is not None and doc_weight is not None and abs(tms_weight - doc_weight) > max(2.0, tms_weight * 0.02):
             findings.append({
@@ -164,7 +198,7 @@ def reconcile_documents(*, order_id: str, tms_snapshot: dict[str, Any], registry
     _append_content_reconciliation(findings, tms_snapshot=tms_snapshot, registry=registry)
 
     max_severity = "low"
-    if any(row.get("severity") == "high" for row in findings):
+    if any(row.get("severity") in {"high", "critical"} for row in findings):
         max_severity = "high"
     elif any(row.get("severity") == "medium" for row in findings):
         max_severity = "medium"

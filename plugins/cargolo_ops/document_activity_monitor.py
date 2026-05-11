@@ -81,6 +81,85 @@ def _is_document_upload(row: dict[str, Any]) -> bool:
     )
 
 
+def _doc_type_label(value: Any) -> str:
+    raw = str(value or "unknown").strip().lower()
+    return {
+        "commercial_invoice": "Handelsrechnung",
+        "packing_list": "Packliste",
+        "air_waybill": "AWB/HAWB",
+        "bill_of_lading": "B/L",
+        "proof_of_delivery": "POD",
+        "mrn": "MRN/Zollreferenz",
+        "customs_document": "Zolldokument",
+        "billing": "Abrechnungsbeleg",
+        "offer": "Angebot",
+        "unknown": "Dokument",
+        "unbekannt": "Dokument",
+    }.get(raw, raw.replace("_", " ") or "Dokument")
+
+
+def _finding_rank(row: Any) -> tuple[int, str]:
+    if not isinstance(row, dict):
+        return (9, str(row or ""))
+    severity = str(row.get("severity") or "").lower()
+    finding_type = str(row.get("type") or "").lower()
+    text = str(row.get("summary") or "").lower()
+    if severity in {"critical", "high"} or any(token in finding_type for token in ("mrn", "wrong", "mismatch")):
+        return (0, text)
+    if any(token in finding_type + " " + text for token in ("weight", "gewicht", "piece", "packstück", "package")):
+        return (1, text)
+    if finding_type in {"document_open_question", "implausible_goods_value"}:
+        return (2, text)
+    if severity == "medium":
+        return (3, text)
+    return (4, text)
+
+
+def _finding_text(row: Any) -> str:
+    if not isinstance(row, dict):
+        return str(row or "").strip()
+    filename = str(row.get("filename") or "").strip()
+    summary = str(row.get("summary") or row.get("type") or "Dokument fachlich prüfen.").strip()
+    return f"{filename}: {summary}" if filename else summary
+
+
+def _route_hint(context: dict[str, Any]) -> str:
+    parts = []
+    for city_key, country_key in (("origin_city", "origin_country"), ("destination_city", "destination_country")):
+        value = " ".join(str(context.get(key) or "").strip() for key in (city_key, country_key) if str(context.get(key) or "").strip())
+        if value:
+            parts.append(value)
+    return " → ".join(parts)
+
+
+def _human_document_message(*, order_id: Any, filename: Any, doc_type: Any, context: dict[str, Any], findings: list[Any], needs_review: bool) -> str:
+    label = _doc_type_label(doc_type)
+    route = _route_hint(context)
+    status = str(context.get("status") or "").strip()
+    network = str(context.get("network") or context.get("mode") or "").strip()
+    context_bits = [bit for bit in (network, status, route) if bit]
+    lage = f"{label} '{filename}' wurde geprüft."
+    if context_bits:
+        lage += " Kontext: " + " · ".join(context_bits) + "."
+    top_findings = sorted([row for row in findings if row], key=_finding_rank)[:3]
+    if top_findings:
+        auffaellig = " | ".join(_finding_text(row) for row in top_findings)
+        empfehlung = "Vor Übernahme oder Folgeaktion bitte die auffälligen Werte gegen TMS/Mailverlauf prüfen."
+        naechster_schritt = "Führenden Wert festlegen; bei TMS-Korrektur anschließend bewusst freigeben."
+    else:
+        auffaellig = "Keine fachlichen Dokumenten-Widersprüche erkannt."
+        empfehlung = "Keine direkte Aktion nötig; Case-Kontext und Dokumentenstand sind aktualisiert."
+        naechster_schritt = "Nur weiter beobachten, bis ein fachlicher Trigger entsteht."
+    if needs_review and not top_findings:
+        auffaellig = "Dokument ist nicht vollständig automatisch belastbar; manuelle Sichtprüfung sinnvoll."
+    return "\n".join([
+        f"Lage: {order_id} · {lage}",
+        f"Auffällig: {auffaellig}",
+        f"Empfehlung: {empfehlung}",
+        f"Nächster Schritt: {naechster_schritt}",
+    ])
+
+
 def list_recent_document_uploads(
     *,
     admin_user_id: int = DEFAULT_ADMIN_USER_ID,
@@ -119,10 +198,14 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
     needs_review = bool(reconciliation.get("needs_human_review"))
     findings = reconciliation.get("findings") if isinstance(reconciliation.get("findings"), list) else []
     priority = "high" if risk in {"high", "critical"} else ("medium" if needs_review or findings else "low")
-    message = (
-        f"Neues TMS-Dokument erkannt: {filename} ({doc_type}). "
-        f"Mailhistorie, TMS-Snapshot, Billing/Requirements und Dokumentanalyse wurden aktualisiert. "
-        f"Reconciliation-Risiko: {reconciliation.get('risk') or 'low'}."
+    context = report.get("tms_context") if isinstance(report.get("tms_context"), dict) else {}
+    message = _human_document_message(
+        order_id=report.get("order_id"),
+        filename=filename,
+        doc_type=doc_type,
+        context=context,
+        findings=findings,
+        needs_review=needs_review,
     )
     pending_review = 1 if needs_review else 0
     return {
@@ -149,7 +232,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         "document_activity_document_type": str(doc_type),
         "document_registry_summary": registry,
         "document_reconciliation": reconciliation,
-        "tms_context": report.get("tms_context") if isinstance(report.get("tms_context"), dict) else {},
+        "tms_context": context,
     }
 
 

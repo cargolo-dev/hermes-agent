@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from plugins.cargolo_ops.document_monitoring import run_document_monitoring
 from plugins.cargolo_ops.document_reconciliation import reconcile_documents
-from plugins.cargolo_ops.document_activity_monitor import run_document_activity_monitor
+from plugins.cargolo_ops.document_activity_monitor import _processor_result_from_report, run_document_activity_monitor
 
 
 def test_reconciliation_does_not_turn_missing_docs_alone_into_risk():
@@ -62,6 +62,78 @@ def test_reconciliation_flags_present_document_weight_mismatch_against_tms(tmp_p
             "summary": "Gewicht im Dokument 123 kg weicht vom TMS-Wert 500 kg ab.",
         }
     ]
+
+
+def test_reconciliation_flags_mrn_mismatch_as_blocker(tmp_path):
+    analysis_path = tmp_path / "customs_analysis.json"
+    analysis_path.write_text(
+        json.dumps({"extracted_fields": {"mrn": "MRN-DOC-222"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    report = reconcile_documents(
+        order_id="AN-SEA",
+        tms_snapshot={"detail": {"network": "sea", "customs_reference": "MRN-TMS-111"}},
+        registry={
+            "expected_types": [],
+            "received_types": ["customs_document"],
+            "received_documents": [{"filename": "customs.pdf", "analysis_status": "ok"}],
+            "analyzed_documents": [
+                {
+                    "filename": "customs.pdf",
+                    "analysis_doc_type": "customs_document",
+                    "analysis_path": str(analysis_path),
+                }
+            ],
+        },
+    )
+
+    assert report["risk"] == "high"
+    assert report["needs_human_review"] is True
+    assert report["findings"] == [
+        {
+            "type": "mrn_mismatch",
+            "severity": "high",
+            "filename": "customs.pdf",
+            "summary": "MRN im Dokument MRN-DOC-222 passt nicht zur TMS-Zollreferenz MRN-TMS-111.",
+        }
+    ]
+
+
+def test_processor_result_uses_human_document_message_without_risk_dump():
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-12432",
+            "report_json_path": "/tmp/report.json",
+            "report_md_path": "/tmp/report.md",
+            "tms_context": {"status": "in_transit", "network": "sea", "destination_city": "Hamburg", "destination_country": "DE"},
+            "lifecycle": {"history_sync_count": 2, "last_email_at": "2026-05-11T09:00:00Z"},
+            "registry_summary": {"received_documents": 2, "tms_documents": 1},
+            "reconciliation": {
+                "risk": "high",
+                "needs_human_review": True,
+                "findings": [
+                    {"type": "mrn_mismatch", "severity": "high", "filename": "customs.pdf", "summary": "MRN im Dokument MRN-DOC-222 passt nicht zur TMS-Zollreferenz MRN-TMS-111."},
+                    {"type": "document_open_question", "severity": "low", "filename": "invoice.pdf", "summary": "Steuernummer nicht lesbar."},
+                    {"type": "tms_document_weight_mismatch", "severity": "medium", "filename": "invoice.pdf", "summary": "Gewicht im Dokument 123 kg weicht vom TMS-Wert 500 kg ab."},
+                    {"type": "extra", "severity": "medium", "filename": "x.pdf", "summary": "Soll wegen Top-3 nicht erscheinen."},
+                ],
+            },
+        },
+        {"id": 77, "changed_at": "2026-05-11T10:00:00Z", "metadata": {"file_name": "customs.pdf", "document_type": "customs_document"}},
+    )
+
+    message = result["message"]
+    assert "Lage:" in message
+    assert "Auffällig:" in message
+    assert "Empfehlung:" in message
+    assert "Nächster Schritt:" in message
+    assert "Reconciliation-Risiko" not in message
+    assert "risk" not in message.lower()
+    assert "MRN-DOC-222" in message
+    assert "Soll wegen Top-3" not in message
+    assert result["analysis_priority"] == "high"
+    assert result["pending_action_summary"]["review"] == 1
 
 
 def test_document_monitoring_uses_lifecycle_and_writes_single_report_location(tmp_path):
