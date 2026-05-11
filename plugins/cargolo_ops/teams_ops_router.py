@@ -294,15 +294,6 @@ def _status_response(root: Path) -> str:
     jobs = _load_cron_jobs()
     doc_jobs = [j for j in jobs if "cargolo" in str(j.get("name") or j.get("job_id") or "").lower()]
     pending = _collect_pending_tms_actions(root, limit=99)
-    runtime_state = root / "runtime" / "document_activity_monitor_state.json"
-    watermark = "unbekannt"
-    if runtime_state.exists():
-        try:
-            state = json.loads(runtime_state.read_text(encoding="utf-8"))
-            watermark = str(state.get("last_seen_activity_id") or state.get("last_activity_id") or "unbekannt")
-        except Exception:
-            watermark = "nicht lesbar"
-
     if doc_jobs:
         first = doc_jobs[0]
         cron_line = f"{first.get('name') or first.get('job_id')} · {first.get('state') or first.get('status') or 'unbekannt'} · last={first.get('last_status') or 'n/a'}"
@@ -313,11 +304,10 @@ def _status_response(root: Path) -> str:
 
     return (
         "CARGOLO Teams Ops · Status\n"
-        f"- Gateway/Teams: Nachricht empfangen, Router aktiv\n"
-        f"- Dokumenten-Monitor: {cron_line}\n"
-        f"- Activity-Watermark: {watermark}\n"
-        f"- Offene TMS-Freigaben: {len(pending)}\n"
-        "Nächster Schritt: Sag z.B. `offene Freigaben` oder `prüfe AN-12345 komplett`."
+        "Lage: Teams ist verbunden, Router aktiv.\n"
+        f"Dokumenten-Monitor: {cron_line}\n"
+        f"Offene TMS-Freigaben: {len(pending)}\n"
+        "Nächster Schritt: `offene Freigaben` oder `prüfe AN-12345 komplett`."
     )
 
 
@@ -377,8 +367,9 @@ def _unknown_shipment_response(order_id: str) -> dict[str, Any]:
         "classification": "shipment_not_found_in_tms",
         "order_id": order_id,
         "response_text": (
-            f"{order_id} ist im ASR-TMS nicht zu finden. Ich starte deshalb keine Mail-/n8n-Suche und lege keinen Case an. "
-            "Bitte AN/BU prüfen oder zuerst im TMS anlegen/finden."
+            f"{order_id} finde ich nicht im ASR-TMS.\n"
+            "Lage: Ich stoppe hier TMS-first und starte keine Mail-/n8n-Suche.\n"
+            "Nächster Schritt: AN/BU prüfen oder die Sendung zuerst im TMS anlegen/finden."
         ),
     }
 

@@ -34,7 +34,8 @@ def test_status_command_returns_compact_ops_status(tmp_path: Path, monkeypatch) 
     assert result["classification"] == "ops_status"
     assert "CARGOLO Teams Ops · Status" in result["response_text"]
     assert "cargolo-asr-document-upload-monitor" in result["response_text"]
-    assert "Activity-Watermark: 1200" in result["response_text"]
+    assert "Teams ist verbunden" in result["response_text"]
+    assert "Activity-Watermark" not in result["response_text"]
 
 
 def test_pending_review_command_lists_open_tms_actions(tmp_path: Path) -> None:
@@ -258,8 +259,9 @@ def test_unknown_tms_case_is_answered_without_generic_agent_or_n8n(tmp_path: Pat
     assert result["handled"] is True
     assert result["classification"] == "shipment_not_found_in_tms"
     assert result["order_id"] == "AN-914458534581"
-    assert "nicht zu finden" in result["response_text"]
+    assert "nicht im ASR-TMS" in result["response_text"]
     assert "keine Mail-/n8n-Suche" in result["response_text"]
+    assert "Nächster Schritt" in result["response_text"]
     assert provider.calls[0]["shipment_number"] == "AN-914458534581"
 
 

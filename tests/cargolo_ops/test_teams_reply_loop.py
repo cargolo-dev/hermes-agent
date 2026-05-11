@@ -626,11 +626,11 @@ def test_teams_button_case_check_runs_read_only_case_summary_without_changing_pe
 
     assert result["status"] == "case_check_completed"
     assert "<h2>🔎 Fallprüfung AN-11755" in result["response_text"]
-    assert "Read-only ausgeführt: kein TMS-Write" in result["response_text"]
-    assert "<strong>TMS:</strong> in_transit" in result["response_text"]
-    assert "<strong>Mails:</strong> 1 Nachrichten" in result["response_text"]
-    assert "Entscheidungshilfe" in result["response_text"]
-    assert "Noch offen, aber nach Relevanz gefiltert" in result["response_text"]
+    assert "Read-only ausgeführt" not in result["response_text"]
+    assert "<strong>Lage:</strong> TMS in_transit" in result["response_text"]
+    assert "Mails 1" in result["response_text"]
+    assert "<h3>Auffällig</h3>" in result["response_text"]
+    assert "<h3>Empfehlung</h3>" in result["response_text"]
     assert "Offene Freigabe" in result["response_text"]
     assert "Zollreferenz / MRN" in result["response_text"]
     assert "26DE99999" in result["response_text"]

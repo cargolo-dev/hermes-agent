@@ -43,7 +43,9 @@ def test_case_assist_runtime_executes_read_only_specialists_and_writes_results(t
     assert [r.agent for r in result.specialist_results] == ["case_context", "mail_history", "tms_snapshot"]
     assert all(r.status.value == "ok" for r in result.specialist_results)
     assert result.draft_response.startswith("<div><h2>🔎 Fallprüfung AN-11755")
-    assert "Read-only ausgeführt: kein TMS-Write" in result.draft_response
+    assert "<h3>Auffällig</h3>" in result.draft_response
+    assert "<h3>Empfehlung</h3>" in result.draft_response
+    assert "Read-only ausgeführt" not in result.draft_response
     result_rows = _read_jsonl(case_dir / "employee" / "specialist_results.jsonl")
     assert [row["agent"] for row in result_rows] == ["case_context", "mail_history", "tms_snapshot"]
     assert all(row["write_intents"] == [] for row in result_rows)
@@ -187,11 +189,12 @@ def test_case_assist_reads_structured_local_sources_and_synthesizes_compact_ops_
     assert by_agent["tms_snapshot"].findings[0]["snapshot"]["status"] == "docs pending"
     assert by_agent["document_analyst"].findings[0]["missing"] == ["commercial_invoice"]
     assert by_agent["document_analyst"].requires_human is True
-    assert "Fallprüfung" in (result.draft_response or "")
+    assert "AN-11755" in (result.draft_response or "")
+    assert "<h3>Auffällig</h3>" in (result.draft_response or "")
     assert "AN-11755" in (result.draft_response or "")
     assert "docs pending" in (result.draft_response or "")
     assert "commercial_invoice" in (result.draft_response or "")
-    assert "Read-only ausgeführt: kein TMS-Write" in (result.draft_response or "")
+    assert "Read-only ausgeführt" not in (result.draft_response or "")
     assert result.should_send_to_teams is False
     assert result.should_write_tms is False
     assert result.should_send_customer_message is False

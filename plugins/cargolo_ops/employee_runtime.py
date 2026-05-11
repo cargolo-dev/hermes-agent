@@ -410,10 +410,10 @@ def _fmt_short_list(values: Any, *, limit: int = 3, empty: str = "nichts Konkret
     return "; ".join(shown) + suffix
 
 
-def _html_list(values: Any, *, limit: int = 3) -> str:
+def _html_list(values: Any, *, limit: int = 3, empty: str = "Keine konkreten Punkte sichtbar.") -> str:
     shown, remaining = _short_list(values, limit=limit)
     if not shown:
-        return "<p>Keine konkreten Punkte sichtbar.</p>"
+        return f"<p>{html.escape(empty)}</p>"
     items = "".join(f"<li>{html.escape(item)}</li>" for item in shown)
     if remaining:
         items += f"<li>… plus {remaining} weitere Punkte im Detail.</li>"
@@ -708,47 +708,41 @@ def _format_case_lage(response: EmployeeResponse, results: list[SpecialistResult
         raw_missing=missing,
         raw_discrepancies=discrepancies,
     )
-    recommendation = f"<p>{html.escape(str(decision_context['recommendation']))}</p>"
-    next_step = str(decision_context["next_step"])
-    decision_html = _html_list(decision_context["decision"], limit=3)
-    green_html = _html_list(decision_context["green"], limit=5)
-    open_html = _html_list(decision_context["open_items"], limit=4)
-    flags_html = _html_list(decision_context["flags"], limit=4)
-    docs_evidence_html = _html_list(decision_context["key_docs"], limit=4)
+    recommendation = html.escape(str(decision_context["recommendation"]))
+    next_step = html.escape(str(decision_context["next_step"]))
+
+    visible_green = decision_context["green"][:3]
+    visible_findings = (
+        list(decision_context["decision"])
+        + list(decision_context["open_items"])
+        + list(decision_context["flags"])
+    )[:3]
+    visible_docs = decision_context["key_docs"][:2]
+    if visible_docs:
+        visible_green.extend(visible_docs[: max(0, 3 - len(visible_green))])
+
+    green_html = _html_list(visible_green, limit=3, empty="Keine belastbaren Zusatzpunkte in den lokalen Quellen sichtbar.")
+    findings_html = _html_list(visible_findings, limit=3, empty="Keine akuten operativen Blocker aus TMS/Mail/Dokumenten sichtbar.")
 
     body = f"""
 <div>
   <h2>🔎 Fallprüfung {title}{route_text}</h2>
-  <p>Ich habe den Fall read-only gegen <strong>TMS</strong>, <strong>Mailverlauf</strong> und <strong>Dokumente</strong> geprüft.</p>
+  <p><strong>Lage:</strong> TMS {status_html}; Mails {mail_html}; Dokumente {docs_html}.{pickup_html}</p>
+  {latest_mail and f'<p><strong>Letzte Mail:</strong> {html.escape(str(latest_subject))}' + (f' von {html.escape(str(latest_from))}' if latest_from else '') + '</p>'}
 
-  <h3>Stand auf einen Blick</h3>
-  <ul>
-    <li><strong>TMS:</strong> {status_html}{pickup_html}</li>
-    <li><strong>Mails:</strong> {mail_html} Nachrichten{latest_mail}</li>
-    <li><strong>Dokumente:</strong> {docs_html} Dokumente in der Analyse</li>
-  </ul>
-
-  <h3>Entscheidungshilfe</h3>
-  <p><strong>Blocker / Abgleich</strong></p>
-  {decision_html}
-  <p><strong>Was belastbar wirkt</strong></p>
-  {green_html}
-
-  <h3>Dokumentenlage</h3>
-  <p><strong>Entscheidende Belege</strong></p>
-  {docs_evidence_html}
-  <p><strong>Noch offen, aber nach Relevanz gefiltert</strong></p>
-  {open_html}
-  <p><strong>Auffällig / operativ zu beachten</strong></p>
-  {flags_html}
+  <h3>Auffällig</h3>
+  {findings_html}
   {source_note}
 
-  <h3>Meine Einschätzung</h3>
-  {recommendation}
-  {release_line}
-  <p><strong>Nächster sinnvoller Schritt:</strong> {html.escape(next_step)}</p>
+  <h3>Belastbar</h3>
+  {green_html}
 
-  <p><small>Read-only ausgeführt: kein TMS-Write, keine Kundenmail, offene Freigabe bleibt stehen.</small></p>
+  <h3>Empfehlung</h3>
+  <p>{recommendation}</p>
+  {release_line}
+
+  <h3>Nächster Schritt</h3>
+  <p>{next_step}</p>
 </div>
 """
     return "".join(line.strip() for line in body.splitlines() if line.strip())
