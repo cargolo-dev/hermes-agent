@@ -961,6 +961,8 @@ class TestTeamsMessageHandling:
         adapter._app = mock_app
         adapter.handle_message = AsyncMock()
         adapter.send_cargolo_asr_tms_review_card = AsyncMock(return_value=MagicMock(success=True))
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr("plugins.platforms.teams.adapter.asyncio.sleep", sleep_mock)
 
         activity = self._make_activity(
             text="offene Freigaben",
@@ -1721,6 +1723,8 @@ async def test_cargolo_ops_pending_command_sends_interactive_review_cards(monkey
     adapter._app = mock_app
     adapter.handle_message = AsyncMock()
     adapter.send_cargolo_asr_tms_review_card = AsyncMock(return_value=MagicMock(success=True))
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("plugins.platforms.teams.adapter.asyncio.sleep", sleep_mock)
 
     helper = TestTeamsMessageHandling()
     activity = helper._make_activity(text="<at>Hermes CARGOLO</at> offene Freigaben", activity_id="msg-pending")

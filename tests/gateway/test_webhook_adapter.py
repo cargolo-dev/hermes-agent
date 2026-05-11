@@ -764,8 +764,11 @@ class TestDeliverCrossPlatformThreadId:
         """CARGOLO native Teams cards carry a compact context marker for deterministic replies."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         adapter = _make_adapter()
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr("gateway.platforms.webhook.asyncio.sleep", sleep_mock)
         mock_target = AsyncMock()
         mock_target.send = AsyncMock(return_value=SendResult(success=True, message_id="teams-msg-777"))
+        mock_target.send_cargolo_asr_tms_review_card = AsyncMock(return_value=SendResult(success=True, message_id="review-msg-1"))
         mock_runner = MagicMock()
         mock_runner.adapters = {Platform("teams"): mock_target}
         mock_runner.config.get_home_channel.return_value = None
@@ -775,7 +778,15 @@ class TestDeliverCrossPlatformThreadId:
             "delivery_id": "delivery-marker",
             "deliver_extra": {"chat_id": "teams-chat-1"},
             "payload": {
-                "processor_result": {"order_id": "AN-11755"},
+                "processor_result": {
+                    "order_id": "AN-11755",
+                    "teams_tms_review_cards": [{
+                        "action_id": "review-1",
+                        "order_id": "AN-11755",
+                        "target": "mbl_number",
+                        "value": "NGP3497068",
+                    }],
+                },
                 "activity_event": {"id": 1203},
             },
         }
@@ -788,6 +799,10 @@ class TestDeliverCrossPlatformThreadId:
         index_path = tmp_path / ".hermes" / "cargolo_asr" / "runtime" / "teams_card_index.json"
         index = json.loads(index_path.read_text(encoding="utf-8"))
         assert index["by_message_id"]["teams-msg-777"]["context_id"] == "AN-11755:1203:delivery-marker"
+        sleep_mock.assert_awaited_once_with(1.5)
+        mock_target.send_cargolo_asr_tms_review_card.assert_awaited_once()
+        assert mock_target.send.await_args_list[0].args[1] == sent_content
+        assert sleep_mock.await_args_list[0]  # documents the main send returned before the card delay
 
 
 class TestInsecureNoAuthSafetyRail:

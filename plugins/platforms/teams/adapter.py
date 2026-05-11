@@ -853,6 +853,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 )
                 for pending_action in ops_result.get("teams_tms_review_cards") or []:
                     if isinstance(pending_action, dict):
+                        await asyncio.sleep(1.0)
                         await self.send_cargolo_asr_tms_review_card(
                             str(conv.id), pending_action, reply_to=str(msg_id) if msg_id else None
                         )

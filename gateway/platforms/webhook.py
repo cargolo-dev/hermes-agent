@@ -1076,7 +1076,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 processor_result = effective_payload.get("processor_result") if isinstance(effective_payload.get("processor_result"), dict) else {}
                 review_cards = processor_result.get("teams_tms_review_cards") if isinstance(processor_result.get("teams_tms_review_cards"), list) else []
                 send_review_card = getattr(adapter, "send_cargolo_asr_tms_review_card", None)
-                if callable(send_review_card):
+                if callable(send_review_card) and review_cards:
+                    # Teams/Graph can render independent card sends faster than the
+                    # preceding rich text/card message even though `adapter.send`
+                    # already returned. Keep the operational narrative first:
+                    # "Hermes · Dokument geprüft" must visibly arrive before the
+                    # follow-up Ja/Nein TMS review cards.
+                    await asyncio.sleep(1.5)
                     reply_to = str(getattr(result, "message_id", "") or "") or None
                     for pending_action in review_cards[:3]:
                         if isinstance(pending_action, dict):
