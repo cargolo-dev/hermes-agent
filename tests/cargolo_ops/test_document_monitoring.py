@@ -136,6 +136,34 @@ def test_processor_result_uses_human_document_message_without_risk_dump():
     assert result["pending_action_summary"]["review"] == 1
 
 
+def test_processor_result_prioritizes_uploaded_document_and_labels_master_bl():
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-11790",
+            "tms_context": {"status": "customs_pending", "network": "sea"},
+            "lifecycle": {},
+            "registry_summary": {},
+            "reconciliation": {
+                "risk": "medium",
+                "needs_human_review": True,
+                "findings": [
+                    {"type": "document_flag", "severity": "medium", "filename": "old.gif", "summary": "not_a_logistics_document"},
+                    {"type": "document_open_question", "severity": "low", "filename": "NGP3497068.pdf", "summary": "ETA nicht explizit auf dem Dokument angegeben"},
+                    {"type": "document_flag", "severity": "medium", "filename": "NGP3497068.pdf", "summary": "Entwurf (Draft) - Original BL prüfen"},
+                ],
+            },
+        },
+        {"id": 1263, "metadata": {"file_name": "NGP3497068.pdf", "document_type": "master_bl"}},
+    )
+
+    message = result["message"]
+    assert "Master B/L" in message
+    assert "Entwurf (Draft)" in message
+    assert "ETA nicht explizit" in message
+    assert "old.gif" not in message
+    assert "not_a_logistics_document" not in message
+
+
 def test_document_monitoring_uses_lifecycle_and_writes_single_report_location(tmp_path):
     lifecycle = {
         "status": "ok",

@@ -88,6 +88,10 @@ def _doc_type_label(value: Any) -> str:
         "packing_list": "Packliste",
         "air_waybill": "AWB/HAWB",
         "bill_of_lading": "B/L",
+        "master_bl": "Master B/L",
+        "house_bl": "House B/L",
+        "hbl": "House B/L",
+        "mbl": "Master B/L",
         "proof_of_delivery": "POD",
         "mrn": "MRN/Zollreferenz",
         "customs_document": "Zolldokument",
@@ -141,7 +145,14 @@ def _human_document_message(*, order_id: Any, filename: Any, doc_type: Any, cont
     lage = f"{label} '{filename}' wurde geprüft."
     if context_bits:
         lage += " Kontext: " + " · ".join(context_bits) + "."
-    top_findings = sorted([row for row in findings if row], key=_finding_rank)[:3]
+    uploaded_norm = str(filename or "").strip().lower()
+    usable_findings = [
+        row for row in findings
+        if not isinstance(row, dict)
+        or str(row.get("filename") or "").strip().lower() == uploaded_norm
+        or _finding_rank(row)[0] <= 1
+    ]
+    top_findings = sorted([row for row in usable_findings if row], key=_finding_rank)[:3]
     if top_findings:
         auffaellig = " | ".join(_finding_text(row) for row in top_findings)
         empfehlung = "Vor Übernahme oder Folgeaktion bitte die auffälligen Werte gegen TMS/Mailverlauf prüfen."
