@@ -220,12 +220,13 @@ def test_processor_result_compares_uploaded_bl_fields_against_tms(tmp_path):
     result = _processor_result_from_report(
         {
             "order_id": "AN-11790",
+            "case_root": str(tmp_path / "orders" / "AN-11790"),
             "tms_context": {"status": "customs_pending", "network": "sea", "origin_city": "Jinhua", "origin_country": "CN", "destination_city": "Kißlegg", "destination_country": "DE"},
             "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
             "registry_summary": {},
             "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
         },
-        {"id": 1263, "metadata": {"file_name": "NGP3497068.pdf", "document_type": "master_bl"}},
+        {"id": 1263, "changed_at": "2026-05-11T10:00:00Z", "changed_by_name": "Max Mustermann", "metadata": {"file_name": "NGP3497068.pdf", "document_type": "master_bl"}},
     )
 
     message = result["message"]
@@ -236,9 +237,15 @@ def test_processor_result_compares_uploaded_bl_fields_against_tms(tmp_path):
     assert "ETD weicht ab" in message
     assert "MBL / B/L-Nr. fehlt im TMS" in message
     assert "Container fehlt im TMS" in message
+    assert "Max Mustermann" in message
     assert "ETA nicht explizit" not in message
     assert "Entwurf (Draft)" not in message
     assert result["pending_action_summary"]["review"] == 1
+    cards = result["teams_tms_review_cards"]
+    assert [(card["target"], card["value"]) for card in cards] == [("mbl_number", "NGP3497068"), ("container_number", "XHCU2996441")]
+    assert all(card["action_id"] for card in cards)
+    pending_path = tmp_path / "orders" / "AN-11790" / "teams" / "pending_tms_actions.jsonl"
+    assert pending_path.exists()
 
 
 

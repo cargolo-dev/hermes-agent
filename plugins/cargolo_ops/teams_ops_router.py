@@ -32,7 +32,7 @@ _PENDING_RE = re.compile(r"\b(offene?|pending|freigaben?|review|tms[-\s]?freigab
 _CASE_CHECK_RE = re.compile(r"\b(prüf(?:e|en)?|pruef(?:e|en)?|(?<!-)check|aktualisier(?:e|en)?|sync|zieh(?:e|en)?)\b", re.IGNORECASE)
 _FULL_CASE_RE = re.compile(r"\b(?:gib|geb|zeig|sag|hol|hole)\b.*\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b|\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b.*\b(?:zu|für|fuer)\b", re.IGNORECASE)
 _WRITE_RE = re.compile(r"\b(schreib(?:e|en)?|setz(?:e|en)?|eintragen|ändern|aendern|update|aktualisier(?:e|en)?)\b", re.IGNORECASE)
-_TMS_FIELD_RE = re.compile(r"\b(TMS|MRN|HBL|MBL|HAWB|Zollreferenz|customs)\b", re.IGNORECASE)
+_TMS_FIELD_RE = re.compile(r"\b(TMS|MRN|HBL|MBL|HAWB|Container|Container[-\s]?Nr|Zollreferenz|customs)\b", re.IGNORECASE)
 _MRN_VALUE_RE = re.compile(r"\b([0-9]{2}[A-Z]{2}[A-Z0-9]{3,})\b", re.IGNORECASE)
 
 
@@ -86,7 +86,7 @@ def _pending_action_id_for_row(item: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-_SUPPORTED_TMS_REVIEW_TARGETS = {"customs_reference", "hbl_number", "mbl_number", "hawb_number"}
+_SUPPORTED_TMS_REVIEW_TARGETS = {"customs_reference", "hbl_number", "mbl_number", "hawb_number", "container_number", "pickup_date", "estimated_delivery_date"}
 
 
 def _collect_pending_tms_actions(root: Path, limit: int = 8) -> list[dict[str, Any]]:
@@ -145,6 +145,9 @@ def _extract_correction_value(raw: str, *, target: str) -> str | None:
         "hbl_number": r"\bHBL\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{2,})\b",
         "mbl_number": r"\bMBL\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{2,})\b",
         "hawb_number": r"\bHAWB\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{2,})\b",
+        "container_number": r"\b([A-Z]{4}\d{7})\b",
+        "pickup_date": r"\b(\d{4}-\d{2}-\d{2})\b",
+        "estimated_delivery_date": r"\b(\d{4}-\d{2}-\d{2})\b",
     }
     pattern = field_patterns.get(target)
     if not pattern:

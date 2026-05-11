@@ -1171,6 +1171,7 @@ class TeamsAdapter(BasePlatformAdapter):
         operator = str(pending_action.get("operator") or "unbekannt")
         action_id = str(pending_action.get("action_id") or "")
         context_id = str(pending_action.get("context_id") or "")
+        question = str(pending_action.get("question") or "").strip()
         data_base = {
             "order_id": order_id,
             "action_id": action_id,
@@ -1183,13 +1184,14 @@ class TeamsAdapter(BasePlatformAdapter):
             .with_version("1.4")
             .with_body([
                 TextBlock(text=f"CARGOLO ASR · TMS-Freigabe {order_id}", wrap=True, weight="Bolder"),
+                TextBlock(text=question or f"Soll dieser TMS-Wert aus dem Dokument übernommen werden?", wrap=True, weight="Bolder"),
                 TextBlock(text=f"Vorschlag: {target} = {value}", wrap=True),
                 TextBlock(text=f"Quelle: {operator} · Status: pending_review", wrap=True, isSubtle=True),
-                TextBlock(text="Bitte prüfen: ✅ schreibt nur nach Live-Writeback + frischer Verifikation ins TMS; ❌/✏️/🔎 schreiben nie ins TMS.", wrap=True),
+                TextBlock(text="Ja schreibt nur nach Live-Writeback + frischer Verifikation ins TMS; Nein/Korrektur/Fall prüfen schreiben nie ins TMS.", wrap=True),
             ])
             .with_actions([
                 ExecuteAction(
-                    title="✅ Bestätigen & TMS schreiben",
+                    title="✅ Ja, TMS schreiben",
                     verb="cargolo_asr_tms_approve",
                     data={**data_base, "hermes_action": "cargolo_asr_tms_approve"},
                     style="positive",
@@ -1205,7 +1207,7 @@ class TeamsAdapter(BasePlatformAdapter):
                     data={**data_base, "hermes_action": "cargolo_asr_case_check"},
                 ),
                 ExecuteAction(
-                    title="❌ Ablehnen",
+                    title="❌ Nein, nicht übernehmen",
                     verb="cargolo_asr_tms_reject",
                     data={**data_base, "hermes_action": "cargolo_asr_tms_reject"},
                     style="destructive",

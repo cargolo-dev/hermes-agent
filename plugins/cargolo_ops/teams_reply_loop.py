@@ -158,12 +158,13 @@ def _classify(text: str) -> tuple[str, dict[str, Any]]:
     instruction = _operator_instruction_text(raw)
     lowered = raw.lower()
     instruction_lowered = instruction.lower()
-    extraction_text = instruction if any(word in instruction_lowered for word in ("tms", "ändern", "aendern", "aktualis", "eintragen", "setzen", "hbl", "mbl", "hawb", "mrn")) else raw
+    extraction_text = instruction if any(word in instruction_lowered for word in ("tms", "ändern", "aendern", "aktualis", "eintragen", "setzen", "hbl", "mbl", "hawb", "mrn", "container")) else raw
     mrn = re.search(r"\b(?:MRN\s*)?([0-9]{2}[A-Z]{2}[A-Z0-9]{3,})\b", extraction_text, re.IGNORECASE)
     hbl = re.search(r"\bHBL\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{2,})\b", extraction_text, re.IGNORECASE)
     mbl = re.search(r"\bMBL\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{2,})\b", extraction_text, re.IGNORECASE)
     hawb = re.search(r"\bHAWB\s*[:#-]?\s*([A-Z0-9][A-Z0-9./-]{2,})\b", extraction_text, re.IGNORECASE)
-    if any(word in instruction_lowered for word in ("tms", "ändern", "aendern", "aktualis", "eintragen", "setzen", "hbl", "mbl", "hawb", "mrn")):
+    container = re.search(r"\b([A-Z]{4}\d{7})\b", extraction_text, re.IGNORECASE)
+    if any(word in instruction_lowered for word in ("tms", "ändern", "aendern", "aktualis", "eintragen", "setzen", "hbl", "mbl", "hawb", "mrn", "container")):
         target = None
         value = None
         if mrn:
@@ -178,6 +179,9 @@ def _classify(text: str) -> tuple[str, dict[str, Any]]:
         elif hawb:
             target = "hawb_number"
             value = hawb.group(1).upper()
+        elif container:
+            target = "container_number"
+            value = container.group(1).upper()
         return "agent_decision_required", {
             "type": "agent_tms_intent_candidate",
             "target_candidate": target,
@@ -358,6 +362,9 @@ _SHORT_TO_FULL_TARGET: dict[str, str] = {
     "hbl_number": "shipment.freight_details.hbl_number",
     "mbl_number": "shipment.freight_details.mbl_number",
     "hawb_number": "shipment.freight_details.hawb_number",
+    "container_number": "shipment.freight_details.container_number",
+    "pickup_date": "shipment.dates.pickup_date",
+    "estimated_delivery_date": "shipment.dates.estimated_delivery_date",
 }
 
 
@@ -749,9 +756,12 @@ def _extract_snapshot_value(snapshot: dict[str, Any], target: str) -> Any:
     if target == "customs_reference":
         customs = shipment.get("customs") if isinstance(shipment.get("customs"), dict) else {}
         return customs.get("customs_reference") or shipment.get("customs_reference")
-    if target in {"hbl_number", "mbl_number", "hawb_number"}:
+    if target in {"hbl_number", "mbl_number", "hawb_number", "container_number"}:
         freight = shipment.get("freight_details") if isinstance(shipment.get("freight_details"), dict) else {}
         return freight.get(target) or shipment.get(target)
+    if target in {"pickup_date", "estimated_delivery_date"}:
+        dates = shipment.get("dates") if isinstance(shipment.get("dates"), dict) else {}
+        return dates.get(target) or shipment.get(target)
     return None
 
 
@@ -874,7 +884,7 @@ def _agent_prompt_for_contextual_reply(order_id: str, context: dict[str, Any], t
         "Wenn du aus dem Kontext einen sinnvollen nächsten Schritt erkennst, schlage ihn proaktiv vor.\n"
         "TMS-Sicherheit: Wenn die Nachricht fachlich ein TMS-Änderungswunsch ist, schreibe NICHT direkt ins TMS. "
         "Nutze ausschließlich das Tool `cargolo_asr_record_teams_tms_intent` mit order_id, target, value, text, context_id, source_message_id, operator. "
-        "Unterstützte targets: customs_reference, hbl_number, mbl_number, hawb_number. "
+        "Unterstützte targets: customs_reference, hbl_number, mbl_number, hawb_number, container_number, pickup_date, estimated_delivery_date. "
         "Wenn target oder value unklar sind, frage nach statt zu raten.\n"
         "Antwortstil: kurz, deutsch, operativ, mit klarer Aussage: geprüft/gespeichert/nicht geschrieben/nächster Schritt. "
         "Wenn es kein TMS-Änderungswunsch ist, antworte natürlich als Kollege und behaupte keinen TMS-Wunsch.\n"

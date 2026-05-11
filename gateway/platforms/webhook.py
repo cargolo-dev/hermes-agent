@@ -1068,4 +1068,19 @@ class WebhookAdapter(BasePlatformAdapter):
                 record_sent_card(context=card_context)
             except Exception as exc:
                 logger.warning("[webhook] could not record CARGOLO Teams card context: %s", exc)
+        if result.success and platform_name == "teams" and str(delivery.get("route_name") or "") == "cargolo-asr-ops-teams":
+            try:
+                effective_payload = delivery.get("payload") if isinstance(delivery.get("payload"), dict) else {}
+                if isinstance(effective_payload.get("payload"), dict):
+                    effective_payload = effective_payload.get("payload")
+                processor_result = effective_payload.get("processor_result") if isinstance(effective_payload.get("processor_result"), dict) else {}
+                review_cards = processor_result.get("teams_tms_review_cards") if isinstance(processor_result.get("teams_tms_review_cards"), list) else []
+                send_review_card = getattr(adapter, "send_cargolo_asr_tms_review_card", None)
+                if callable(send_review_card):
+                    reply_to = str(getattr(result, "message_id", "") or "") or None
+                    for pending_action in review_cards[:3]:
+                        if isinstance(pending_action, dict):
+                            await send_review_card(chat_id, pending_action, reply_to=reply_to)
+            except Exception as exc:
+                logger.warning("[webhook] could not send CARGOLO Teams TMS review cards: %s", exc)
         return result

@@ -177,6 +177,22 @@ def _date_from_ms(value: Any) -> str:
     return datetime.fromtimestamp(number / 1000, tz=timezone.utc).date().isoformat()
 
 
+def _display_timestamp(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    raw = str(value).strip()
+    if raw.isdigit():
+        try:
+            number = int(raw)
+            if number > 10_000_000_000:
+                return datetime.fromtimestamp(number / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if number > 0:
+                return datetime.fromtimestamp(number, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            return raw
+    return raw
+
+
 def _norm(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
@@ -297,6 +313,8 @@ def _human_document_message(
     findings: list[Any],
     needs_review: bool,
     comparisons: list[dict[str, str]] | None = None,
+    uploaded_by: Any = None,
+    uploaded_at: Any = None,
 ) -> str:
     label = _doc_type_label(doc_type)
     route = _route_hint(context)
@@ -304,6 +322,13 @@ def _human_document_message(
     network = str(context.get("network") or context.get("mode") or "").strip()
     context_bits = [bit for bit in (network, status, route) if bit]
     lage = f"{label} '{filename}' wurde gegen die im TMS gepflegten Sendungsdaten geprüft."
+    uploader = str(uploaded_by or "").strip()
+    upload_time = _display_timestamp(uploaded_at)
+    if uploader and uploader != "-":
+        lage += f" Upload laut TMS-Activity-Log: {uploader}"
+        if upload_time and upload_time != "-":
+            lage += f" am {upload_time}"
+        lage += "."
     if context_bits:
         lage += " Kontext: " + " · ".join(context_bits) + "."
 
@@ -355,6 +380,83 @@ def _human_document_message(
     ])
 
 
+def _case_root_from_report(report: dict[str, Any], order_id: str) -> Path | None:
+    del order_id
+    lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
+    for value in (lifecycle.get("case_root"), report.get("case_root")):
+        if value:
+            return Path(str(value))
+    return None
+
+
+def _queue_tms_review_cards_from_comparisons(
+    *,
+    report: dict[str, Any],
+    event: dict[str, Any],
+    comparisons: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Persist Teams approval items for document-derived TMS field updates.
+
+    The document monitor may propose concrete TMS updates, but never writes them
+    directly. For fields supported by the existing Teams review/writeback flow,
+    queue one pending item and let the Teams adapter render a Yes/No review card.
+    Unsupported operational fields, such as main-leg ETD, stay as textual review
+    findings until a dedicated writeback tool exists for them.
+    """
+    order_id = str(report.get("order_id") or "").strip().upper()
+    if not order_id:
+        return []
+    try:
+        from .teams_reply_loop import record_agent_tms_update_intent
+    except Exception:
+        return []
+
+    case_root = _case_root_from_report(report, order_id)
+    if not case_root:
+        return []
+    root = case_root.parent.parent if case_root.name == order_id and case_root.parent.name == "orders" else case_root
+    operator = "Hermes Document Monitor"
+    activity_id = _activity_id(event)
+    context_id = f"{order_id}:{activity_id}:document_monitor" if activity_id else f"{order_id}:document_monitor"
+    supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference"}
+    cards: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in comparisons:
+        if row.get("status") not in {"diff", "missing_tms"}:
+            continue
+        target = str(row.get("target") or "").strip()
+        value = str(row.get("doc") or "").strip()
+        if target not in supported_targets or not value or value == "nicht lesbar":
+            continue
+        key = (target, value)
+        if key in seen:
+            continue
+        seen.add(key)
+        queued = record_agent_tms_update_intent(
+            root=root,
+            order_id=order_id,
+            target=target,
+            value=value,
+            text=f"Dokumentenabgleich: {row.get('label') or target} aus Dokument übernehmen? TMS {row.get('tms')} ↔ Dokument {value}.",
+            operator=operator,
+            source_message_id=str(activity_id or "") or None,
+            context_id=context_id,
+            confidence="document_field_comparison",
+        )
+        if queued.get("queued"):
+            cards.append({
+                "order_id": order_id,
+                "action_id": queued.get("action_id"),
+                "target": target,
+                "value": value,
+                "operator": operator,
+                "context_id": context_id,
+                "source": "document_activity_monitor",
+                "question": f"{row.get('label') or target}: TMS auf Dokumentwert setzen?",
+            })
+    return cards
+
+
 def list_recent_document_uploads(
     *,
     admin_user_id: int = DEFAULT_ADMIN_USER_ID,
@@ -399,6 +501,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         needs_review = True
         if priority == "low":
             priority = "medium"
+    tms_review_cards = _queue_tms_review_cards_from_comparisons(report=report, event=event, comparisons=comparisons)
     message = _human_document_message(
         order_id=report.get("order_id"),
         filename=filename,
@@ -407,6 +510,8 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         findings=findings,
         needs_review=needs_review,
         comparisons=comparisons,
+        uploaded_by=event.get("changed_by_name") or event.get("changed_by"),
+        uploaded_at=event.get("changed_at"),
     )
     pending_review = 1 if needs_review else 0
     return {
@@ -433,6 +538,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         "document_activity_document_type": str(doc_type),
         "document_registry_summary": registry,
         "document_field_comparison": comparisons,
+        "teams_tms_review_cards": tms_review_cards,
         "document_reconciliation": reconciliation,
         "tms_context": context,
     }
