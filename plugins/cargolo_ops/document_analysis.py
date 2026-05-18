@@ -721,21 +721,78 @@ def _record_pricing_document_events_if_relevant(
         return [{"status": "error", "error": str(exc), "filename": str(row.get("filename") or path.name)}]
 
 
+def _analysis_candidate_rows(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return all local documents that should be analyzed.
+
+    Mail/inbound attachments remain the primary `received_documents` input. TMS
+    uploads mirrored from ASR history are also first-class evidence and must be
+    analyzed even when no matching mail attachment exists.
+    """
+    candidates: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    def _add(row: dict[str, Any], *, source: str) -> None:
+        stored_path = str(row.get("stored_path") or row.get("local_path") or "").strip()
+        sha = str(row.get("sha256") or "").strip()
+        key = sha or stored_path or str(row.get("filename") or row.get("label") or "")
+        if not key or key in seen_keys:
+            return
+        seen_keys.add(key)
+        candidate = dict(row)
+        candidate.setdefault("source", source)
+        candidate.setdefault("stored_path", stored_path)
+        candidate.setdefault("filename", candidate.get("filename") or candidate.get("label") or Path(stored_path).name)
+        if source == "tms_document":
+            candidate.setdefault("detected_types", [candidate.get("document_type") or candidate.get("label")])
+        candidates.append(candidate)
+
+    for row in registry.get("received_documents", []) or []:
+        if isinstance(row, dict):
+            _add(row, source=str(row.get("source") or "mail_history"))
+    for row in (registry.get("mirrored_tms_documents", []) or registry.get("tms_documents", []) or []):
+        if isinstance(row, dict) and row.get("mirror_status") == "mirrored" and row.get("local_path"):
+            _add(row, source="tms_document")
+    return candidates
+
+
 def analyze_case_documents(*, order_id: str, case_root: Path, registry: dict[str, Any], tms_snapshot: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     analysis_root = case_root / "documents" / "analysis"
     analysis_root.mkdir(parents=True, exist_ok=True)
 
     summaries: list[dict[str, Any]] = []
     open_questions: list[str] = []
-    received_documents = [row for row in registry.get("received_documents", []) if isinstance(row, dict)]
+    candidate_documents = _analysis_candidate_rows(registry)
     updated_received_documents: list[dict[str, Any]] = []
+    updated_tms_documents = [dict(row) for row in registry.get("tms_documents", []) if isinstance(row, dict)]
+    if not updated_tms_documents:
+        updated_tms_documents = [dict(row) for row in registry.get("mirrored_tms_documents", []) if isinstance(row, dict)]
 
-    for row in received_documents:
+    def _remember_tms_analysis(row: dict[str, Any]) -> None:
+        tms_id = row.get("tms_document_id") or row.get("document_uuid") or row.get("document_id")
+        sha = row.get("sha256")
+        local_path = row.get("local_path") or row.get("stored_path")
+        for idx, tms_row in enumerate(updated_tms_documents):
+            same_id = tms_id and tms_id in {tms_row.get("tms_document_id"), tms_row.get("document_uuid"), tms_row.get("document_id")}
+            same_sha = sha and sha == tms_row.get("sha256")
+            same_path = local_path and local_path == tms_row.get("local_path")
+            if same_id or same_sha or same_path:
+                merged = dict(tms_row)
+                for key in ["analysis_status", "analysis_path", "analysis_doc_type", "analysis_confidence", "analysis_summary", "tms_matches", "detected_types", "pricing_kb_events", "pricing_kb_event"]:
+                    if key in row:
+                        merged[key] = row[key]
+                updated_tms_documents[idx] = merged
+                return
+        if row.get("source") == "tms_document":
+            updated_tms_documents.append(dict(row))
+
+    for row in candidate_documents:
         stored_path = Path(str(row.get("stored_path") or ""))
         if not stored_path.exists():
             row = dict(row)
             row["analysis_status"] = "missing_file"
-            updated_received_documents.append(row)
+            _remember_tms_analysis(row)
+            if row.get("source") != "tms_document":
+                updated_received_documents.append(row)
             open_questions.append(f"Dokumentdatei fehlt lokal: {row.get('filename') or stored_path.name}")
             continue
 
@@ -813,11 +870,13 @@ def analyze_case_documents(*, order_id: str, case_root: Path, registry: dict[str
                 "missing_or_unreadable": [str(exc)],
             })
             open_questions.append(f"Dokumentanalyse fehlgeschlagen für {row.get('filename')}: {exc}")
-        updated_received_documents.append(row)
+        _remember_tms_analysis(row)
+        if row.get("source") != "tms_document":
+            updated_received_documents.append(row)
 
     analyzed_types = sorted({
         doc_type
-        for row in updated_received_documents
+        for row in [*updated_received_documents, *updated_tms_documents]
         for doc_type in row.get("detected_types", [])
         if doc_type
     })
@@ -830,7 +889,7 @@ def analyze_case_documents(*, order_id: str, case_root: Path, registry: dict[str
             "tms_filename": match.get("filename"),
             "match_basis": list(match.get("match_basis") or []),
         }
-        for row in updated_received_documents
+        for row in [*updated_received_documents, *updated_tms_documents]
         if isinstance(row, dict)
         for match in (row.get("tms_matches") or [])
         if isinstance(match, dict)
@@ -851,6 +910,8 @@ def analyze_case_documents(*, order_id: str, case_root: Path, registry: dict[str
     updated_registry["analysis_version"] = ANALYSIS_VERSION
     updated_registry["analysis_generated_at"] = utc_now_iso()
     updated_registry["received_documents"] = updated_received_documents
+    updated_registry["tms_documents"] = updated_tms_documents
+    updated_registry["mirrored_tms_documents"] = [row for row in updated_tms_documents if row.get("mirror_status") == "mirrored"]
     updated_registry["received_types"] = analyzed_types or list(updated_registry.get("received_types", []))
     updated_registry["missing_types"] = missing_types
     updated_registry["analyzed_documents"] = summaries

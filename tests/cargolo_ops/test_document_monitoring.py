@@ -867,7 +867,7 @@ def test_document_activity_monitor_filters_new_document_uploads_and_updates_curs
     class FakeProvider:
         def list_asr_activity_log(self, **kwargs):
             assert kwargs["entity_type"] == "document"
-            assert kwargs["action"] == "upload"
+            assert kwargs.get("action") is None
             return {
                 "status": "ok",
                 "items": [
@@ -939,3 +939,42 @@ def test_document_activity_monitor_dry_run_does_not_update_cursor_or_notify(tmp_
     assert not (tmp_path / "runtime" / "document_activity_monitor_state.json").exists()
     mock_monitor.assert_not_called()
     mock_notify.assert_not_called()
+
+
+def test_document_activity_monitor_accepts_document_create_events(tmp_path):
+    class FakeProvider:
+        def list_asr_activity_log(self, **kwargs):
+            assert kwargs["entity_type"] == "document"
+            assert kwargs.get("action") is None
+            return {
+                "status": "ok",
+                "items": [
+                    {
+                        "id": 15,
+                        "entity_type": "document",
+                        "action": "create",
+                        "metadata": {"file_name": "mbl.pdf", "document_type": "master_bl"},
+                        "asr_request": {"request_number": "AN-12506"},
+                    }
+                ],
+            }
+
+    fake_report = {
+        "order_id": "AN-12506",
+        "report_json_path": str(tmp_path / "orders" / "AN-12506" / "document_monitoring" / "latest_report.json"),
+        "report_md_path": str(tmp_path / "orders" / "AN-12506" / "document_monitoring" / "latest_report.md"),
+        "lifecycle": {},
+        "registry_summary": {},
+        "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+    }
+
+    with patch("plugins.cargolo_ops.document_activity_monitor.build_tms_provider_from_env", return_value=FakeProvider()), patch(
+        "plugins.cargolo_ops.document_activity_monitor.run_document_monitoring", return_value=fake_report
+    ) as mock_monitor, patch(
+        "plugins.cargolo_ops.document_activity_monitor.send_manual_ops_notification", return_value={"enabled": True, "delivered": 1}
+    ):
+        result = run_document_activity_monitor(storage_root=tmp_path, max_events=1)
+
+    assert result["processed_count"] == 1
+    assert result["processed"][0]["activity_id"] == 15
+    mock_monitor.assert_called_once()

@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -151,3 +150,168 @@ def test_billing_document_analysis_hands_off_to_pricing_kb(tmp_path, monkeypatch
     marker_payload = json.loads(marker.read_text(encoding="utf-8"))
     assert marker_payload["source_skill"] == "cargolo-tms-document-monitoring"
     assert marker_payload["source_event"] == "document_analysis.analyzed"
+
+
+def test_tms_only_mirrored_document_is_analyzed_as_case_evidence(tmp_path):
+    case_root = tmp_path / "orders" / "AN-99999"
+    tms_dir = case_root / "documents" / "tms"
+    tms_dir.mkdir(parents=True, exist_ok=True)
+    doc_path = tms_dir / "NGP3497068.txt"
+    doc_path.write_text("MASTER BILL OF LADING NGP3497068 vessel EVER GREET", encoding="utf-8")
+
+    tms_doc = {
+        "tms_document_id": "doc-1",
+        "filename": doc_path.name,
+        "document_type": "master_bl",
+        "mirror_status": "mirrored",
+        "local_path": str(doc_path),
+        "sha256": "tms-sha-1",
+    }
+    registry = {
+        "received_documents": [],
+        "tms_documents": [dict(tms_doc)],
+        "mirrored_tms_documents": [dict(tms_doc)],
+        "expected_types": ["bill_of_lading"],
+        "received_types": [],
+        "missing_types": [],
+    }
+    llm_json = json.dumps(
+        {
+            "doc_type": "bill_of_lading",
+            "confidence": "high",
+            "summary": "Master B/L erkannt.",
+            "shipment_numbers": ["AN-99999"],
+            "references": ["NGP3497068"],
+            "suggested_registry_types": ["bill_of_lading"],
+            "extracted_fields": {"mbl_number": "NGP3497068", "vessel": "EVER GREET"},
+            "missing_or_unreadable": [],
+            "consistency_notes": [],
+            "operational_flags": [],
+            "reply_relevance": "high",
+        },
+        ensure_ascii=False,
+    )
+
+    with patch("plugins.cargolo_ops.document_analysis._resolve_task_provider_model", return_value=("openrouter", "google/gemini-3-flash-preview", None, None, "openai")), \
+         patch("plugins.cargolo_ops.document_analysis.call_llm", return_value=_FakeResponse(llm_json)):
+        updated_registry, open_questions = analyze_case_documents(
+            order_id="AN-99999",
+            case_root=case_root,
+            registry=registry,
+            tms_snapshot={"detail": {"freight_details": {"mbl_number": ""}}},
+        )
+
+    assert open_questions == []
+    assert updated_registry["received_documents"] == []
+    updated_tms_doc = updated_registry["tms_documents"][0]
+    assert updated_tms_doc["analysis_status"] == "analyzed"
+    assert updated_tms_doc["analysis_doc_type"] == "bill_of_lading"
+    assert updated_registry["analyzed_documents"][0]["filename"] == "NGP3497068.txt"
+    assert "bill_of_lading" in updated_registry["received_types"]
+
+
+def test_duplicate_mail_and_tms_document_propagates_analysis_to_tms_row(tmp_path):
+    case_root = tmp_path / "orders" / "AN-99998"
+    inbound = case_root / "documents" / "inbound"
+    inbound.mkdir(parents=True, exist_ok=True)
+    doc_path = inbound / "shared-ci.txt"
+    doc_path.write_text("Commercial invoice AN-99998 EUR 1000", encoding="utf-8")
+    shared_sha = "shared-sha"
+    registry = {
+        "received_documents": [{
+            "filename": doc_path.name,
+            "stored_path": str(doc_path),
+            "mime_type": "text/plain",
+            "sha256": shared_sha,
+            "detected_types": [],
+        }],
+        "tms_documents": [{
+            "tms_document_id": "doc-shared",
+            "filename": doc_path.name,
+            "document_type": "commercial_invoice",
+            "mirror_status": "mirrored",
+            "local_path": str(doc_path),
+            "sha256": shared_sha,
+        }],
+        "mirrored_tms_documents": [],
+        "expected_types": ["commercial_invoice"],
+        "received_types": [],
+        "missing_types": [],
+    }
+    llm_json = json.dumps({
+        "doc_type": "commercial_invoice",
+        "confidence": "high",
+        "summary": "Handelsrechnung erkannt.",
+        "shipment_numbers": ["AN-99998"],
+        "references": ["AN-99998"],
+        "suggested_registry_types": ["commercial_invoice"],
+        "extracted_fields": {"amount": "1000", "currency": "EUR"},
+        "missing_or_unreadable": [],
+        "consistency_notes": [],
+        "operational_flags": [],
+        "reply_relevance": "high",
+    }, ensure_ascii=False)
+
+    with patch("plugins.cargolo_ops.document_analysis._resolve_task_provider_model", return_value=("openrouter", "google/gemini-3-flash-preview", None, None, "openai")), \
+         patch("plugins.cargolo_ops.document_analysis.call_llm", return_value=_FakeResponse(llm_json)):
+        updated_registry, open_questions = analyze_case_documents(
+            order_id="AN-99998",
+            case_root=case_root,
+            registry=registry,
+            tms_snapshot={"detail": {}},
+        )
+
+    assert open_questions == []
+    assert updated_registry["received_documents"][0]["analysis_status"] == "analyzed"
+    assert updated_registry["tms_documents"][0]["analysis_status"] == "analyzed"
+    assert updated_registry["tms_documents"][0]["analysis_doc_type"] == "commercial_invoice"
+
+
+def test_mirrored_tms_documents_without_tms_documents_are_preserved(tmp_path):
+    case_root = tmp_path / "orders" / "AN-99997"
+    tms_dir = case_root / "documents" / "tms"
+    tms_dir.mkdir(parents=True, exist_ok=True)
+    doc_path = tms_dir / "hawb.txt"
+    doc_path.write_text("HAWB 1234567890 AN-99997", encoding="utf-8")
+    registry = {
+        "received_documents": [],
+        "tms_documents": [],
+        "mirrored_tms_documents": [{
+            "tms_document_id": "doc-orphan",
+            "filename": doc_path.name,
+            "document_type": "hawb",
+            "mirror_status": "mirrored",
+            "local_path": str(doc_path),
+            "sha256": "orphan-sha",
+        }],
+        "expected_types": ["hawb"],
+        "received_types": [],
+        "missing_types": [],
+    }
+    llm_json = json.dumps({
+        "doc_type": "hawb",
+        "confidence": "high",
+        "summary": "HAWB erkannt.",
+        "shipment_numbers": ["AN-99997"],
+        "references": ["1234567890"],
+        "suggested_registry_types": ["hawb"],
+        "extracted_fields": {"hawb_number": "1234567890"},
+        "missing_or_unreadable": [],
+        "consistency_notes": [],
+        "operational_flags": [],
+        "reply_relevance": "high",
+    }, ensure_ascii=False)
+
+    with patch("plugins.cargolo_ops.document_analysis._resolve_task_provider_model", return_value=("openrouter", "google/gemini-3-flash-preview", None, None, "openai")), \
+         patch("plugins.cargolo_ops.document_analysis.call_llm", return_value=_FakeResponse(llm_json)):
+        updated_registry, open_questions = analyze_case_documents(
+            order_id="AN-99997",
+            case_root=case_root,
+            registry=registry,
+            tms_snapshot={"detail": {}},
+        )
+
+    assert open_questions == []
+    assert len(updated_registry["tms_documents"]) == 1
+    assert len(updated_registry["mirrored_tms_documents"]) == 1
+    assert updated_registry["mirrored_tms_documents"][0]["analysis_status"] == "analyzed"

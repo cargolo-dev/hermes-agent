@@ -194,7 +194,14 @@ register = _teams_mod.register
 # ---------------------------------------------------------------------------
 
 def _make_config(**extra):
-    return PlatformConfig(enabled=True, extra=extra)
+    # Unit tests should not inherit the live gateway's CARGOLO env flags; tests
+    # that exercise those paths opt in explicitly.
+    merged = {
+        "cargolo_employee_handoff_enabled": False,
+        "cargolo_paperclip_teams_bridge_enabled": False,
+    }
+    merged.update(extra)
+    return PlatformConfig(enabled=True, extra=merged)
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +881,116 @@ class TestTeamsMessageHandling:
         assert handoff_calls[0]["user_name"] == "Test User"
 
     @pytest.mark.asyncio
+    async def test_cargolo_employee_dedicated_paperclip_bridge_reaches_handoff(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {"handled": False, "reason": "no_card_context"}
+
+        handoff_calls = []
+
+        def fake_handle_teams_employee_message(**kwargs):
+            handoff_calls.append(kwargs)
+            assert kwargs["config"].paperclip_bridge_enabled is True
+            assert kwargs["config"].paperclip_api_base == "http://127.0.0.1:3100"
+            return {
+                "handled": True,
+                "classification": "paperclip_case_assist",
+                "response_text": "Paperclip Chef hat übernommen.",
+                "should_write_tms": False,
+                "should_send_customer_message": False,
+            }
+
+        route_calls = []
+
+        def fake_route_teams_ops_message(**kwargs):
+            route_calls.append(kwargs)
+            return {
+                "handled": False,
+                "reason": "paperclip_bridge_case_assist",
+                "classification": "paperclip_case_assist_candidate",
+                "order_id": "AN-11755",
+                "allow_employee_handoff": True,
+            }
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", fake_route_teams_ops_message, raising=False)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids=["cargolo-hermes"],
+            cargolo_paperclip_teams_bridge_enabled=True,
+            cargolo_paperclip_api_base="http://127.0.0.1:3100",
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "paperclip-ack"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            text="Was ist mit AN-11755 los?",
+            activity_id="msg-employee-paperclip",
+            conversation_type="channel",
+            channel_data={"channel": {"id": "cargolo-hermes"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert "Paperclip Chef" in mock_app.send.call_args[0][1]
+        assert route_calls[0]["paperclip_bridge_enabled"] is True
+        assert handoff_calls[0]["text"] == "Was ist mit AN-11755 los?"
+
+    @pytest.mark.asyncio
+    async def test_cargolo_paperclip_pending_followup_polls_and_sends_result(self, monkeypatch):
+        poll_calls = []
+
+        def fake_poll_paperclip_issue_answer(**kwargs):
+            poll_calls.append(kwargs)
+            return {"answer": "Lage: Chef-Ergebnis ist da.", "timed_out": False}
+
+        monkeypatch.setattr(
+            "plugins.cargolo_ops.paperclip_teams_bridge.poll_paperclip_issue_answer",
+            fake_poll_paperclip_issue_answer,
+        )
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_paperclip_teams_bridge_enabled=True,
+            cargolo_paperclip_result_timeout_seconds=1,
+        ))
+        adapter.send = AsyncMock()
+
+        adapter._schedule_paperclip_followup_if_needed(
+            {
+                "paperclip_result_pending": True,
+                "paperclip_issue_id": "issue-1",
+                "paperclip_issue_identifier": "CAR-9",
+            },
+            conv_id="19:abc@thread.v2",
+            reply_to="teams-msg-1",
+        )
+
+        tasks = list(adapter._paperclip_followup_tasks)
+        assert tasks
+        await asyncio.wait_for(tasks[0], timeout=2)
+
+        adapter.send.assert_awaited_once_with(
+            "19:abc@thread.v2",
+            "Lage: Chef-Ergebnis ist da.",
+            reply_to="teams-msg-1",
+        )
+        assert poll_calls[0]["issue_id"] == "issue-1"
+        assert poll_calls[0]["timeout_seconds"] == 1.0
+
+    @pytest.mark.asyncio
     async def test_cargolo_employee_dedicated_free_chat_falls_through_to_generic_hermes(self, monkeypatch):
         def fake_handle_teams_message(**kwargs):
             return {"handled": False, "reason": "no_card_context"}
@@ -887,6 +1004,8 @@ class TestTeamsMessageHandling:
                 "reason": "generic_hermes_chat",
                 "classification": "free_chat",
                 "passthrough_text": kwargs.get("text"),
+                "allow_generic_chat": True,
+                "agent_prompt": "Rolle: Du bist Hermes CARGOLO in Microsoft Teams\nTeams-Nachricht: erzähl mal einen witz",
                 "response_text": None,
             }
 
@@ -924,8 +1043,10 @@ class TestTeamsMessageHandling:
         mock_app.send.assert_not_awaited()
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.call_args[0][0]
-        assert event.text == "erzähl mal einen witz"
-        assert len(handoff_calls) >= 1
+        assert event.text.startswith("Rolle: Du bist Hermes CARGOLO in Microsoft Teams")
+        assert "Teams-Nachricht: erzähl mal einen witz" in event.text
+        assert len(handoff_calls) == 1
+        assert len(route_calls) == 1
         assert route_calls[0]["text"] == "erzähl mal einen witz"
 
     @pytest.mark.asyncio

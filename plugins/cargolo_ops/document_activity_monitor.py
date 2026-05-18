@@ -640,7 +640,7 @@ def list_recent_document_uploads(
         admin_user_id=admin_user_id,
         an=an or None,
         entity_type="document",
-        action="upload",
+        action=None,
         date_from=date_from,
         date_to=date_to,
         page=page,

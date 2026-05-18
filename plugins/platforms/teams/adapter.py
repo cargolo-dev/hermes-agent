@@ -117,6 +117,20 @@ def _parse_bool(value: Any, *, default: bool = False) -> bool:
     return default
 
 
+def _parse_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def _parse_csv_set(value: Any) -> set[str]:
     """Parse config/env list values into a normalized string set."""
     if value is None:
@@ -650,6 +664,7 @@ class TeamsAdapter(BasePlatformAdapter):
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
         self._conv_refs: Dict[str, Any] = {}
+        self._paperclip_followup_tasks: set[asyncio.Task[Any]] = set()
         self._cargolo_employee_handoff_enabled = _parse_bool(
             extra.get("cargolo_employee_handoff_enabled")
             if "cargolo_employee_handoff_enabled" in extra
@@ -660,6 +675,142 @@ class TeamsAdapter(BasePlatformAdapter):
             extra.get("cargolo_employee_dedicated_channel_ids")
             or os.getenv("CARGOLO_TEAMS_EMPLOYEE_DEDICATED_CHANNEL_IDS")
         )
+        paperclip_bridge_raw = (
+            extra.get("cargolo_paperclip_teams_bridge_enabled")
+            if "cargolo_paperclip_teams_bridge_enabled" in extra
+            else extra.get("cargolo_paperclip_bridge_enabled")
+            if "cargolo_paperclip_bridge_enabled" in extra
+            else os.getenv("CARGOLO_PAPERCLIP_TEAMS_BRIDGE_ENABLED")
+            or os.getenv("CARGOLO_PAPERCLIP_BRIDGE_ENABLED")
+        )
+        self._cargolo_paperclip_bridge_enabled = _parse_bool(paperclip_bridge_raw, default=False)
+        self._cargolo_paperclip_api_base = extra.get("cargolo_paperclip_api_base") or os.getenv("CARGOLO_PAPERCLIP_API_BASE")
+        self._cargolo_paperclip_company_id = extra.get("cargolo_paperclip_company_id") or os.getenv("CARGOLO_PAPERCLIP_COMPANY_ID")
+        self._cargolo_paperclip_project_id = extra.get("cargolo_paperclip_project_id") or os.getenv("CARGOLO_PAPERCLIP_PROJECT_ID")
+        self._cargolo_paperclip_chef_agent_id = extra.get("cargolo_paperclip_chef_agent_id") or os.getenv("CARGOLO_PAPERCLIP_CHEF_AGENT_ID")
+        self._cargolo_paperclip_wait_timeout_seconds = _parse_optional_float(
+            extra.get("cargolo_paperclip_wait_timeout_seconds") or os.getenv("CARGOLO_PAPERCLIP_WAIT_TIMEOUT_SECONDS")
+        )
+        self._cargolo_paperclip_poll_interval_seconds = _parse_optional_float(
+            extra.get("cargolo_paperclip_poll_interval_seconds") or os.getenv("CARGOLO_PAPERCLIP_POLL_INTERVAL_SECONDS")
+        )
+        self._cargolo_paperclip_request_timeout_seconds = _parse_optional_float(
+            extra.get("cargolo_paperclip_request_timeout_seconds") or os.getenv("CARGOLO_PAPERCLIP_REQUEST_TIMEOUT_SECONDS")
+        )
+        self._cargolo_paperclip_result_timeout_seconds = _parse_optional_float(
+            extra.get("cargolo_paperclip_result_timeout_seconds") or os.getenv("CARGOLO_PAPERCLIP_RESULT_TIMEOUT_SECONDS")
+        )
+        self._cargolo_paperclip_wakeup_after_create = _parse_bool(
+            extra.get("cargolo_paperclip_wakeup_after_create")
+            if "cargolo_paperclip_wakeup_after_create" in extra
+            else os.getenv("CARGOLO_PAPERCLIP_WAKEUP_AFTER_CREATE"),
+            default=False,
+        )
+
+    def _build_cargolo_handoff_config(self) -> Any:
+        from plugins.cargolo_ops.teams_employee_handoff import TeamsHandoffConfig
+
+        return TeamsHandoffConfig(
+            dedicated_channel_ids=self._cargolo_employee_dedicated_channel_ids,
+            paperclip_bridge_enabled=self._cargolo_paperclip_bridge_enabled,
+            paperclip_api_base=self._cargolo_paperclip_api_base,
+            paperclip_company_id=self._cargolo_paperclip_company_id,
+            paperclip_project_id=self._cargolo_paperclip_project_id,
+            paperclip_chef_agent_id=self._cargolo_paperclip_chef_agent_id,
+            paperclip_wait_timeout_seconds=self._cargolo_paperclip_wait_timeout_seconds,
+            paperclip_poll_interval_seconds=self._cargolo_paperclip_poll_interval_seconds,
+            paperclip_request_timeout_seconds=self._cargolo_paperclip_request_timeout_seconds,
+            paperclip_wakeup_after_create=self._cargolo_paperclip_wakeup_after_create,
+        )
+
+    def _build_paperclip_bridge_config(self) -> Any:
+        from plugins.cargolo_ops.paperclip_teams_bridge import PaperclipTeamsBridgeConfig
+
+        env_config = PaperclipTeamsBridgeConfig.from_env(enabled=self._cargolo_paperclip_bridge_enabled)
+        return PaperclipTeamsBridgeConfig(
+            enabled=bool(self._cargolo_paperclip_bridge_enabled),
+            api_base=(self._cargolo_paperclip_api_base or env_config.api_base).rstrip("/"),
+            company_id=self._cargolo_paperclip_company_id or env_config.company_id,
+            project_id=self._cargolo_paperclip_project_id or env_config.project_id,
+            chef_agent_id=self._cargolo_paperclip_chef_agent_id or env_config.chef_agent_id,
+            issue_priority=env_config.issue_priority,
+            issue_work_mode=env_config.issue_work_mode,
+            wait_timeout_seconds=(
+                self._cargolo_paperclip_wait_timeout_seconds
+                if self._cargolo_paperclip_wait_timeout_seconds is not None
+                else env_config.wait_timeout_seconds
+            ),
+            poll_interval_seconds=(
+                self._cargolo_paperclip_poll_interval_seconds
+                if self._cargolo_paperclip_poll_interval_seconds is not None
+                else env_config.poll_interval_seconds
+            ),
+            wakeup_after_create=bool(self._cargolo_paperclip_wakeup_after_create),
+            request_timeout_seconds=(
+                self._cargolo_paperclip_request_timeout_seconds
+                if self._cargolo_paperclip_request_timeout_seconds is not None
+                else env_config.request_timeout_seconds
+            ),
+        )
+
+    def _schedule_paperclip_followup_if_needed(
+        self,
+        handoff_result: dict[str, Any],
+        *,
+        conv_id: str,
+        reply_to: str | None,
+    ) -> None:
+        if not handoff_result.get("paperclip_result_pending"):
+            return
+        issue_id = str(handoff_result.get("paperclip_issue_id") or "").strip()
+        if not issue_id or not conv_id:
+            return
+        task = asyncio.create_task(
+            self._poll_and_send_paperclip_followup(
+                issue_id=issue_id,
+                issue_identifier=str(handoff_result.get("paperclip_issue_identifier") or issue_id),
+                conv_id=str(conv_id),
+                reply_to=reply_to,
+            )
+        )
+        self._paperclip_followup_tasks.add(task)
+
+        def _done(done_task: asyncio.Task[Any]) -> None:
+            self._paperclip_followup_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.debug("[teams] Paperclip follow-up task failed", exc_info=True)
+
+        task.add_done_callback(_done)
+
+    async def _poll_and_send_paperclip_followup(
+        self,
+        *,
+        issue_id: str,
+        issue_identifier: str,
+        conv_id: str,
+        reply_to: str | None,
+    ) -> None:
+        from plugins.cargolo_ops.paperclip_teams_bridge import poll_paperclip_issue_answer
+
+        timeout = self._cargolo_paperclip_result_timeout_seconds
+        if timeout is None:
+            timeout = max(120.0, (self._cargolo_paperclip_wait_timeout_seconds or 8.0) * 30.0)
+        result = await asyncio.to_thread(
+            poll_paperclip_issue_answer,
+            issue_id=issue_id,
+            config=self._build_paperclip_bridge_config(),
+            timeout_seconds=timeout,
+            poll_interval_seconds=self._cargolo_paperclip_poll_interval_seconds,
+        )
+        answer = str(result.get("answer") or "").strip() if isinstance(result, dict) else ""
+        if not answer:
+            logger.info("[teams] Paperclip follow-up timed out/no answer for %s", issue_identifier)
+            return
+        await self.send(conv_id, answer, reply_to=reply_to)
 
     def format_message(self, content: str) -> str:
         """Format plain Hermes text so Teams keeps paragraph/list breaks.
@@ -756,6 +907,9 @@ class TeamsAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._running = False
+        for task in list(self._paperclip_followup_tasks):
+            task.cancel()
+        self._paperclip_followup_tasks.clear()
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -821,6 +975,8 @@ class TeamsAdapter(BasePlatformAdapter):
 
         handoff_channel_id = ""
         conv_handoff_id = str(getattr(conv, "id", "") or "").strip()
+        dedicated_handoff_ran = False
+        dedicated_generic_prompt_applied = False
         if self._cargolo_employee_handoff_enabled:
             handoff_channel_id = self._extract_cargolo_handoff_channel_id(activity)
             # Some Teams payloads expose both a human channel id in channelData and
@@ -864,6 +1020,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 user_id=str(user_id),
                 user_name=user_name,
                 message_id=str(msg_id) if msg_id else None,
+                paperclip_bridge_enabled=self._cargolo_paperclip_bridge_enabled,
             )
             if ops_result.get("handled"):
                 await self.send(
@@ -879,10 +1036,7 @@ class TeamsAdapter(BasePlatformAdapter):
                         )
                 return
 
-            from plugins.cargolo_ops.teams_employee_handoff import (
-                TeamsHandoffConfig,
-                handle_teams_employee_message,
-            )
+            from plugins.cargolo_ops.teams_employee_handoff import handle_teams_employee_message
 
             handoff_result = handle_teams_employee_message(
                 root=get_hermes_home() / "cargolo_asr",
@@ -891,17 +1045,24 @@ class TeamsAdapter(BasePlatformAdapter):
                 message_id=str(msg_id) if msg_id else "",
                 user_id=str(user_id) if user_id else None,
                 user_name=user_name or None,
-                config=TeamsHandoffConfig(
-                    dedicated_channel_ids=self._cargolo_employee_dedicated_channel_ids,
-                ),
+                config=self._build_cargolo_handoff_config(),
             )
+            dedicated_handoff_ran = True
             if handoff_result.get("handled"):
                 await self.send(
                     str(conv.id),
                     str(handoff_result.get("response_text") or "Gespeichert."),
                     reply_to=str(msg_id) if msg_id else None,
                 )
+                self._schedule_paperclip_followup_if_needed(
+                    handoff_result,
+                    conv_id=str(conv.id),
+                    reply_to=str(msg_id) if msg_id else None,
+                )
                 return
+            if handoff_result.get("allow_generic_chat") and handoff_result.get("agent_prompt"):
+                text = str(handoff_result.get("agent_prompt"))
+                dedicated_generic_prompt_applied = True
 
         # CARGOLO ASR Teams reply loop: replies to operator cards are
         # deterministic case-learning/control events, not generic chat.
@@ -924,12 +1085,9 @@ class TeamsAdapter(BasePlatformAdapter):
                 asr_agent_prompt = str(reply_result.get("agent_prompt"))
                 text = asr_agent_prompt
             else:
-                if self._cargolo_employee_handoff_enabled:
+                if self._cargolo_employee_handoff_enabled and not dedicated_handoff_ran:
                     from hermes_constants import get_hermes_home
-                    from plugins.cargolo_ops.teams_employee_handoff import (
-                        TeamsHandoffConfig,
-                        handle_teams_employee_message,
-                    )
+                    from plugins.cargolo_ops.teams_employee_handoff import handle_teams_employee_message
 
                     handoff_text = text
                     if had_teams_at_mention and handoff_channel_id not in self._cargolo_employee_dedicated_channel_ids:
@@ -941,9 +1099,7 @@ class TeamsAdapter(BasePlatformAdapter):
                         message_id=str(msg_id) if msg_id else "",
                         user_id=str(user_id) if user_id else None,
                         user_name=user_name or None,
-                        config=TeamsHandoffConfig(
-                            dedicated_channel_ids=self._cargolo_employee_dedicated_channel_ids,
-                        ),
+                        config=self._build_cargolo_handoff_config(),
                     )
                     if handoff_result.get("handled"):
                         await self.send(
@@ -951,33 +1107,43 @@ class TeamsAdapter(BasePlatformAdapter):
                             str(handoff_result.get("response_text") or "Gespeichert."),
                             reply_to=str(msg_id) if msg_id else None,
                         )
+                        self._schedule_paperclip_followup_if_needed(
+                            handoff_result,
+                            conv_id=str(conv.id),
+                            reply_to=str(msg_id) if msg_id else None,
+                        )
                         return
+                    if handoff_result.get("allow_generic_chat") and handoff_result.get("agent_prompt"):
+                        text = str(handoff_result.get("agent_prompt"))
+                        dedicated_generic_prompt_applied = True
 
-                from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message
+                if not dedicated_generic_prompt_applied:
+                    from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message
 
-                ops_result = route_teams_ops_message(
-                    text=text,
-                    chat_id=str(conv.id),
-                    user_id=str(user_id),
-                    user_name=user_name,
-                    message_id=str(msg_id) if msg_id else None,
-                )
-                if ops_result.get("handled"):
-                    await self.send(str(conv.id), str(ops_result.get("response_text") or "Gespeichert."), reply_to=str(msg_id) if msg_id else None)
-                    for pending_action in ops_result.get("teams_tms_review_cards") or []:
-                        if isinstance(pending_action, dict):
-                            await self.send_cargolo_asr_tms_review_card(str(conv.id), pending_action, reply_to=str(msg_id) if msg_id else None)
-                    return
-                if ops_result.get("allow_generic_chat") and ops_result.get("agent_prompt"):
-                    asr_agent_prompt = str(ops_result.get("agent_prompt"))
-                    text = asr_agent_prompt
-                elif self._looks_like_cargolo_asr_control_message(text):
-                    await self.send(
-                        str(conv.id),
-                        "Ich erkenne eine CARGOLO-ASR/TMS-Anweisung, kann sie aber nicht eindeutig einer Operator-Karte zuordnen. Bitte auf die konkrete ASR-Karte antworten/quote-reply und @Hermes CARGOLO erwähnen; ich lege TMS-Änderungen dann nur als Review-Vorschlag ab.",
-                        reply_to=str(msg_id) if msg_id else None,
+                    ops_result = route_teams_ops_message(
+                        text=text,
+                        chat_id=str(conv.id),
+                        user_id=str(user_id),
+                        user_name=user_name,
+                        message_id=str(msg_id) if msg_id else None,
+                        paperclip_bridge_enabled=self._cargolo_paperclip_bridge_enabled,
                     )
-                    return
+                    if ops_result.get("handled"):
+                        await self.send(str(conv.id), str(ops_result.get("response_text") or "Gespeichert."), reply_to=str(msg_id) if msg_id else None)
+                        for pending_action in ops_result.get("teams_tms_review_cards") or []:
+                            if isinstance(pending_action, dict):
+                                await self.send_cargolo_asr_tms_review_card(str(conv.id), pending_action, reply_to=str(msg_id) if msg_id else None)
+                        return
+                    if ops_result.get("allow_generic_chat") and ops_result.get("agent_prompt"):
+                        asr_agent_prompt = str(ops_result.get("agent_prompt"))
+                        text = asr_agent_prompt
+                    elif self._looks_like_cargolo_asr_control_message(text):
+                        await self.send(
+                            str(conv.id),
+                            "Ich erkenne eine CARGOLO-ASR/TMS-Anweisung, kann sie aber nicht eindeutig einer Operator-Karte zuordnen. Bitte auf die konkrete ASR-Karte antworten/quote-reply und @Hermes CARGOLO erwähnen; ich lege TMS-Änderungen dann nur als Review-Vorschlag ab.",
+                            reply_to=str(msg_id) if msg_id else None,
+                        )
+                        return
         except Exception as e:
             logger.warning("[teams] CARGOLO ASR reply loop failed; suppressing generic chat fallback for safety: %s", e)
             if self._looks_like_cargolo_asr_control_message(text):
