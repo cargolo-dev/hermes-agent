@@ -450,7 +450,6 @@ def route_teams_ops_message(
     user_id: str | None = None,
     user_name: str | None = None,
     message_id: str | None = None,
-    paperclip_bridge_enabled: bool = False,
 ) -> dict[str, Any]:
     """Route non-card CARGOLO Teams messages.
 
@@ -493,8 +492,8 @@ def route_teams_ops_message(
         }
 
     # TMS-looking free text with AN but no card context: guard in-channel before
-    # local deep-dive/Paperclip handoff. `_CASE_CHECK_RE` also contains
-    # "aktualisier", so write-like text must be protected first.
+    # local deep-dive handoff. `_CASE_CHECK_RE` also contains "aktualisier",
+    # so write-like text must be protected first.
     if order_id and _WRITE_RE.search(raw) and _TMS_FIELD_RE.search(raw):
         return {
             "handled": True,
@@ -509,21 +508,11 @@ def route_teams_ops_message(
 
     # Case deep-dive: for "gib mir alles" / complete case questions, refresh the
     # canonical local case first (create if missing, update if present), then
-    # synthesize from the refreshed local TMS/mail/document evidence. When the
-    # Paperclip bridge is enabled, let the employee handoff create a Chef issue
-    # instead of swallowing the Fallfrage in this older local deep-dive path.
+    # synthesize from the refreshed local TMS/mail/document evidence.
     if order_id and (_CASE_CHECK_RE.search(raw) or _FULL_CASE_RE.search(raw) or "komplett" in lowered or "case" in lowered):
         live_exists = _live_shipment_exists(order_id)
         if live_exists is False:
             return _unknown_shipment_response(order_id)
-        if paperclip_bridge_enabled:
-            return {
-                "handled": False,
-                "reason": "paperclip_bridge_case_assist",
-                "classification": "paperclip_case_assist_candidate",
-                "order_id": order_id,
-                "allow_employee_handoff": True,
-            }
         return _run_local_case_deep_dive(root=case_root, order_id=order_id, text=raw, user_name=user_name)
 
     # General CARGOLO/ASR mentions should get the employee prompt rather than generic chatbot tone.

@@ -231,7 +231,7 @@ def test_tms_like_free_text_without_card_context_is_guarded(tmp_path: Path) -> N
     assert "Review-Vorschlag" in result["response_text"]
 
 
-def test_paperclip_bridge_deep_dive_falls_through_to_employee_handoff(tmp_path: Path, monkeypatch) -> None:
+def test_deep_dive_runs_local_case_assist_directly(tmp_path: Path, monkeypatch) -> None:
     calls = []
 
     def fake_deep_dive(**kwargs):
@@ -244,27 +244,22 @@ def test_paperclip_bridge_deep_dive_falls_through_to_employee_handoff(tmp_path: 
     result = route_teams_ops_message(
         text="prüfe AN-12345 komplett",
         root=tmp_path / "cargolo_asr",
-        paperclip_bridge_enabled=True,
     )
 
-    assert result["handled"] is False
-    assert result["reason"] == "paperclip_bridge_case_assist"
-    assert result["classification"] == "paperclip_case_assist_candidate"
-    assert result["order_id"] == "AN-12345"
-    assert result["allow_employee_handoff"] is True
-    assert calls == []
+    assert result["handled"] is True
+    assert result["classification"] == "case_deep_dive_local_refresh"
+    assert calls[0]["order_id"] == "AN-12345"
 
 
-def test_paperclip_bridge_tms_write_still_guarded_before_case_handoff(tmp_path: Path, monkeypatch) -> None:
+def test_tms_write_still_guarded_before_case_handoff(tmp_path: Path, monkeypatch) -> None:
     def fake_deep_dive(**kwargs):
-        raise AssertionError("write-like TMS text must not enter deep-dive/Paperclip route")
+        raise AssertionError("write-like TMS text must not enter deep-dive route")
 
     monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router._run_local_case_deep_dive", fake_deep_dive)
 
     result = route_teams_ops_message(
         text="aktualisiere MRN 26DE99999 in AN-11755 im TMS",
         root=tmp_path / "cargolo_asr",
-        paperclip_bridge_enabled=True,
     )
 
     assert result["handled"] is True
