@@ -468,11 +468,6 @@ def route_teams_ops_message(
     order_match = _ORDER_RE.search(raw)
     order_id = order_match.group(0).upper() if order_match else None
 
-    if order_id:
-        live_exists = _live_shipment_exists(order_id)
-        if live_exists is False:
-            return _unknown_shipment_response(order_id)
-
     correction_followup = _route_correction_followup(
         raw=raw,
         root=case_root,
@@ -518,6 +513,9 @@ def route_teams_ops_message(
     # Paperclip bridge is enabled, let the employee handoff create a Chef issue
     # instead of swallowing the Fallfrage in this older local deep-dive path.
     if order_id and (_CASE_CHECK_RE.search(raw) or _FULL_CASE_RE.search(raw) or "komplett" in lowered or "case" in lowered):
+        live_exists = _live_shipment_exists(order_id)
+        if live_exists is False:
+            return _unknown_shipment_response(order_id)
         if paperclip_bridge_enabled:
             return {
                 "handled": False,

@@ -42,6 +42,7 @@ _TERMINAL_RUN_STATUSES = {
     "skipped",
 }
 _TERMINAL_ISSUE_STATUSES = {"done", "cancelled", "canceled", "archived"}
+_ORDER_RE = re.compile(r"\b(?:AN|BU)-\d{3,}\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,196 @@ def _stable_key(*parts: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def _normalize_order_id(*values: Any) -> str | None:
+    for value in values:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        match = _ORDER_RE.search(raw)
+        if match:
+            return match.group(0).upper()
+    return None
+
+
+def _read_json_file(path: Path) -> Any:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _json_payload_has_content(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        return any(value not in (None, "", [], {}) for value in payload.values())
+    if isinstance(payload, list):
+        return bool(payload)
+    return payload not in (None, "")
+
+
+def _json_file_has_content(path: Path) -> bool:
+    return _json_payload_has_content(_read_json_file(path))
+
+
+def _file_has_bytes(path: Path) -> bool:
+    try:
+        return path.exists() and path.is_file() and path.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def _jsonl_has_rows(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _registry_has_document_evidence(registry: Any) -> bool:
+    if not isinstance(registry, dict):
+        return False
+    evidence_keys = (
+        "received_types",
+        "expected_types",
+        "received_documents",
+        "tms_documents",
+        "mirrored_tms_documents",
+        "tms_mirroring_gaps",
+        "analyzed_documents",
+        "missing_types",
+    )
+    return any(bool(registry.get(key)) for key in evidence_keys)
+
+
+def _local_case_evidence_status(root: Path, order_id: str) -> dict[str, Any]:
+    """Return whether the local case has enough read-only evidence for Paperclip.
+
+    A bare `orders/<AN>/employee` or CaseStore skeleton is not enough. For the
+    Paperclip/Chef handoff we want local TMS + mail history + document registry +
+    document analysis evidence to be present before the agent answers from the
+    local case. Missing evidence triggers the TMS-first lifecycle sync.
+    """
+
+    normalized = _normalize_order_id(order_id) or str(order_id or "").strip().upper()
+    case_root = root / "orders" / normalized
+    registry_path = case_root / "documents" / "registry.json"
+    registry = _read_json_file(registry_path)
+    tms_ready = _json_file_has_content(case_root / "tms" / "shipment_detail.json") or _json_file_has_content(case_root / "tms_snapshot.json")
+    mail_ready = _jsonl_has_rows(case_root / "email_index.jsonl")
+    registry_ready = _registry_has_document_evidence(registry)
+    analysis_path = None
+    if isinstance(registry, dict):
+        raw_analysis_path = str(registry.get("document_analysis_summary_path") or "").strip()
+        if raw_analysis_path:
+            candidate = Path(raw_analysis_path)
+            analysis_path = candidate if candidate.is_absolute() else case_root / candidate
+    default_analysis_path = case_root / "documents" / "analysis" / "latest_summary.json"
+    analysis_ready = _file_has_bytes(default_analysis_path) or bool(analysis_path and _file_has_bytes(analysis_path))
+    exists = case_root.exists()
+    evidence = {
+        "case_folder": exists,
+        "tms": tms_ready,
+        "mail_history": mail_ready,
+        "document_registry": registry_ready,
+        "document_analysis": analysis_ready,
+    }
+    missing = [name for name, present in evidence.items() if not present]
+    return {
+        "status": "local_ready" if not missing else "incomplete",
+        "order_id": normalized,
+        "case_root": str(case_root),
+        "answerable_from_local": not missing,
+        "evidence": evidence,
+        "missing": missing,
+    }
+
+
+def _sync_case_lifecycle(order_id: str, **kwargs: Any) -> dict[str, Any]:
+    from .case_lifecycle import sync_case_lifecycle
+
+    return sync_case_lifecycle(order_id, **kwargs)
+
+
+def _run_local_case_preflight(root: Path, order_id: str | None) -> dict[str, Any]:
+    if not order_id:
+        return {"status": "skipped", "reason": "no_order_id", "answerable_from_local": False}
+    before = _local_case_evidence_status(root, order_id)
+    if before.get("answerable_from_local"):
+        return before
+    try:
+        sync_result = _sync_case_lifecycle(
+            order_id,
+            storage_root=root,
+            refresh_history=True,
+            analyze_documents=True,
+        )
+    except Exception as exc:
+        return {
+            "status": "sync_error",
+            "order_id": order_id,
+            "case_root": before.get("case_root"),
+            "answerable_from_local": False,
+            "missing_before": before.get("missing") or [],
+            "evidence_before": before.get("evidence") or {},
+            "error": str(exc),
+        }
+    if isinstance(sync_result, dict) and sync_result.get("status") == "skipped":
+        return {
+            "status": "skipped",
+            "order_id": order_id,
+            "reason": sync_result.get("reason"),
+            "message": sync_result.get("message"),
+            "answerable_from_local": False,
+            "missing_before": before.get("missing") or [],
+            "evidence_before": before.get("evidence") or {},
+            "sync_result": sync_result,
+        }
+    after = _local_case_evidence_status(root, order_id)
+    return {
+        "status": "synced",
+        "order_id": order_id,
+        "case_root": after.get("case_root") or before.get("case_root"),
+        "answerable_from_local": bool(after.get("answerable_from_local")),
+        "missing_before": before.get("missing") or [],
+        "missing_after": after.get("missing") or [],
+        "evidence_before": before.get("evidence") or {},
+        "evidence_after": after.get("evidence") or {},
+        "sync_result": sync_result,
+    }
+
+
+def _preflight_description(local_case_preflight: dict[str, Any] | None) -> str:
+    if not local_case_preflight:
+        return "Lokaler Case-Preflight: nicht ausgeführt."
+    status = local_case_preflight.get("status") or "unbekannt"
+    case_root = local_case_preflight.get("case_root") or "n/a"
+    answerable = "ja" if local_case_preflight.get("answerable_from_local") else "nein/teilweise"
+    missing = local_case_preflight.get("missing_after") or local_case_preflight.get("missing") or []
+    if not isinstance(missing, list):
+        missing = [str(missing)]
+    sync_result = local_case_preflight.get("sync_result") if isinstance(local_case_preflight.get("sync_result"), dict) else {}
+    history_count = sync_result.get("history_sync_count") if isinstance(sync_result, dict) else None
+    reason = local_case_preflight.get("reason") or (sync_result.get("reason") if isinstance(sync_result, dict) else None)
+    lines = [
+        "Lokaler Case-Preflight:",
+        f"- Status: {status}",
+        f"- Case-Pfad: {case_root}",
+        f"- Lokale Antwortbasis vollständig: {answerable}",
+        f"- Fehlende Evidenz nach Preflight: {', '.join(str(item) for item in missing) if missing else '-'}",
+    ]
+    if history_count is not None:
+        lines.append(f"- Mail-Historie Sync Count: {history_count}")
+    if reason:
+        lines.append(f"- Grund/Hinweis: {reason}")
+    return "\n".join(lines)
+
+
 def _build_issue_description(
     *,
     request: EmployeeRequest,
@@ -159,8 +350,9 @@ def _build_issue_description(
     message_id: str,
     user_id: str | None,
     user_name: str | None,
+    local_case_preflight: dict[str, Any] | None = None,
 ) -> str:
-    order_id = response.order_id or request.order_id or "nicht eindeutig"
+    order_id = response.order_id or request.order_id or _normalize_order_id(request.text) or "nicht eindeutig"
     actor = user_name or user_id or request.actor or "Teams Operator"
     return f"""CARGOLO Teams-Fallfrage für Paperclip Chef.
 
@@ -171,6 +363,8 @@ Teams-Kontext:
 - Channel/Conversation: {channel_id or 'n/a'}
 - Message ID: {message_id or 'n/a'}
 - Order/Case: {order_id}
+
+{_preflight_description(local_case_preflight)}
 
 Chef-Auftrag:
 1. Koordiniere die passenden CARGOLO-Agenten/Spezialisten (z.B. Case Brain, Document Monitor) für diese operative Fallfrage.
@@ -205,6 +399,7 @@ def _create_chef_issue(
     message_id: str,
     user_id: str | None,
     user_name: str | None,
+    local_case_preflight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "projectId": config.project_id,
@@ -216,6 +411,7 @@ def _create_chef_issue(
             message_id=message_id,
             user_id=user_id,
             user_name=user_name,
+            local_case_preflight=local_case_preflight,
         ),
         "assigneeAgentId": config.chef_agent_id,
         "priority": config.issue_priority,
@@ -323,6 +519,63 @@ def _looks_probably_truncated(text: str) -> bool:
     return bool(re.search(r"[A-Za-zÄÖÜäöüß]{3,}$", tail))
 
 
+def _looks_probably_like_truncated_json(text: str) -> bool:
+    """Return whether a JSON-looking run payload appears clipped/corrupt.
+
+    Paperclip may expose adapter results either as JSON objects or as stringified
+    JSON excerpts. If the stringified form is clipped, we can still use the
+    explicit TEAMS_ANTWORT marker for detection, but we must not forward an
+    incomplete mid-word answer to Teams.
+    """
+
+    cleaned = str(text or "").strip()
+    if not cleaned or cleaned[0] not in "[{":
+        return False
+    try:
+        json.loads(cleaned)
+        return False
+    except json.JSONDecodeError as exc:
+        if "unterminated string" in exc.msg.lower():
+            return True
+        if exc.pos >= max(0, len(cleaned) - 4):
+            return True
+        if cleaned.count('"') % 2 == 1:
+            return True
+        return cleaned[-1:] not in "}]"
+
+
+def _unescape_jsonish_text(text: str) -> str:
+    return (
+        str(text or "")
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\\/", "/")
+    )
+
+
+def _extract_marker_segment_from_jsonish_text(text: str) -> str | None:
+    candidate = _unescape_jsonish_text(text)
+    match = re.search(r"TEAMS_ANTWORT\s*:", candidate, flags=re.IGNORECASE)
+    if not match:
+        return None
+    segment = candidate[match.start() :].strip()
+    # If the marker came from a broken JSON string, drop obvious trailing JSON
+    # quote/brace noise while keeping the answer itself intact.
+    return segment.rstrip().rstrip('"}]}').strip()
+
+
+def _jsonish_marker_segment_looks_incomplete(text: str) -> bool:
+    cleaned = str(text or "").rstrip()
+    if not cleaned:
+        return True
+    if re.search(r"[.!?…\])}>'\"]\s*$", cleaned):
+        return False
+    return bool(re.search(r"[A-Za-zÄÖÜäöüß]{3,}$", cleaned[-24:]))
+
+
 def _extract_teams_answer(body: str, *, require_marker: bool = False) -> str | None:
     text = _strip_code_fence(body)
     marker = re.match(r"\s*TEAMS_ANTWORT\s*:\s*", text, flags=re.IGNORECASE)
@@ -395,20 +648,47 @@ def _run_issue_id(run: Any) -> str:
     return ""
 
 
+def _collect_run_result_texts(payload: Any) -> list[str]:
+    texts: list[str] = []
+    if isinstance(payload, dict):
+        for key in ("result", "summary", "text", "message", "answer", "output"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.extend(_collect_run_result_texts(value))
+        for value in payload.values():
+            if isinstance(value, (dict, list)):
+                texts.extend(_collect_run_result_texts(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            texts.extend(_collect_run_result_texts(item))
+    elif isinstance(payload, str):
+        raw = payload.strip()
+        if not raw:
+            return texts
+        if raw[0] in "[{":
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                if _looks_probably_like_truncated_json(raw):
+                    marker_segment = _extract_marker_segment_from_jsonish_text(raw)
+                    if marker_segment and not _jsonish_marker_segment_looks_incomplete(marker_segment):
+                        texts.append(marker_segment)
+            else:
+                texts.extend(_collect_run_result_texts(decoded))
+                return texts
+        texts.append(raw)
+    return texts
+
+
 def _run_result_texts(run: Any) -> list[str]:
     if not isinstance(run, dict):
         return []
     result_json = run.get("resultJson") or run.get("result_json")
-    texts: list[str] = []
-    if isinstance(result_json, dict):
-        for key in ("result", "summary", "text", "message"):
-            value = result_json.get(key)
-            if isinstance(value, str) and value.strip():
-                texts.append(value.strip())
+    texts: list[str] = _collect_run_result_texts(result_json)
     for key in ("stdoutExcerpt", "stdout_excerpt"):
         value = run.get(key)
         if isinstance(value, str) and value.strip():
-            texts.append(value.strip())
+            texts.extend(_collect_run_result_texts(value))
     return texts
 
 
@@ -559,6 +839,18 @@ def _fallback_response(issue: dict[str, Any], *, run_status: str | None = None) 
     )
 
 
+def _progress_response(issue: dict[str, Any], *, order_id: str | None, local_case_preflight: dict[str, Any] | None = None) -> str:
+    identifier = _issue_identifier(issue)
+    subject = order_id or "die Fallfrage"
+    preflight_status = str((local_case_preflight or {}).get("status") or "gestartet")
+    return (
+        f"Bin dran: {subject} ist im CARGOLO Operations Board angelegt ({identifier}).\n"
+        f"Lage: Lokaler Case-Preflight ist {preflight_status}; TMS, Mail-Historie und Dokumente werden read-only geprüft.\n"
+        "Sicherheit: Keine TMS-Writes, keine Kunden-/Partnermails, kein Dokumentupload.\n"
+        "Ergebnis folgt hier automatisch als Antwort, sobald der CARGOLO Operations Lauf fertig ist."
+    )
+
+
 def handle_paperclip_teams_case_assist(
     *,
     root: Path,
@@ -580,6 +872,8 @@ def handle_paperclip_teams_case_assist(
     started_at = utc_now_iso()
     if not bridge_config.enabled:
         return {"handled": False, "reason": "paperclip_bridge_disabled"}
+    order_id = _normalize_order_id(response.order_id, request.order_id, request.text)
+    local_case_preflight: dict[str, Any] | None = None
 
     audit_base: dict[str, Any] = {
         "timestamp": started_at,
@@ -588,7 +882,7 @@ def handle_paperclip_teams_case_assist(
         "message_id": message_id,
         "user_id": user_id,
         "user_name": user_name,
-        "order_id": response.order_id or request.order_id,
+        "order_id": order_id,
         "request_text": request.text,
         "company_id": bridge_config.company_id,
         "project_id": bridge_config.project_id,
@@ -599,6 +893,29 @@ def handle_paperclip_teams_case_assist(
     }
 
     try:
+        local_case_preflight = _run_local_case_preflight(root, order_id)
+        if local_case_preflight.get("status") == "skipped" and local_case_preflight.get("reason") == "shipment_not_found_in_tms":
+            result = {
+                "handled": True,
+                "classification": "shipment_not_found_in_tms",
+                "handoff_target": "paperclip_chef",
+                "order_id": order_id,
+                "response_text": (
+                    f"{order_id} finde ich nicht im ASR-TMS.\n"
+                    "Lage: Ich stoppe TMS-first und lege kein Paperclip-Issue an; keine Mail-/n8n-Suche.\n"
+                    "Sicherheit: Kein TMS-Write, keine Kunden-/Partnermail, kein Dokumentupload.\n"
+                    "Nächster Schritt: AN/BU prüfen oder die Sendung zuerst im TMS anlegen/finden."
+                ),
+                "local_case_preflight": local_case_preflight,
+                "paperclip_result_pending": False,
+                "suppress_initial_response": False,
+                "should_send_to_teams": False,
+                "should_write_tms": False,
+                "should_send_customer_message": False,
+            }
+            _append_jsonl(root / "runtime" / "paperclip_teams_bridge.jsonl", {**audit_base, **result, "status": "skipped"})
+            return result
+
         issue = _create_chef_issue(
             config=bridge_config,
             request=request,
@@ -607,6 +924,7 @@ def handle_paperclip_teams_case_assist(
             message_id=message_id,
             user_id=user_id,
             user_name=user_name,
+            local_case_preflight=local_case_preflight,
         )
         wakeup: dict[str, Any] | None = None
         if bridge_config.wakeup_after_create:
@@ -619,13 +937,14 @@ def handle_paperclip_teams_case_assist(
             )
         answer, run_status = _wait_for_issue_answer(bridge_config, issue)
         fallback_text = _fallback_response(issue, run_status=run_status)
-        response_text = answer or fallback_text
+        response_text = answer or _progress_response(issue, order_id=order_id, local_case_preflight=local_case_preflight)
         result = {
             "handled": True,
             "classification": "paperclip_case_assist",
             "handoff_target": "paperclip_chef",
-            "order_id": response.order_id or request.order_id,
+            "order_id": order_id,
             "response_text": response_text,
+            "local_case_preflight": local_case_preflight,
             "paperclip_issue_id": issue.get("id"),
             "paperclip_issue_identifier": issue.get("identifier"),
             "paperclip_issue_status": run_status,
@@ -633,7 +952,7 @@ def handle_paperclip_teams_case_assist(
             "paperclip_answer_ready": bool(answer),
             "paperclip_result_pending": not bool(answer),
             "paperclip_placeholder_text": fallback_text,
-            "suppress_initial_response": not bool(answer),
+            "suppress_initial_response": False,
             "paperclip_wakeup_id": wakeup.get("id") if isinstance(wakeup, dict) else None,
             "should_send_to_teams": False,
             "should_write_tms": False,
@@ -646,13 +965,14 @@ def handle_paperclip_teams_case_assist(
             "handled": True,
             "classification": "paperclip_case_assist_error",
             "handoff_target": "paperclip_chef",
-            "order_id": response.order_id or request.order_id,
+            "order_id": order_id,
             "response_text": (
                 "⚠️ Paperclip Chef konnte diese Fallfrage gerade nicht sicher übernehmen.\n"
                 "Lage: Die lokale Paperclip-Bridge hat einen technischen Fehler gemeldet; Details sind nur intern im Audit-Log erfasst.\n"
                 "Sicherheit: Kein TMS-Write, keine Kunden-/Partnermail, kein Dokumentupload."
             ),
             "paperclip_error": str(exc),
+            "local_case_preflight": local_case_preflight,
             "should_send_to_teams": False,
             "should_write_tms": False,
             "should_send_customer_message": False,

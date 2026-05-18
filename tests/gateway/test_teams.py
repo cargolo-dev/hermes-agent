@@ -947,7 +947,7 @@ class TestTeamsMessageHandling:
         assert handoff_calls[0]["text"] == "Was ist mit AN-11755 los?"
 
     @pytest.mark.asyncio
-    async def test_cargolo_employee_dedicated_paperclip_pending_suppresses_initial_placeholder(self, monkeypatch):
+    async def test_cargolo_employee_dedicated_paperclip_pending_sends_progress_ack(self, monkeypatch):
         def fake_handle_teams_message(**kwargs):
             return {"handled": False, "reason": "no_card_context"}
 
@@ -987,9 +987,11 @@ class TestTeamsMessageHandling:
             cargolo_paperclip_teams_bridge_enabled=True,
             cargolo_paperclip_api_base="http://127.0.0.1:3100",
         ))
+        mock_result = MagicMock()
+        mock_result.id = "paperclip-progress-ack"
         mock_app = MagicMock()
         mock_app.id = "bot-id"
-        mock_app.send = AsyncMock()
+        mock_app.send = AsyncMock(return_value=mock_result)
         adapter._app = mock_app
         adapter.handle_message = AsyncMock()
         adapter._schedule_paperclip_followup_if_needed = MagicMock()
@@ -1003,7 +1005,9 @@ class TestTeamsMessageHandling:
         await adapter._on_message(self._make_ctx(activity))
 
         adapter.handle_message.assert_not_awaited()
-        mock_app.send.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert "Bin dran" in mock_app.send.call_args[0][1]
+        assert "AN-11755" in mock_app.send.call_args[0][1]
         adapter._schedule_paperclip_followup_if_needed.assert_called_once()
 
     @pytest.mark.asyncio

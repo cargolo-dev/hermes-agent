@@ -762,6 +762,23 @@ class TeamsAdapter(BasePlatformAdapter):
             ),
         )
 
+    def _paperclip_progress_ack_text(self, handoff_result: dict[str, Any], *, original_text: str) -> str:
+        candidate = str(handoff_result.get("response_text") or "").strip()
+        if "bin dran" in candidate.lower():
+            return candidate
+        order_id = str(handoff_result.get("order_id") or "").strip().upper()
+        if not order_id:
+            match = re.search(r"\b(?:AN|BU)-\d{3,}\b", original_text or "", flags=re.IGNORECASE)
+            order_id = match.group(0).upper() if match else "die Fallfrage"
+        issue = str(handoff_result.get("paperclip_issue_identifier") or handoff_result.get("paperclip_issue_id") or "").strip()
+        issue_suffix = f" ({issue})" if issue else ""
+        return (
+            f"Bin dran: {order_id} ist im CARGOLO Operations Board angelegt{issue_suffix}.\n"
+            "Lage: Ich prüfe TMS, lokale Mail-Historie und Dokumente read-only.\n"
+            "Sicherheit: Keine TMS-Writes, keine Kunden-/Partnermails, kein Dokumentupload.\n"
+            "Ergebnis folgt hier automatisch als Antwort."
+        )
+
     def _schedule_paperclip_followup_if_needed(
         self,
         handoff_result: dict[str, Any],
@@ -1058,7 +1075,13 @@ class TeamsAdapter(BasePlatformAdapter):
             )
             dedicated_handoff_ran = True
             if handoff_result.get("handled"):
-                if not handoff_result.get("suppress_initial_response"):
+                if handoff_result.get("paperclip_result_pending"):
+                    await self.send(
+                        str(conv.id),
+                        self._paperclip_progress_ack_text(handoff_result, original_text=text),
+                        reply_to=str(msg_id) if msg_id else None,
+                    )
+                elif not handoff_result.get("suppress_initial_response"):
                     await self.send(
                         str(conv.id),
                         str(handoff_result.get("response_text") or "Gespeichert."),
@@ -1112,7 +1135,13 @@ class TeamsAdapter(BasePlatformAdapter):
                         config=self._build_cargolo_handoff_config(),
                     )
                     if handoff_result.get("handled"):
-                        if not handoff_result.get("suppress_initial_response"):
+                        if handoff_result.get("paperclip_result_pending"):
+                            await self.send(
+                                str(conv.id),
+                                self._paperclip_progress_ack_text(handoff_result, original_text=handoff_text),
+                                reply_to=str(msg_id) if msg_id else None,
+                            )
+                        elif not handoff_result.get("suppress_initial_response"):
                             await self.send(
                                 str(conv.id),
                                 str(handoff_result.get("response_text") or "Gespeichert."),

@@ -6,6 +6,7 @@ from plugins.cargolo_ops.paperclip_teams_bridge import (
     _extract_teams_answer,
     _latest_issue_comment_answer,
     _latest_run_answer,
+    _looks_probably_like_truncated_json,
     handle_paperclip_teams_case_assist,
     poll_paperclip_issue_answer,
 )
@@ -206,6 +207,70 @@ def test_latest_run_answer_skips_truncated_result_excerpt(monkeypatch) -> None:
     assert answer is None
 
 
+def test_latest_run_answer_extracts_marker_from_stringified_result_json(monkeypatch) -> None:
+    def fake_request_json(method: str, url: str, *, payload=None, timeout=8.0):
+        del method, url, payload, timeout
+        return {
+            "heartbeatRuns": [
+                {
+                    "id": "run-1",
+                    "createdAt": "2026-05-18T10:00:02Z",
+                    "contextSnapshot": {"issueId": "issue-1"},
+                    "resultJson": '{"summary":"TEAMS_ANTWORT:\\n\\nAus stringifiziertem Result."}',
+                }
+            ]
+        }
+
+    monkeypatch.setattr("plugins.cargolo_ops.paperclip_teams_bridge._request_json", fake_request_json)
+
+    answer = _latest_run_answer(
+        PaperclipTeamsBridgeConfig(enabled=True, api_base="http://paperclip.local"),
+        "issue-1",
+    )
+
+    assert answer == "Aus stringifiziertem Result."
+
+
+def test_stringified_run_result_truncation_falls_back_to_agent_comment(monkeypatch) -> None:
+    truncated_json = '{"summary":"TEAMS_ANTWORT:\\n\\n' + ("Sehr kompakter Satz. " * 25) + "Nächster Schri"
+
+    assert _looks_probably_like_truncated_json(truncated_json) is True
+
+    def fake_request_json(method: str, url: str, *, payload=None, timeout=8.0):
+        del method, payload, timeout
+        if "heartbeat-runs" in url:
+            return {
+                "heartbeatRuns": [
+                    {
+                        "id": "run-1",
+                        "createdAt": "2026-05-18T10:00:02Z",
+                        "contextSnapshot": {"issueId": "issue-1"},
+                        "resultJson": truncated_json,
+                    }
+                ]
+            }
+        if url.endswith("/comments"):
+            return [
+                {
+                    "authorType": "agent",
+                    "createdAt": "2026-05-18T10:00:03Z",
+                    "body": "TEAMS_ANTWORT:\n\nVollständige Antwort aus Agent-Kommentar.",
+                }
+            ]
+        raise AssertionError(url)
+
+    monkeypatch.setattr("plugins.cargolo_ops.paperclip_teams_bridge._request_json", fake_request_json)
+
+    result = poll_paperclip_issue_answer(
+        issue_id="issue-1",
+        config=PaperclipTeamsBridgeConfig(enabled=True, api_base="http://paperclip.local", poll_interval_seconds=0.01),
+        timeout_seconds=1,
+    )
+
+    assert result["answer"] == "Vollständige Antwort aus Agent-Kommentar."
+    assert result["source"] == "issue_comment"
+
+
 def test_poll_paperclip_issue_answer_prefers_matching_run_result_over_comment(monkeypatch) -> None:
     monkeypatch.setattr(
         "plugins.cargolo_ops.paperclip_teams_bridge._latest_run_answer",
@@ -298,6 +363,110 @@ def test_poll_paperclip_issue_answer_uses_terminal_grace_for_late_run_result(mon
 
     assert result["answer"] == "Lage: spät, aber innerhalb Grace"
     assert result["source"] == "run_result"
+
+
+def test_bridge_runs_lifecycle_preflight_when_local_case_is_incomplete(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "cargolo_asr"
+    (root / "orders" / "AN-12807" / "employee").mkdir(parents=True)
+    calls: list[str] = []
+
+    def fake_sync_case_lifecycle(order_id: str, **kwargs):
+        calls.append(f"sync:{order_id}")
+        assert kwargs["storage_root"] == root
+        assert kwargs["refresh_history"] is True
+        assert kwargs["analyze_documents"] is True
+        return {
+            "status": "ok",
+            "order_id": order_id,
+            "case_root": str(root / "orders" / order_id),
+            "history_sync_count": 4,
+            "tms_snapshot_path": str(root / "orders" / order_id / "tms_snapshot.json"),
+            "document_registry_path": str(root / "orders" / order_id / "documents" / "registry.json"),
+        }
+
+    def fake_create_issue(**kwargs):
+        calls.append("create_issue")
+        return {"id": "issue-1", "identifier": "CAR-12"}
+
+    monkeypatch.setattr("plugins.cargolo_ops.paperclip_teams_bridge._sync_case_lifecycle", fake_sync_case_lifecycle)
+    monkeypatch.setattr("plugins.cargolo_ops.paperclip_teams_bridge._create_chef_issue", fake_create_issue)
+    monkeypatch.setattr("plugins.cargolo_ops.paperclip_teams_bridge._wait_for_issue_answer", lambda config, issue: (None, None))
+
+    result = handle_paperclip_teams_case_assist(
+        root=root,
+        request=EmployeeRequest(text="Hermes CARGOLO gib mir alle infos zu AN-12807", channel="teams", order_id="AN-12807"),
+        response=EmployeeResponse(mode=ResponseMode.CASE_ASSIST, order_id="AN-12807"),
+        channel_id="teams-channel",
+        message_id="teams-message",
+        config=PaperclipTeamsBridgeConfig(enabled=True, wait_timeout_seconds=0),
+    )
+
+    assert calls == ["sync:AN-12807", "create_issue"]
+    assert result["local_case_preflight"]["status"] == "synced"
+    assert result["local_case_preflight"]["answerable_from_local"] is False
+    assert result["paperclip_result_pending"] is True
+    assert result["suppress_initial_response"] is False
+    assert "Bin dran" in result["response_text"]
+    assert "CARGOLO Operations Board" in result["response_text"]
+
+
+def test_bridge_skips_lifecycle_preflight_when_local_case_has_required_evidence(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "cargolo_asr"
+    case_root = root / "orders" / "AN-12807"
+    (case_root / "tms").mkdir(parents=True)
+    (case_root / "documents" / "analysis").mkdir(parents=True)
+    (case_root / "tms" / "shipment_detail.json").write_text('{"shipment_number":"AN-12807"}', encoding="utf-8")
+    (case_root / "email_index.jsonl").write_text('{"subject":"Update AN-12807"}\n', encoding="utf-8")
+    (case_root / "documents" / "registry.json").write_text('{"received_types":["commercial_invoice"]}', encoding="utf-8")
+    (case_root / "documents" / "analysis" / "latest_summary.json").write_text('{"documents":[]}', encoding="utf-8")
+
+    def fail_sync(*args, **kwargs):
+        raise AssertionError("complete local evidence should not trigger a fresh sync")
+
+    monkeypatch.setattr("plugins.cargolo_ops.paperclip_teams_bridge._sync_case_lifecycle", fail_sync)
+    monkeypatch.setattr("plugins.cargolo_ops.paperclip_teams_bridge._create_chef_issue", lambda **kwargs: {"id": "issue-1", "identifier": "CAR-12"})
+    monkeypatch.setattr("plugins.cargolo_ops.paperclip_teams_bridge._wait_for_issue_answer", lambda config, issue: (None, None))
+
+    result = handle_paperclip_teams_case_assist(
+        root=root,
+        request=EmployeeRequest(text="Gib mir alle Infos zu AN-12807", channel="teams", order_id="AN-12807"),
+        response=EmployeeResponse(mode=ResponseMode.CASE_ASSIST, order_id="AN-12807"),
+        channel_id="teams-channel",
+        message_id="teams-message",
+        config=PaperclipTeamsBridgeConfig(enabled=True, wait_timeout_seconds=0),
+    )
+
+    assert result["local_case_preflight"]["status"] == "local_ready"
+    assert result["local_case_preflight"]["answerable_from_local"] is True
+    assert result["local_case_preflight"]["case_root"] == str(case_root)
+
+
+def test_bridge_stops_unknown_tms_case_without_paperclip_issue(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "cargolo_asr"
+
+    monkeypatch.setattr(
+        "plugins.cargolo_ops.paperclip_teams_bridge._sync_case_lifecycle",
+        lambda order_id, **kwargs: {"status": "skipped", "reason": "shipment_not_found_in_tms", "order_id": order_id},
+    )
+
+    def fail_create_issue(**kwargs):
+        raise AssertionError("unknown TMS cases must not create Paperclip work")
+
+    monkeypatch.setattr("plugins.cargolo_ops.paperclip_teams_bridge._create_chef_issue", fail_create_issue)
+
+    result = handle_paperclip_teams_case_assist(
+        root=root,
+        request=EmployeeRequest(text="Gib mir alles zu AN-404404", channel="teams", order_id="AN-404404"),
+        response=EmployeeResponse(mode=ResponseMode.CASE_ASSIST, order_id="AN-404404"),
+        channel_id="teams-channel",
+        message_id="teams-message",
+        config=PaperclipTeamsBridgeConfig(enabled=True, wait_timeout_seconds=0),
+    )
+
+    assert result["classification"] == "shipment_not_found_in_tms"
+    assert result["paperclip_result_pending"] is False
+    assert "nicht im ASR-TMS" in result["response_text"]
+    assert not (root / "orders" / "AN-404404").exists()
 
 
 def test_bridge_error_response_keeps_raw_api_error_internal(monkeypatch, tmp_path) -> None:
