@@ -152,6 +152,36 @@ def _apply_doctor_tool_availability_overrides(available: list[str], unavailable:
     return updated_available, updated_unavailable
 
 
+def _has_healthy_oauth_fallback_for_apikey_provider(provider_label: str) -> bool:
+    """Return True when a direct API-key probe failure is non-blocking.
+
+    Some provider families support both a direct API-key path and a separate
+    OAuth runtime path. When the OAuth path is already healthy, doctor should
+    still show a failed API-key connectivity row, but it should not promote
+    that direct-key problem into the final blocking summary.
+    """
+    normalized = (provider_label or "").strip().lower()
+    if normalized in {"google / gemini", "gemini"}:
+        try:
+            from hermes_cli.auth import get_gemini_oauth_auth_status
+            return bool((get_gemini_oauth_auth_status() or {}).get("logged_in"))
+        except Exception:
+            return False
+    if normalized == "minimax":
+        try:
+            from hermes_cli.auth import get_minimax_oauth_auth_status
+            return bool((get_minimax_oauth_auth_status() or {}).get("logged_in"))
+        except Exception:
+            return False
+    if normalized == "xai":
+        try:
+            from hermes_cli.auth import get_xai_oauth_auth_status
+            return bool((get_xai_oauth_auth_status() or {}).get("logged_in"))
+        except Exception:
+            return False
+    return False
+
+
 def check_ok(text: str, detail: str = ""):
     print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
@@ -245,14 +275,30 @@ def _build_apikey_providers_list() -> list:
     }
     for _label, _canonical in _name_to_canonical.items():
         _known_canonical.add(_canonical)
+    # Providers that already have a dedicated health check above the generic
+    # API-key loop (with custom headers/auth). Skip their pluggable profiles
+    # here so the generic Bearer-auth loop doesn't run a duplicate, broken
+    # check (e.g. Anthropic native API requires x-api-key, not Bearer).
+    _dedicated_canonical = {"anthropic", "openrouter", "bedrock"}
+    _known_canonical.update(_dedicated_canonical)
     try:
         from providers import list_providers
         from providers.base import ProviderProfile as _PP
+        try:
+            from hermes_cli.providers import normalize_provider as _normalize_provider
+        except Exception:  # pragma: no cover - normalization is best-effort
+            def _normalize_provider(_name: str) -> str:
+                return (_name or "").strip().lower()
         for _pp in list_providers():
             if not isinstance(_pp, _PP) or _pp.auth_type != "api_key" or not _pp.env_vars:
                 continue
             _label = _pp.display_name or _pp.name
             if _label in _known_names or _pp.name in _known_canonical:
+                continue
+            _candidates = {_normalize_provider(_pp.name)}
+            for _alias in (_pp.aliases or ()):
+                _candidates.add(_normalize_provider(_alias))
+            if _candidates & _dedicated_canonical:
                 continue
             # Separate API-key vars from base-URL override vars — the health-check
             # loop sends the first found value as Authorization: Bearer, so a URL
@@ -271,7 +317,8 @@ def _build_apikey_providers_list() -> list:
                 (_pp.models_url or (_pp.base_url.rstrip("/") + "/models"))
                 if _pp.base_url else None
             )
-            _static.append((_label, _key_vars, _models_url, _base_var, True))
+            _hc = getattr(_pp, "supports_health_check", True)
+            _static.append((_label, _key_vars, _models_url, _base_var, _hc))
     except Exception:
         pass
     return _static
@@ -280,19 +327,101 @@ def _build_apikey_providers_list() -> list:
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
+    ack_target = getattr(args, 'ack', None)
 
     # Doctor runs from the interactive CLI, so CLI-gated tool availability
     # checks (like cronjob management) should see the same context as `hermes`.
     os.environ.setdefault("HERMES_INTERACTIVE", "1")
-    
+
+    # Handle `hermes doctor --ack <id>` as a fast path. Persist the ack and
+    # return without running the rest of the diagnostics — the user has
+    # already seen the advisory and just wants to silence it.
+    if ack_target:
+        from hermes_cli.security_advisories import (
+            ADVISORIES,
+            ack_advisory,
+        )
+        valid_ids = {a.id for a in ADVISORIES}
+        if ack_target not in valid_ids:
+            print(color(
+                f"Unknown advisory ID: {ack_target!r}. Known IDs: "
+                f"{', '.join(sorted(valid_ids)) or '(none)'}",
+                Colors.RED,
+            ))
+            sys.exit(2)
+        if ack_advisory(ack_target):
+            print(color(
+                f"  ✓ Acknowledged advisory {ack_target}. "
+                f"It will no longer trigger startup banners.",
+                Colors.GREEN,
+            ))
+        else:
+            print(color(
+                f"  ✗ Failed to persist ack for {ack_target}. "
+                f"Check ~/.hermes/config.yaml is writable.",
+                Colors.RED,
+            ))
+            sys.exit(1)
+        return
+
     issues = []
     manual_issues = []  # issues that can't be auto-fixed
     fixed_count = 0
-    
+
     print()
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
     print(color("│                 🩺 Hermes Doctor                        │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
+
+    # =========================================================================
+    # Check: Security advisories  (RUNS FIRST — these are the most urgent)
+    # =========================================================================
+    print()
+    print(color("◆ Security Advisories", Colors.CYAN, Colors.BOLD))
+    try:
+        from hermes_cli.security_advisories import (
+            detect_compromised,
+            filter_unacked,
+            full_remediation_text,
+            get_acked_ids,
+        )
+        all_hits = detect_compromised()
+        fresh_hits = filter_unacked(all_hits)
+        if fresh_hits:
+            for hit in fresh_hits:
+                check_fail(
+                    f"{hit.advisory.title}",
+                    f"({hit.package}=={hit.installed_version})",
+                )
+                # Print the full remediation block, indented under the
+                # check_fail header so it reads as a single section.
+                for line in full_remediation_text(hit):
+                    if line:
+                        print(f"    {color(line, Colors.YELLOW)}")
+                    else:
+                        print()
+                # Funnel into the action list so the summary block surfaces it
+                # for users who scroll past the section.
+                manual_issues.append(
+                    f"Resolve security advisory {hit.advisory.id}: "
+                    f"uninstall {hit.package}=={hit.installed_version} and "
+                    f"rotate credentials, then run "
+                    f"`hermes doctor --ack {hit.advisory.id}`."
+                )
+            # Acked-but-still-installed: show as informational so the user
+            # knows the package is still on disk after the ack.
+            acked_ids = get_acked_ids()
+            for h in all_hits:
+                if h.advisory.id in acked_ids:
+                    check_warn(
+                        f"{h.package}=={h.installed_version} still installed "
+                        f"(advisory {h.advisory.id} acknowledged)",
+                    )
+        else:
+            check_ok("No active security advisories")
+    except Exception as e:
+        # Never let a bug in the advisory check block the rest of doctor.
+        check_warn(f"Security advisory check failed: {e}")
     
     # =========================================================================
     # Check: Python version
@@ -457,7 +586,7 @@ def run_doctor(args):
             if (
                 provider
                 and _resolve_auth_provider is not None
-                and provider not in ("auto", "custom")
+                and provider not in {"auto", "custom"}
             ):
                 try:
                     runtime_provider = _resolve_auth_provider(provider)
@@ -469,7 +598,7 @@ def run_doctor(args):
             if (
                 provider
                 and _resolve_provider_full is not None
-                and provider not in ("auto", "custom")
+                and provider not in {"auto", "custom"}
             ):
                 provider_def = _resolve_provider_full(provider, user_providers, custom_providers)
                 catalog_provider = provider_def.id if provider_def is not None else None
@@ -522,31 +651,41 @@ def run_doctor(args):
 
             # Check credentials for the configured provider.
             # Limit to API-key providers in PROVIDER_REGISTRY — other provider
-            # types (OAuth, SDK, openrouter/anthropic/custom/auto) have their
-            # own env-var checks elsewhere in doctor, and get_auth_status()
-            # returns a bare {logged_in: False} for anything it doesn't
-            # explicitly dispatch, which would produce false positives.
-            if runtime_provider and runtime_provider not in ("auto", "custom", "openrouter"):
+            # types (OAuth, SDK, anthropic/custom/auto) have their own env-var
+            # checks elsewhere in doctor, and get_auth_status() returns a bare
+            # {logged_in: False} for anything it doesn't explicitly dispatch,
+            # which would produce false positives.
+            if runtime_provider and runtime_provider not in ("auto", "custom"):
                 try:
-                    from hermes_cli.auth import PROVIDER_REGISTRY, get_auth_status
-                    pconfig = PROVIDER_REGISTRY.get(runtime_provider)
-                    if pconfig and getattr(pconfig, "auth_type", "") == "api_key":
-                        status = get_auth_status(runtime_provider) or {}
+                    if runtime_provider == "openrouter":
+                        from hermes_cli.config import get_env_value
+
                         configured = bool(
-                            status.get("configured")
-                            or status.get("logged_in")
-                            or status.get("api_key")
+                            str(get_env_value("OPENROUTER_API_KEY") or "").strip()
+                            or str(get_env_value("OPENAI_API_KEY") or "").strip()
                         )
-                        if not configured:
-                            check_fail(
-                                f"model.provider '{runtime_provider}' is set but no API key is configured",
-                                "(check ~/.hermes/.env or run 'hermes setup')",
+                    else:
+                        from hermes_cli.auth import PROVIDER_REGISTRY, get_auth_status
+
+                        pconfig = PROVIDER_REGISTRY.get(runtime_provider)
+                        configured = True
+                        if pconfig and getattr(pconfig, "auth_type", "") == "api_key":
+                            status = get_auth_status(runtime_provider) or {}
+                            configured = bool(
+                                status.get("configured")
+                                or status.get("logged_in")
+                                or status.get("api_key")
                             )
-                            issues.append(
-                                f"No credentials found for provider '{runtime_provider}'. "
-                                f"Run 'hermes setup' or set the provider's API key in {_DHH}/.env, "
-                                f"or switch providers with 'hermes config set model.provider <name>'"
-                            )
+                    if not configured:
+                        check_fail(
+                            f"model.provider '{runtime_provider}' is set but no API key is configured",
+                            "(check ~/.hermes/.env or run 'hermes setup')",
+                        )
+                        issues.append(
+                            f"No credentials found for provider '{runtime_provider}'. "
+                            f"Run 'hermes setup' or set the provider's API key in {_DHH}/.env, "
+                            f"or switch providers with 'hermes config set model.provider <name>'"
+                        )
                 except Exception:
                     pass
 
@@ -557,15 +696,17 @@ def run_doctor(args):
         if fallback_config.exists():
             check_ok("cli-config.yaml exists (in project directory)")
         else:
-            example_config = PROJECT_ROOT / 'cli-config.yaml.example'
-            if should_fix and example_config.exists():
+            if should_fix:
                 config_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(example_config), str(config_path))
-                check_ok(f"Created {_DHH}/config.yaml from cli-config.yaml.example")
+                example_config = PROJECT_ROOT / 'cli-config.yaml.example'
+                if example_config.exists():
+                    shutil.copy2(str(example_config), str(config_path))
+                    check_ok(f"Created {_DHH}/config.yaml from cli-config.yaml.example")
+                else:
+                    from hermes_cli.config import DEFAULT_CONFIG, save_config
+                    save_config(DEFAULT_CONFIG)
+                    check_ok(f"Created {_DHH}/config.yaml from defaults")
                 fixed_count += 1
-            elif should_fix:
-                check_warn("config.yaml not found and no example to copy from")
-                manual_issues.append(f"Create {_DHH}/config.yaml manually")
             else:
                 check_warn("config.yaml not found", "(using defaults)")
 
@@ -692,6 +833,20 @@ def run_doctor(args):
     except Exception as e:
         check_warn("Auth provider status", f"(could not check: {e})")
 
+    # xAI OAuth — separate try/except so an import failure here cannot
+    # disrupt the already-printed Nous/Codex/Gemini/MiniMax rows above.
+    try:
+        from hermes_cli.auth import get_xai_oauth_auth_status
+        xai_oauth_status = get_xai_oauth_auth_status() or {}
+        if xai_oauth_status.get("logged_in"):
+            check_ok("xAI OAuth", "(logged in)")
+        else:
+            check_warn("xAI OAuth", "(not logged in)")
+            if xai_oauth_status.get("error"):
+                check_info(xai_oauth_status["error"])
+    except Exception:
+        pass
+
     if _safe_which("codex"):
         check_ok("codex CLI")
     else:
@@ -713,13 +868,12 @@ def run_doctor(args):
     hermes_home = HERMES_HOME
     if hermes_home.exists():
         check_ok(f"{_DHH} directory exists")
+    elif should_fix:
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        check_ok(f"Created {_DHH} directory")
+        fixed_count += 1
     else:
-        if should_fix:
-            hermes_home.mkdir(parents=True, exist_ok=True)
-            check_ok(f"Created {_DHH} directory")
-            fixed_count += 1
-        else:
-            check_warn(f"{_DHH} not found", "(will be created on first use)")
+        check_warn(f"{_DHH} not found", "(will be created on first use)")
     
     # Check expected subdirectories
     expected_subdirs = ["cron", "sessions", "logs", "skills", "memories"]
@@ -727,13 +881,12 @@ def run_doctor(args):
         subdir_path = hermes_home / subdir_name
         if subdir_path.exists():
             check_ok(f"{_DHH}/{subdir_name}/ exists")
+        elif should_fix:
+            subdir_path.mkdir(parents=True, exist_ok=True)
+            check_ok(f"Created {_DHH}/{subdir_name}/")
+            fixed_count += 1
         else:
-            if should_fix:
-                subdir_path.mkdir(parents=True, exist_ok=True)
-                check_ok(f"Created {_DHH}/{subdir_name}/")
-                fixed_count += 1
-            else:
-                check_warn(f"{_DHH}/{subdir_name}/ not found", "(will be created on first use)")
+            check_warn(f"{_DHH}/{subdir_name}/ not found", "(will be created on first use)")
     
     # Check for SOUL.md persona file
     soul_path = hermes_home / "SOUL.md"
@@ -939,23 +1092,31 @@ def run_doctor(args):
         else:
             check_fail("docker not found", "(required for TERMINAL_ENV=docker)")
             issues.append("Install Docker or change TERMINAL_ENV")
+    elif _safe_which("docker"):
+        check_ok("docker", "(optional)")
+    elif _is_termux():
+        check_info("Docker backend is not available inside Termux (expected on Android)")
     else:
-        if _safe_which("docker"):
-            check_ok("docker", "(optional)")
-        else:
-            if _is_termux():
-                check_info("Docker backend is not available inside Termux (expected on Android)")
-            else:
-                check_warn("docker not found", "(optional)")
+        check_warn("docker not found", "(optional)")
     
     # SSH (if using ssh backend)
     if terminal_env == "ssh":
         ssh_host = os.getenv("TERMINAL_SSH_HOST")
         if ssh_host:
+            ssh_user = os.getenv("TERMINAL_SSH_USER")
+            ssh_port = os.getenv("TERMINAL_SSH_PORT")
+            ssh_key = os.getenv("TERMINAL_SSH_KEY")
+            target = f"{ssh_user}@{ssh_host}" if ssh_user else ssh_host
+            cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
+            if ssh_port:
+                cmd += ["-p", ssh_port]
+            if ssh_key:
+                cmd += ["-i", os.path.expanduser(ssh_key)]
+            cmd += [target, "echo ok"]
             # Try to connect
             try:
                 result = subprocess.run(
-                    ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh_host, "echo ok"],
+                    cmd,
                     capture_output=True,
                     text=True,
                     timeout=15
@@ -998,7 +1159,7 @@ def run_doctor(args):
             issues.append(f"Set TERMINAL_VERCEL_RUNTIME to one of: {supported}")
 
         disk = os.getenv("TERMINAL_CONTAINER_DISK", "51200").strip()
-        if disk in ("", "0", "51200"):
+        if disk in {"", "0", "51200"}:
             check_ok("Vercel disk setting", "(uses platform default)")
         else:
             check_fail("Vercel custom disk unsupported", "(reset terminal.container_disk to 51200)")
@@ -1024,7 +1185,7 @@ def run_doctor(args):
         for line in auth_status.detail_lines:
             check_info(f"Vercel auth {line}")
 
-        persistent = os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in ("1", "true", "yes", "on")
+        persistent = os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"1", "true", "yes", "on"}
         if persistent:
             check_info("Vercel persistence: snapshot filesystem only; live processes do not survive sandbox recreation")
         else:
@@ -1042,15 +1203,14 @@ def run_doctor(args):
         elif shutil.which("agent-browser"):
             check_ok("agent-browser", "(browser automation)")
             agent_browser_ok = True
+        elif _is_termux():
+            check_info("agent-browser is not installed (expected in the tested Termux path)")
+            check_info("Install it manually later with: npm install -g agent-browser && agent-browser install")
+            check_info("Termux browser setup:")
+            for step in _termux_browser_setup_steps(node_installed=True):
+                check_info(step)
         else:
-            if _is_termux():
-                check_info("agent-browser is not installed (expected in the tested Termux path)")
-                check_info("Install it manually later with: npm install -g agent-browser && agent-browser install")
-                check_info("Termux browser setup:")
-                for step in _termux_browser_setup_steps(node_installed=True):
-                    check_info(step)
-            else:
-                check_warn("agent-browser not installed", "(run: npm install)")
+            check_warn("agent-browser not installed", "(run: npm install)")
 
         # Chromium presence — the browser tools silently fail to register when
         # agent-browser is found but no Playwright-managed Chromium is on disk
@@ -1101,15 +1261,14 @@ def run_doctor(args):
                                 f"Install with: cd {PROJECT_ROOT} && "
                                 "npx playwright install --with-deps chromium"
                             )
+    elif _is_termux():
+        check_info("Node.js not found (browser tools are optional in the tested Termux path)")
+        check_info("Install Node.js on Termux with: pkg install nodejs")
+        check_info("Termux browser setup:")
+        for step in _termux_browser_setup_steps(node_installed=False):
+            check_info(step)
     else:
-        if _is_termux():
-            check_info("Node.js not found (browser tools are optional in the tested Termux path)")
-            check_info("Install Node.js on Termux with: pkg install nodejs")
-            check_info("Termux browser setup:")
-            for step in _termux_browser_setup_steps(node_installed=False):
-                check_info(step)
-        else:
-            check_warn("Node.js not found", "(optional, needed for browser tools)")
+        check_warn("Node.js not found", "(optional, needed for browser tools)")
     
     # npm audit for all Node.js packages
     _npm_bin = _safe_which("npm")
@@ -1355,6 +1514,15 @@ def run_doctor(args):
             }
             if base_url_host_matches(base, "api.kimi.com"):
                 headers["User-Agent"] = "claude-code/0.1.0"
+            # Google's Generative Language API (generativelanguage.googleapis.com)
+            # rejects ``Authorization: Bearer <api-key>`` with 401
+            # ``ACCESS_TOKEN_TYPE_UNSUPPORTED`` — that header is reserved for
+            # OAuth 2 access tokens, not plain API keys. Plain keys use
+            # ``x-goog-api-key`` (or ``?key=``). Without this, a perfectly valid
+            # GOOGLE_API_KEY/GEMINI_API_KEY always shows red in ``hermes doctor``.
+            if url and base_url_host_matches(url, "generativelanguage.googleapis.com"):
+                headers.pop("Authorization", None)
+                headers["x-goog-api-key"] = key
             r = httpx.get(url, headers=headers, timeout=10)
             if (
                 pname == "Alibaba/DashScope"
@@ -1499,31 +1667,12 @@ def run_doctor(args):
                 print(f"  {_glyph} {_label} {_detail}")
             else:
                 print(f"  {_glyph} {_label}")
-        for _issue in _r.issues:
+        _issues_to_add = list(_r.issues)
+        if _issues_to_add and _has_healthy_oauth_fallback_for_apikey_provider(_r.label):
+            _issues_to_add = []
+        for _issue in _issues_to_add:
             issues.append(_issue)
 
-    # =========================================================================
-    # Check: Submodules
-    # =========================================================================
-    print()
-    print(color("◆ Submodules", Colors.CYAN, Colors.BOLD))
-    
-    # tinker-atropos (RL training backend)
-    tinker_dir = PROJECT_ROOT / "tinker-atropos"
-    if tinker_dir.exists() and (tinker_dir / "pyproject.toml").exists():
-        if py_version >= (3, 11):
-            try:
-                __import__("tinker_atropos")
-                check_ok("tinker-atropos", "(RL training backend)")
-            except ImportError:
-                install_cmd = f"{_python_install_cmd()} -e ./tinker-atropos"
-                check_warn("tinker-atropos found but not installed", f"(run: {install_cmd})")
-                issues.append(f"Install tinker-atropos: {install_cmd}")
-        else:
-            check_warn("tinker-atropos requires Python 3.11+", f"(current: {py_version.major}.{py_version.minor})")
-    else:
-        check_warn("tinker-atropos not found", "(run: git submodule update --init --recursive)")
-    
     # =========================================================================
     # Check: Tool Availability
     # =========================================================================
