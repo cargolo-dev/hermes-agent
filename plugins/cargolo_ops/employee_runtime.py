@@ -891,11 +891,19 @@ def _draft_for(response: EmployeeResponse, results: list[SpecialistResult], memo
         return _format_business_draft(response, results, request) + memory_note
     if response.mode == ResponseMode.GUARDED_ACTION_REQUIRED:
         if response.boundary_action == BoundaryAction.TEAMS_SEND:
-            return "Teams Guard erforderlich; keine Teams-Nachricht gesendet. Draft/Review bleibt möglich." + memory_note
+            return (
+                "⛔ Nicht gesendet. Ich darf Teams-Nachrichten aus freiem Chat nicht eigenständig auslösen. "
+                "Ich kann dir hier einen Entwurf/Review vorbereiten; Versand bleibt Freigabe-/Operator-Sache. "
+                "Sicherheit: keine Teams-Sendung, kein TMS-Write, keine Kundenmail."
+            ) + memory_note
         if response.boundary_action == BoundaryAction.TMS_WRITE:
-            return "TMS Guard erforderlich; keine TMS-Änderung ausgeführt. Draft/Review bleibt möglich." + memory_note
+            return (
+                "⛔ Nicht geschrieben. Ich darf TMS-Felder aus freiem Teams-Text nicht direkt ändern. "
+                "Bitte nutze die konkrete TMS-Freigabekarte oder antworte auf die Karte mit Korrektur/Fall prüfen; "
+                "dann bleibt es als Review nachvollziehbar. Sicherheit: kein TMS-Write, keine Kundenmail, kein Dokumentupload."
+            ) + memory_note
         action = response.boundary_action.value if response.boundary_action else "unknown"
-        return f"Guard erforderlich für {action}; keine externe Aktion ausgeführt. Draft/Review bleibt möglich." + memory_note
+        return f"⛔ Nicht ausgeführt. Für {action} ist eine explizite Freigabe/Review nötig; keine externe Aktion wurde ausgelöst." + memory_note
     return _format_case_lage(response, results, request) + memory_note
 
 

@@ -947,6 +947,66 @@ class TestTeamsMessageHandling:
         assert handoff_calls[0]["text"] == "Was ist mit AN-11755 los?"
 
     @pytest.mark.asyncio
+    async def test_cargolo_employee_dedicated_paperclip_pending_suppresses_initial_placeholder(self, monkeypatch):
+        def fake_handle_teams_message(**kwargs):
+            return {"handled": False, "reason": "no_card_context"}
+
+        def fake_handle_teams_employee_message(**kwargs):
+            assert kwargs["config"].paperclip_bridge_enabled is True
+            return {
+                "handled": True,
+                "classification": "paperclip_case_assist",
+                "response_text": "Paperclip Chef hat übernommen.",
+                "paperclip_result_pending": True,
+                "paperclip_issue_id": "issue-1",
+                "paperclip_issue_identifier": "CAR-9",
+                "suppress_initial_response": True,
+                "should_write_tms": False,
+                "should_send_customer_message": False,
+            }
+
+        def fake_route_teams_ops_message(**kwargs):
+            return {
+                "handled": False,
+                "reason": "paperclip_bridge_case_assist",
+                "classification": "paperclip_case_assist_candidate",
+                "order_id": "AN-11755",
+                "allow_employee_handoff": True,
+            }
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", fake_route_teams_ops_message, raising=False)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids=["cargolo-hermes"],
+            cargolo_paperclip_teams_bridge_enabled=True,
+            cargolo_paperclip_api_base="http://127.0.0.1:3100",
+        ))
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock()
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+        adapter._schedule_paperclip_followup_if_needed = MagicMock()
+
+        activity = self._make_activity(
+            text="Was ist mit AN-11755 los?",
+            activity_id="msg-employee-paperclip-pending",
+            conversation_type="channel",
+            channel_data={"channel": {"id": "cargolo-hermes"}},
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_not_awaited()
+        adapter._schedule_paperclip_followup_if_needed.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_cargolo_paperclip_pending_followup_polls_and_sends_result(self, monkeypatch):
         poll_calls = []
 

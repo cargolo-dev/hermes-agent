@@ -34,6 +34,7 @@ class TeamsHandoffConfig(BaseModel):
     paperclip_chef_agent_id: str | None = None
     paperclip_wait_timeout_seconds: float | None = None
     paperclip_poll_interval_seconds: float | None = None
+    paperclip_terminal_grace_seconds: float | None = None
     paperclip_request_timeout_seconds: float | None = None
     paperclip_wakeup_after_create: bool | None = None
 
@@ -96,6 +97,11 @@ def _paperclip_config_from_handoff(config: TeamsHandoffConfig) -> PaperclipTeams
             config.paperclip_poll_interval_seconds
             if config.paperclip_poll_interval_seconds is not None
             else env_config.poll_interval_seconds
+        ),
+        terminal_grace_seconds=(
+            config.paperclip_terminal_grace_seconds
+            if config.paperclip_terminal_grace_seconds is not None
+            else env_config.terminal_grace_seconds
         ),
         wakeup_after_create=(
             config.paperclip_wakeup_after_create

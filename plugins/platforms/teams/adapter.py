@@ -694,6 +694,9 @@ class TeamsAdapter(BasePlatformAdapter):
         self._cargolo_paperclip_poll_interval_seconds = _parse_optional_float(
             extra.get("cargolo_paperclip_poll_interval_seconds") or os.getenv("CARGOLO_PAPERCLIP_POLL_INTERVAL_SECONDS")
         )
+        self._cargolo_paperclip_terminal_grace_seconds = _parse_optional_float(
+            extra.get("cargolo_paperclip_terminal_grace_seconds") or os.getenv("CARGOLO_PAPERCLIP_TERMINAL_GRACE_SECONDS")
+        )
         self._cargolo_paperclip_request_timeout_seconds = _parse_optional_float(
             extra.get("cargolo_paperclip_request_timeout_seconds") or os.getenv("CARGOLO_PAPERCLIP_REQUEST_TIMEOUT_SECONDS")
         )
@@ -719,6 +722,7 @@ class TeamsAdapter(BasePlatformAdapter):
             paperclip_chef_agent_id=self._cargolo_paperclip_chef_agent_id,
             paperclip_wait_timeout_seconds=self._cargolo_paperclip_wait_timeout_seconds,
             paperclip_poll_interval_seconds=self._cargolo_paperclip_poll_interval_seconds,
+            paperclip_terminal_grace_seconds=self._cargolo_paperclip_terminal_grace_seconds,
             paperclip_request_timeout_seconds=self._cargolo_paperclip_request_timeout_seconds,
             paperclip_wakeup_after_create=self._cargolo_paperclip_wakeup_after_create,
         )
@@ -744,6 +748,11 @@ class TeamsAdapter(BasePlatformAdapter):
                 self._cargolo_paperclip_poll_interval_seconds
                 if self._cargolo_paperclip_poll_interval_seconds is not None
                 else env_config.poll_interval_seconds
+            ),
+            terminal_grace_seconds=(
+                self._cargolo_paperclip_terminal_grace_seconds
+                if self._cargolo_paperclip_terminal_grace_seconds is not None
+                else env_config.terminal_grace_seconds
             ),
             wakeup_after_create=bool(self._cargolo_paperclip_wakeup_after_create),
             request_timeout_seconds=(
@@ -1049,11 +1058,12 @@ class TeamsAdapter(BasePlatformAdapter):
             )
             dedicated_handoff_ran = True
             if handoff_result.get("handled"):
-                await self.send(
-                    str(conv.id),
-                    str(handoff_result.get("response_text") or "Gespeichert."),
-                    reply_to=str(msg_id) if msg_id else None,
-                )
+                if not handoff_result.get("suppress_initial_response"):
+                    await self.send(
+                        str(conv.id),
+                        str(handoff_result.get("response_text") or "Gespeichert."),
+                        reply_to=str(msg_id) if msg_id else None,
+                    )
                 self._schedule_paperclip_followup_if_needed(
                     handoff_result,
                     conv_id=str(conv.id),
@@ -1102,11 +1112,12 @@ class TeamsAdapter(BasePlatformAdapter):
                         config=self._build_cargolo_handoff_config(),
                     )
                     if handoff_result.get("handled"):
-                        await self.send(
-                            str(conv.id),
-                            str(handoff_result.get("response_text") or "Gespeichert."),
-                            reply_to=str(msg_id) if msg_id else None,
-                        )
+                        if not handoff_result.get("suppress_initial_response"):
+                            await self.send(
+                                str(conv.id),
+                                str(handoff_result.get("response_text") or "Gespeichert."),
+                                reply_to=str(msg_id) if msg_id else None,
+                            )
                         self._schedule_paperclip_followup_if_needed(
                             handoff_result,
                             conv_id=str(conv.id),

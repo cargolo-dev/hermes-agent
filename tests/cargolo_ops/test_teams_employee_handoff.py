@@ -167,7 +167,8 @@ def test_paperclip_bridge_does_not_receive_guarded_tms_write(tmp_path: Path, mon
 
     assert result["handled"] is True
     assert result["classification"] == "guarded_action_required"
-    assert "TMS Guard erforderlich" in result["response_text"]
+    assert "Nicht geschrieben" in result["response_text"]
+    assert "kein TMS-Write" in result["response_text"]
     assert result["should_write_tms"] is False
     assert result["should_send_customer_message"] is False
 
@@ -230,7 +231,8 @@ def test_dedicated_channel_tms_write_request_remains_guarded_without_external_ac
 
     assert result["handled"] is True
     assert result["classification"] == "guarded_action_required"
-    assert "TMS Guard erforderlich" in result["response_text"]
+    assert "Nicht geschrieben" in result["response_text"]
+    assert "kein TMS-Write" in result["response_text"]
     assert result["should_send_to_teams"] is False
     assert result["should_write_tms"] is False
     assert result["should_send_customer_message"] is False

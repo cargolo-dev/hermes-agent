@@ -55,6 +55,7 @@ class PaperclipTeamsBridgeConfig:
     issue_work_mode: str = "standard"
     wait_timeout_seconds: float = 8.0
     poll_interval_seconds: float = 1.5
+    terminal_grace_seconds: float = 15.0
     wakeup_after_create: bool = False
     request_timeout_seconds: float = 8.0
 
@@ -73,6 +74,7 @@ class PaperclipTeamsBridgeConfig:
             issue_work_mode=os.getenv("CARGOLO_PAPERCLIP_ISSUE_WORK_MODE") or "standard",
             wait_timeout_seconds=_parse_float(os.getenv("CARGOLO_PAPERCLIP_WAIT_TIMEOUT_SECONDS"), default=8.0),
             poll_interval_seconds=_parse_float(os.getenv("CARGOLO_PAPERCLIP_POLL_INTERVAL_SECONDS"), default=1.5),
+            terminal_grace_seconds=_parse_float(os.getenv("CARGOLO_PAPERCLIP_TERMINAL_GRACE_SECONDS"), default=15.0),
             wakeup_after_create=_parse_bool(os.getenv("CARGOLO_PAPERCLIP_WAKEUP_AFTER_CREATE"), default=False),
             request_timeout_seconds=_parse_float(os.getenv("CARGOLO_PAPERCLIP_REQUEST_TIMEOUT_SECONDS"), default=8.0),
         )
@@ -265,7 +267,7 @@ def _as_list(payload: Any) -> list[Any]:
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
-        for key in ("comments", "items", "data", "results"):
+        for key in ("comments", "runs", "heartbeatRuns", "heartbeat_runs", "items", "data", "results"):
             value = payload.get(key)
             if isinstance(value, list):
                 return value
@@ -303,6 +305,24 @@ def _sanitize_teams_answer(text: str) -> str:
     return cleaned.strip()
 
 
+def _looks_probably_truncated(text: str) -> bool:
+    """Detect Paperclip result excerpts that were clipped mid-sentence.
+
+    Paperclip comments can contain the complete final answer while adapter
+    resultJson may be capped. Do not deliver a run result that visibly ends in
+    the middle of a word; let the poller wait for the agent-authored
+    TEAMS_ANTWORT comment instead.
+    """
+
+    cleaned = text.rstrip()
+    if len(cleaned) < 480:
+        return False
+    tail = cleaned[-24:]
+    if re.search(r"[.!?…\])}>'\"]\s*$", cleaned):
+        return False
+    return bool(re.search(r"[A-Za-zÄÖÜäöüß]{3,}$", tail))
+
+
 def _extract_teams_answer(body: str, *, require_marker: bool = False) -> str | None:
     text = _strip_code_fence(body)
     marker = re.match(r"\s*TEAMS_ANTWORT\s*:\s*", text, flags=re.IGNORECASE)
@@ -322,6 +342,23 @@ def _comment_created_at(comment: Any) -> str:
     return ""
 
 
+def _comment_is_agent_generated(comment: Any) -> bool:
+    """Return whether a Paperclip comment is safe to treat as agent output.
+
+    Teams follow-ups must never be sourced from local-board/user comments. Those
+    comments are also Paperclip wake triggers and caused the CAR-5 done -> wake ->
+    comment loop. Unknown/bare comment rows are not trusted either: if Paperclip
+    cannot explicitly label the author as an agent, the bridge waits for a
+    matching run_result instead of forwarding a potentially bridge-authored
+    marker back to Teams.
+    """
+
+    if not isinstance(comment, dict):
+        return False
+    author_type = str(comment.get("authorType") or comment.get("author_type") or "").lower().strip()
+    return author_type == "agent"
+
+
 def _latest_issue_comment_answer(config: PaperclipTeamsBridgeConfig, issue_id: str) -> str | None:
     if not issue_id:
         return None
@@ -332,12 +369,72 @@ def _latest_issue_comment_answer(config: PaperclipTeamsBridgeConfig, issue_id: s
     )
     comments = sorted(_as_list(payload), key=_comment_created_at)
     for comment in reversed(comments):
+        if not _comment_is_agent_generated(comment):
+            continue
         # Only an explicit TEAMS_ANTWORT block may become a Teams follow-up.
         # Markerless Paperclip comments are often heartbeat summaries, review
         # notes, or debug/audit text and must stay internal.
         answer = _extract_teams_answer(_comment_body(comment), require_marker=True)
         if answer:
             return answer
+    return None
+
+
+def _run_created_at(run: Any) -> str:
+    if isinstance(run, dict):
+        return str(run.get("finishedAt") or run.get("updatedAt") or run.get("createdAt") or "")
+    return ""
+
+
+def _run_issue_id(run: Any) -> str:
+    if not isinstance(run, dict):
+        return ""
+    context = run.get("contextSnapshot") or run.get("context_snapshot")
+    if isinstance(context, dict):
+        return str(context.get("issueId") or context.get("issue_id") or "").strip()
+    return ""
+
+
+def _run_result_texts(run: Any) -> list[str]:
+    if not isinstance(run, dict):
+        return []
+    result_json = run.get("resultJson") or run.get("result_json")
+    texts: list[str] = []
+    if isinstance(result_json, dict):
+        for key in ("result", "summary", "text", "message"):
+            value = result_json.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.append(value.strip())
+    for key in ("stdoutExcerpt", "stdout_excerpt"):
+        value = run.get(key)
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+    return texts
+
+
+def _latest_run_answer(config: PaperclipTeamsBridgeConfig, issue_id: str) -> str | None:
+    """Read the final answer directly from the Chef run result if available.
+
+    Paperclip persists adapter resultJson before/around issue-comment materialize.
+    Polling it avoids racing the final comment and keeps bridge delivery tied to
+    the exact issue rather than the latest Chef run globally.
+    """
+
+    if not issue_id:
+        return None
+    payload = _request_json(
+        "GET",
+        f"{config.api_base}/api/companies/{config.company_id}/heartbeat-runs?agentId={config.chef_agent_id}&limit=25",
+        timeout=config.request_timeout_seconds,
+    )
+    runs = [run for run in _as_list(payload) if _run_issue_id(run) == issue_id]
+    for run in sorted(runs, key=_run_created_at, reverse=True):
+        for text in _run_result_texts(run):
+            if _looks_probably_truncated(text):
+                continue
+            answer = _extract_teams_answer(text, require_marker=True)
+            if answer:
+                return answer
     return None
 
 
@@ -386,20 +483,33 @@ def poll_paperclip_issue_answer(
     interval = poll_interval_seconds if poll_interval_seconds is not None else bridge_config.poll_interval_seconds
     interval = max(1.0, float(interval or 1.0))
     deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    terminal_deadline: float | None = None
     latest_status: str | None = None
     while time.monotonic() <= deadline:
+        # Prefer the matching Chef run result over comments. Paperclip comments
+        # are UI/audit material and can contain stale auto-comments or delayed
+        # heartbeat summaries; resultJson is tied directly to the issue run.
+        try:
+            answer = _latest_run_answer(bridge_config, issue_id)
+        except RuntimeError:
+            answer = None
+        if answer:
+            return {"answer": answer, "issue_status": latest_status, "timed_out": False, "source": "run_result"}
         answer = _latest_issue_comment_answer(bridge_config, issue_id)
         if answer:
-            return {"answer": answer, "issue_status": latest_status, "timed_out": False}
+            return {"answer": answer, "issue_status": latest_status, "timed_out": False, "source": "issue_comment"}
         try:
             latest_status = _issue_status(bridge_config, issue_id)
         except RuntimeError:
             latest_status = latest_status or None
         if latest_status in _TERMINAL_ISSUE_STATUSES:
-            # A final comment can be committed a few seconds after the issue status.
-            time.sleep(min(interval, 3.0))
-            answer = _latest_issue_comment_answer(bridge_config, issue_id)
-            return {"answer": answer, "issue_status": latest_status, "timed_out": False}
+            # A final run result/comment can be committed shortly after status
+            # flips to done. Keep polling for a short grace period instead of
+            # returning the placeholder immediately.
+            if terminal_deadline is None:
+                terminal_deadline = min(deadline, time.monotonic() + max(0.0, bridge_config.terminal_grace_seconds))
+            if time.monotonic() >= terminal_deadline:
+                return {"answer": None, "issue_status": latest_status, "timed_out": False, "reason": "terminal_without_answer"}
         time.sleep(interval)
     return {"answer": None, "issue_status": latest_status, "timed_out": True}
 
@@ -409,8 +519,17 @@ def _wait_for_issue_answer(config: PaperclipTeamsBridgeConfig, issue: dict[str, 
     if not issue_id or config.wait_timeout_seconds <= 0:
         return None, None
     deadline = time.monotonic() + config.wait_timeout_seconds
+    terminal_deadline: float | None = None
     latest_status: str | None = None
     while time.monotonic() <= deadline:
+        # Prefer resultJson from the matching Chef run over comments; issue
+        # comments are delayed/audit-facing and can contain non-answer material.
+        try:
+            answer = _latest_run_answer(config, issue_id)
+        except RuntimeError:
+            answer = None
+        if answer:
+            return answer, latest_status
         answer = _latest_issue_comment_answer(config, issue_id)
         if answer:
             return answer, latest_status
@@ -419,12 +538,12 @@ def _wait_for_issue_answer(config: PaperclipTeamsBridgeConfig, issue: dict[str, 
         except RuntimeError:
             latest_status = latest_status or None
         if latest_status in _TERMINAL_ISSUE_STATUSES:
-            # Give Paperclip one short extra chance to persist the final comment.
-            time.sleep(min(config.poll_interval_seconds, 1.0))
-            answer = _latest_issue_comment_answer(config, issue_id)
-            if answer:
-                return answer, latest_status
-            return None, latest_status
+            # Give Paperclip a grace window to persist adapter resultJson and/or
+            # the final agent comment after the issue moves to done/cancelled.
+            if terminal_deadline is None:
+                terminal_deadline = min(deadline, time.monotonic() + max(0.0, config.terminal_grace_seconds))
+            if time.monotonic() >= terminal_deadline:
+                return None, latest_status
         time.sleep(max(0.2, config.poll_interval_seconds))
     return None, latest_status
 
@@ -499,7 +618,8 @@ def handle_paperclip_teams_case_assist(
                 response=response,
             )
         answer, run_status = _wait_for_issue_answer(bridge_config, issue)
-        response_text = answer or _fallback_response(issue, run_status=run_status)
+        fallback_text = _fallback_response(issue, run_status=run_status)
+        response_text = answer or fallback_text
         result = {
             "handled": True,
             "classification": "paperclip_case_assist",
@@ -512,6 +632,8 @@ def handle_paperclip_teams_case_assist(
             "paperclip_run_status": run_status,
             "paperclip_answer_ready": bool(answer),
             "paperclip_result_pending": not bool(answer),
+            "paperclip_placeholder_text": fallback_text,
+            "suppress_initial_response": not bool(answer),
             "paperclip_wakeup_id": wakeup.get("id") if isinstance(wakeup, dict) else None,
             "should_send_to_teams": False,
             "should_write_tms": False,
