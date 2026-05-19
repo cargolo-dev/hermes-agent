@@ -822,26 +822,23 @@ class TestTeamsMessageHandling:
         assert (tmp_path / "cargolo_asr" / "orders" / "AN-11755" / "teams" / "replies.jsonl").exists()
 
     @pytest.mark.asyncio
-    async def test_cargolo_employee_dedicated_channel_routes_to_safe_handoff(self, monkeypatch):
+    async def test_cargolo_employee_dedicated_channel_routes_to_agent_after_evidence_refresh(self, monkeypatch):
         def fake_handle_teams_message(**kwargs):
-            return {"handled": False, "reason": "no_card_context"}
-
-        handoff_calls = []
+            raise AssertionError("dedicated evidence agent prompt must bypass ASR reply loop")
 
         def fake_handle_teams_employee_message(**kwargs):
-            handoff_calls.append(kwargs)
-            return {
-                "handled": True,
-                "response_text": "Lage: AN-11755 | Keine externe Aktion ausgeführt.",
-                "should_write_tms": False,
-                "should_send_customer_message": False,
-            }
+            raise AssertionError("router-prepared agent prompt must not be swallowed by employee handoff")
 
         route_calls = []
-
         def fake_route_teams_ops_message(**kwargs):
             route_calls.append(kwargs)
-            return {"handled": False, "reason": "no_deterministic_ops_command"}
+            return {
+                "handled": False,
+                "allow_generic_chat": True,
+                "classification": "case_evidence_refreshed_agent_handoff",
+                "order_id": "AN-11755",
+                "agent_prompt": "Rolle: Du bist Hermes CARGOLO\nEvidence Refresh: ok\nOriginalfrage: Was ist mit AN-11755 los?",
+            }
 
         monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
         monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
@@ -854,11 +851,9 @@ class TestTeamsMessageHandling:
             cargolo_employee_handoff_enabled=True,
             cargolo_employee_dedicated_channel_ids=["cargolo-hermes"],
         ))
-        mock_result = MagicMock()
-        mock_result.id = "employee-ack"
         mock_app = MagicMock()
         mock_app.id = "bot-id"
-        mock_app.send = AsyncMock(return_value=mock_result)
+        mock_app.send = AsyncMock()
         adapter._app = mock_app
         adapter.handle_message = AsyncMock()
 
@@ -870,15 +865,12 @@ class TestTeamsMessageHandling:
         )
         await adapter._on_message(self._make_ctx(activity))
 
-        adapter.handle_message.assert_not_awaited()
         mock_app.send.assert_awaited_once()
-        assert "Lage: AN-11755" in mock_app.send.call_args[0][1]
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text.startswith("Rolle: Du bist Hermes CARGOLO")
+        assert "Evidence Refresh: ok" in event.text
         assert route_calls[0]["text"] == "Was ist mit AN-11755 los?"
-        assert handoff_calls[0]["channel_id"] == "cargolo-hermes"
-        assert handoff_calls[0]["text"] == "Was ist mit AN-11755 los?"
-        assert handoff_calls[0]["user_id"] == "aad-456"
-        assert handoff_calls[0]["user_name"] == "Test User"
-
     @pytest.mark.asyncio
     async def test_cargolo_employee_dedicated_free_chat_falls_through_to_generic_hermes(self, monkeypatch):
         def fake_handle_teams_message(**kwargs):
@@ -1100,8 +1092,12 @@ class TestTeamsMessageHandling:
             handoff_calls.append(kwargs)
             return {"handled": True, "response_text": "Lage: AN-11755 | Keine externe Aktion ausgeführt."}
 
+        def fake_route_teams_ops_message(**kwargs):
+            return {"handled": False, "reason": "no_deterministic_ops_command"}
+
         monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
         monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
+        monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", fake_route_teams_ops_message, raising=False)
 
         adapter = TeamsAdapter(_make_config(
             client_id="bot-id",
@@ -1126,7 +1122,7 @@ class TestTeamsMessageHandling:
         await adapter._on_message(self._make_ctx(activity))
 
         adapter.handle_message.assert_not_awaited()
-        mock_app.send.assert_awaited_once()
+        assert mock_app.send.await_count == 2
         assert handoff_calls[0]["channel_id"] == "19:logged-thread@thread.v2"
         assert handoff_calls[0]["text"] == "Was ist mit AN-11755 los?"
 

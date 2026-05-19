@@ -12,9 +12,26 @@ def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def test_dedicated_channel_routes_without_mention_to_employee_runtime(tmp_path: Path) -> None:
+def test_dedicated_channel_routes_case_assist_to_agent_after_evidence_refresh(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "cargolo_asr"
-    (root / "orders" / "AN-11755").mkdir(parents=True)
+    calls = []
+
+    def fake_handoff(**kwargs):
+        calls.append(kwargs)
+        return {
+            "handled": False,
+            "allow_generic_chat": True,
+            "classification": "case_evidence_refreshed_agent_handoff",
+            "order_id": kwargs["order_id"],
+            "agent_prompt": "frisch synchronisiert AN-11755",
+            "case_path": str(root / "orders" / kwargs["order_id"]),
+            "lifecycle": {"status": "ok"},
+            "should_send_to_teams": False,
+            "should_write_tms": False,
+            "should_send_customer_message": False,
+        }
+
+    monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.build_case_evidence_agent_handoff", fake_handoff)
 
     result = handle_teams_employee_message(
         root=root,
@@ -26,19 +43,23 @@ def test_dedicated_channel_routes_without_mention_to_employee_runtime(tmp_path: 
         config=TeamsHandoffConfig(dedicated_channel_ids={"cargolo-hermes"}),
     )
 
-    assert result["handled"] is True
+    assert result["handled"] is False
     assert result["handoff_mode"] == "dedicated_channel"
     assert result["requires_mention"] is False
     assert result["order_id"] == "AN-11755"
-    assert result["response_text"].startswith("<div><h2>🔎 Fallprüfung AN-11755")
+    assert result["allow_generic_chat"] is True
+    assert result["classification"] == "case_evidence_refreshed_agent_handoff"
+    assert result["agent_prompt"] == "frisch synchronisiert AN-11755"
+    assert result["response_text"] is None
     assert result["should_send_to_teams"] is False
     assert result["should_write_tms"] is False
     assert result["should_send_customer_message"] is False
-    assert (root / "orders" / "AN-11755" / "employee" / "review_required.json").exists()
+    assert calls[0]["order_id"] == "AN-11755"
 
     audit_rows = _read_jsonl(root / "runtime" / "teams_employee_handoff.jsonl")
     assert audit_rows[-1]["message_id"] == "teams-msg-1"
     assert audit_rows[-1]["handoff_mode"] == "dedicated_channel"
+    assert audit_rows[-1]["handled"] is False
 
 
 def test_dedicated_channel_free_chat_falls_through_to_generic_hermes(tmp_path: Path) -> None:
@@ -111,10 +132,12 @@ def test_shared_channel_routes_when_mentioned_and_strips_mention(tmp_path: Path)
         config=TeamsHandoffConfig(dedicated_channel_ids={"cargolo-hermes"}),
     )
 
-    assert result["handled"] is True
+    assert result["handled"] is False
     assert result["handoff_mode"] == "mention"
     assert result["request_text"] == "Was ist mit AN-11755 los?"
-    assert "Air / FRA -&gt; JFK" in result["response_text"]
+    assert result["allow_generic_chat"] is True
+    assert "AN-11755" in result["agent_prompt"]
+    assert result["response_text"] is None
     assert result["should_send_to_teams"] is False
 
 

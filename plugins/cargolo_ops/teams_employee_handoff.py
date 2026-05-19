@@ -15,8 +15,9 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .employee_agent import EmployeeRequest, ResponseMode
+from .employee_agent import EmployeeRequest, ResponseMode, handle_employee_request
 from .employee_runtime import run_employee_runtime
+from .teams_ops_router import build_case_evidence_agent_handoff
 from .models import utc_now_iso
 
 
@@ -104,13 +105,8 @@ def handle_teams_employee_message(
         channel="teams",
         actor=user_name or user_id,
     )
-    runtime_result = run_employee_runtime(
-        employee_request,
-        root=root,
-    )
-    response = runtime_result.employee_response
+    response = handle_employee_request(employee_request)
     mode_value = response.mode.value if isinstance(response.mode, ResponseMode) else str(response.mode)
-    handled = mode_value != ResponseMode.FREE_CHAT.value
     order_id = getattr(response, "order_id", None)
 
     base_row = {
@@ -122,6 +118,47 @@ def handle_teams_employee_message(
         "user_id": user_id,
         "user_name": user_name,
         "request_text": request_text,
+        "order_id": order_id,
+        "runtime": response.to_audit_row(),
+    }
+
+    if mode_value == ResponseMode.CASE_ASSIST.value and order_id:
+        handoff = build_case_evidence_agent_handoff(
+            root=root,
+            order_id=order_id,
+            text=request_text,
+            user_name=user_name or user_id,
+        )
+        row = {
+            **base_row,
+            "handled": bool(handoff.get("handled")),
+            "reason": None if handoff.get("handled") else "agent_case_assist_after_evidence_refresh",
+            "classification": str(handoff.get("classification") or "case_assist_agent_handoff"),
+            "passthrough_text": request_text,
+            "allow_generic_chat": bool(handoff.get("allow_generic_chat")),
+            "agent_prompt": handoff.get("agent_prompt"),
+            "response_text": handoff.get("response_text") if handoff.get("handled") else None,
+            "case_path": handoff.get("case_path"),
+            "lifecycle": handoff.get("lifecycle"),
+            "should_send_to_teams": bool(handoff.get("should_send_to_teams", False)),
+            "should_write_tms": bool(handoff.get("should_write_tms", False)),
+            "should_send_customer_message": bool(handoff.get("should_send_customer_message", False)),
+        }
+        if handoff_config.audit_enabled:
+            _append_jsonl(root / "runtime" / "teams_employee_handoff.jsonl", row)
+        return row
+
+    runtime_result = run_employee_runtime(
+        employee_request,
+        root=root,
+    )
+    response = runtime_result.employee_response
+    mode_value = response.mode.value if isinstance(response.mode, ResponseMode) else str(response.mode)
+    handled = mode_value != ResponseMode.FREE_CHAT.value
+    order_id = getattr(response, "order_id", None)
+
+    base_row = {
+        **base_row,
         "order_id": order_id,
         "runtime": runtime_result.to_audit_row(),
     }

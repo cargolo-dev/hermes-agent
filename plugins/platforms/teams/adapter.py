@@ -870,11 +870,11 @@ class TeamsAdapter(BasePlatformAdapter):
             from hermes_constants import get_hermes_home
             from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message
 
-            # Deep-dive ops commands are handled synchronously before the generic
+            # Case-assist refreshes can run synchronously before the generic
             # gateway loop, so the normal gateway typing indicator would not fire.
-            # Send an early Teams typing activity for these long-running TMS/mail/doc refreshes.
+            # Send an early Teams typing activity for AN/BU transport questions.
             if re.search(r"\b(?:AN|BU)-\d{3,}\b", text or "", re.IGNORECASE) and re.search(
-                r"\b(?:gib|geb|zeig|sag|hol|hole|prüf(?:e|en)?|pruef(?:e|en)?)\b.*\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b|\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b.*\b(?:zu|für|fuer)\b",
+                r"\b(?:gib|geb|zeig|sag|hol|hole|prüf(?:e|en)?|pruef(?:e|en)?|was ist|stand|status|lage|eta|etd|fehlt|sauber|antwort|geantwortet|kunde|mail|dokument|docs?|tms|sendung|update|komplett|übersicht|uebersicht)\b",
                 text or "",
                 re.IGNORECASE,
             ):
@@ -901,44 +901,53 @@ class TeamsAdapter(BasePlatformAdapter):
                             str(conv.id), pending_action, reply_to=str(msg_id) if msg_id else None
                         )
                 return
-
-            from plugins.cargolo_ops.teams_employee_handoff import handle_teams_employee_message
-
-            handoff_result = handle_teams_employee_message(
-                root=get_hermes_home() / "cargolo_asr",
-                text=text,
-                channel_id=handoff_channel_id,
-                message_id=str(msg_id) if msg_id else "",
-                user_id=str(user_id) if user_id else None,
-                user_name=user_name or None,
-                config=self._build_cargolo_handoff_config(),
-            )
-            dedicated_handoff_ran = True
-            if handoff_result.get("handled"):
-                if not handoff_result.get("suppress_initial_response"):
-                    await self.send(
-                        str(conv.id),
-                        str(handoff_result.get("response_text") or "Gespeichert."),
-                        reply_to=str(msg_id) if msg_id else None,
-                    )
-                return
-            if handoff_result.get("allow_generic_chat") and handoff_result.get("agent_prompt"):
-                text = str(handoff_result.get("agent_prompt"))
+            if ops_result.get("allow_generic_chat") and ops_result.get("agent_prompt"):
+                text = str(ops_result.get("agent_prompt"))
                 dedicated_generic_prompt_applied = True
+            else:
+                from plugins.cargolo_ops.teams_employee_handoff import handle_teams_employee_message
+
+                handoff_result = handle_teams_employee_message(
+                    root=get_hermes_home() / "cargolo_asr",
+                    text=text,
+                    channel_id=handoff_channel_id,
+                    message_id=str(msg_id) if msg_id else "",
+                    user_id=str(user_id) if user_id else None,
+                    user_name=user_name or None,
+                    config=self._build_cargolo_handoff_config(),
+                )
+                dedicated_handoff_ran = True
+                if handoff_result.get("handled"):
+                    if not handoff_result.get("suppress_initial_response"):
+                        await self.send(
+                            str(conv.id),
+                            str(handoff_result.get("response_text") or "Gespeichert."),
+                            reply_to=str(msg_id) if msg_id else None,
+                        )
+                    return
+                if handoff_result.get("allow_generic_chat") and handoff_result.get("agent_prompt"):
+                    text = str(handoff_result.get("agent_prompt"))
+                    dedicated_generic_prompt_applied = True
 
         # CARGOLO ASR Teams reply loop: replies to operator cards are
         # deterministic case-learning/control events, not generic chat.
+        # If the dedicated-channel router/handoff already produced an agent prompt
+        # (for example after refreshing AN/BU evidence), do not run the reply loop
+        # over that internal prompt; it can otherwise mistake the prompt's AN/BU as
+        # a card reply and replace/persist the actual evidence prompt.
         try:
-            from plugins.cargolo_ops.teams_reply_loop import handle_teams_message
+            reply_result = {"handled": False}
+            if not dedicated_generic_prompt_applied:
+                from plugins.cargolo_ops.teams_reply_loop import handle_teams_message
 
-            reply_result = handle_teams_message(
-                text=text,
-                chat_id=str(conv.id),
-                user_id=str(user_id),
-                user_name=user_name,
-                message_id=str(msg_id) if msg_id else None,
-                reply_to_message_id=str(reply_to_message_id) if reply_to_message_id else None,
-            )
+                reply_result = handle_teams_message(
+                    text=text,
+                    chat_id=str(conv.id),
+                    user_id=str(user_id),
+                    user_name=user_name,
+                    message_id=str(msg_id) if msg_id else None,
+                    reply_to_message_id=str(reply_to_message_id) if reply_to_message_id else None,
+                )
             asr_agent_prompt = None
             if reply_result.get("handled"):
                 await self.send(str(conv.id), str(reply_result.get("response_text") or "Gespeichert."), reply_to=str(msg_id) if msg_id else None)
@@ -947,7 +956,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 asr_agent_prompt = str(reply_result.get("agent_prompt"))
                 text = asr_agent_prompt
             else:
-                if self._cargolo_employee_handoff_enabled and not dedicated_handoff_ran:
+                if self._cargolo_employee_handoff_enabled and not dedicated_handoff_ran and not dedicated_generic_prompt_applied:
                     from hermes_constants import get_hermes_home
                     from plugins.cargolo_ops.teams_employee_handoff import handle_teams_employee_message
 

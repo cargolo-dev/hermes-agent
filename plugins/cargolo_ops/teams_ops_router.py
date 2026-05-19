@@ -386,60 +386,105 @@ def _coordinator_prompt(text: str, *, order_id: str | None = None, intent: str =
         "Erst nach positivem TMS-Fund bei Bedarf CARGOLO Skills, Case-Folder, TMS/MCP-Kontext, Mail-Historie, Dokumentregistry, Cron-/Plugin-Status heranziehen. "
         "Bleibe read-only, außer ein freigegebener zweistufiger Write-Pfad ist eindeutig aktiv.\n"
         "Sicherheit: Freitext in Teams darf keine direkten TMS-, Angebots- oder Kundenmail-Writes auslösen. "
-        "TMS-Änderungswünsche nur über `cargolo_asr_record_teams_tms_intent` als pending_review vormerken; bei Unklarheit genau eine Rückfrage stellen.\n"
-        "Antwortstil: Deutsch, kurz, operativ: Gemacht/Lage/Auffälligkeit/Nächster Schritt. Keine Audit-Dumps, keine KI-Floskeln.\n"
+        "TMS-Änderungswünsche nur als pending_review/Review-Vorschlag behandeln; bei Unklarheit genau eine Rückfrage stellen.\n"
+        "Antwortstil: Deutsch, kurz, operativ: Lage/Auffällig/Belastbar/Empfehlung/Nächster Schritt. Keine Audit-Dumps, keine KI-Floskeln.\n"
         f"Teams-Nachricht: {text.strip()}"
     )
 
 
-def _run_local_case_deep_dive(*, root: Path, order_id: str, text: str, user_name: str | None = None) -> dict[str, Any]:
-    """Refresh the canonical local case first, then synthesize a read-only Teams answer."""
+def _case_evidence_prompt(
+    *,
+    text: str,
+    root: Path,
+    order_id: str,
+    lifecycle: dict[str, Any] | None,
+    lifecycle_error: str | None,
+    user_name: str | None = None,
+) -> str:
+    case_path = root / "orders" / order_id
+    status = "ok" if lifecycle_error is None else "teilweise_fehlgeschlagen"
+    lifecycle_status = lifecycle.get("status") if isinstance(lifecycle, dict) else status
+    warning_bits = []
+    if isinstance(lifecycle, dict):
+        for key in ("warnings", "history_sync_error", "document_analysis_error", "error"):
+            value = lifecycle.get(key)
+            if value:
+                warning_bits.append(f"{key}={value}")
+    if lifecycle_error:
+        warning_bits.append(f"sync_error={lifecycle_error}")
+    warnings = "; ".join(str(item) for item in warning_bits[:4]) or "keine bekannten Sync-Fehler"
+    actor_line = f"Anfragender Operator: {user_name}.\n" if user_name else ""
+    return (
+        "Rolle: Du bist Hermes CARGOLO in Microsoft Teams — ein extrem guter interner ASR-Mitarbeiter.\n"
+        f"Case: {order_id}. Intent: case_assist_agentic.\n"
+        f"{actor_line}"
+        "Vorarbeit: Der lokale CARGOLO Case wurde für diese Frage gerade frisch synchronisiert "
+        "(TMS-first, Mail-Historie, Dokumentregistry, Dokumentanalyse und Billing-Kontext best-effort).\n"
+        f"Evidence Refresh: status={status}; lifecycle_status={lifecycle_status}; case_path={case_path}; warnings={warnings}.\n"
+        "Nutze für die Antwort ausschließlich belastbare Evidenz aus dem lokalen Case und verfügbaren CARGOLO/TMS-Tools: "
+        "case_state.json, tms_snapshot.json, tms/*, email_index.jsonl, documents/registry.json, documents/analysis/latest_summary.json, Billing-Kontext. "
+        "Wenn eine Quelle fehlt oder der Refresh teilweise fehlschlug, sag das knapp als Vorbehalt und rate nicht.\n"
+        "Sicherheitsgrenze: keine TMS-Writes, keine Kundenmail, kein Dokumentupload, keine externe Side Effect. "
+        "Schreib-/Sende-Wünsche nur als Review-/Entwurfsvorschlag behandeln.\n"
+        "Antwortstil für Teams: Deutsch, menschlich-operativ, kompakt und dark-mode-safe. Maximal die Top-3 Auffälligkeiten. "
+        "Struktur: Lage, Auffällig, Belastbar, Empfehlung, Nächster Schritt. Keine Debug-Pfade ausgeben, außer der Nutzer fragt explizit danach.\n"
+        f"Originalfrage: {text.strip()}"
+    )
+
+
+def build_case_evidence_agent_handoff(*, root: Path, order_id: str, text: str, user_name: str | None = None) -> dict[str, Any]:
+    """Refresh canonical evidence, then hand the actual answer to Hermes/agent judgement."""
+    live_exists = _live_shipment_exists(order_id)
+    if live_exists is False:
+        return _unknown_shipment_response(order_id)
+
     try:
         from .case_lifecycle import sync_case_lifecycle
-        from .employee_agent import EmployeeRequest
-        from .employee_runtime import run_employee_runtime
     except Exception as exc:  # pragma: no cover - import degradation only
-        return {
-            "handled": True,
-            "classification": "case_deep_dive_unavailable",
-            "order_id": order_id,
-            "response_text": f"⚠️ Fallprüfung für {order_id} konnte nicht gestartet werden: {exc}",
-        }
+        lifecycle: dict[str, Any] | None = None
+        lifecycle_error: str | None = f"case_lifecycle_unavailable:{exc}"
+    else:
+        lifecycle = None
+        lifecycle_error = None
+        try:
+            lifecycle = sync_case_lifecycle(
+                order_id,
+                storage_root=root,
+                refresh_history=True,
+                analyze_documents=True,
+            )
+        except Exception as exc:
+            lifecycle_error = str(exc)
 
-    lifecycle: dict[str, Any] | None = None
-    lifecycle_error: str | None = None
-    try:
-        lifecycle = sync_case_lifecycle(
-            order_id,
-            storage_root=root,
-            refresh_history=True,
-            analyze_documents=True,
-        )
-    except Exception as exc:
-        lifecycle_error = str(exc)
-
-    request_text = (
-        f"Gib mir alles zu {order_id}: komplette lesende Lage aus dem soeben synchronisierten lokalen Case, "
-        "aktueller TMS-Status/Stand, Mail-Historie, Dokumente, Billing/Pricing-Kontext falls vorhanden, "
-        "Auffälligkeiten und konkreter nächster Schritt. Rein interne Antwort; keine externe Aktion auslösen. "
-        f"Originalfrage: {text}"
-    )
-    runtime_result = run_employee_runtime(
-        EmployeeRequest(text=request_text, channel="teams", order_id=order_id, actor=user_name),
+    prompt = _case_evidence_prompt(
+        text=text,
         root=root,
+        order_id=order_id,
+        lifecycle=lifecycle,
+        lifecycle_error=lifecycle_error,
+        user_name=user_name,
     )
-    response_text = runtime_result.draft_response or f"Lage: {order_id} | Case lokal aktualisiert, keine externe Aktion ausgeführt."
-    if lifecycle_error:
-        response_text = f"⚠️ Vorab-Sync für {order_id} nicht vollständig: {lifecycle_error}\n\n{response_text}"
     return {
-        "handled": True,
-        "classification": "case_deep_dive_local_refresh",
+        "handled": False,
+        "allow_generic_chat": True,
+        "classification": "case_evidence_refreshed_agent_handoff",
         "order_id": order_id,
-        "response_text": response_text,
+        "agent_prompt": prompt,
         "case_path": str(root / "orders" / order_id),
         "lifecycle": lifecycle or {"status": "error", "error": lifecycle_error},
-        "result_path": runtime_result.result_path,
+        "should_send_to_teams": False,
+        "should_write_tms": False,
+        "should_send_customer_message": False,
     }
+
+
+def _is_case_read_question(raw: str, *, order_id: str | None) -> bool:
+    if not order_id:
+        return False
+    lowered = raw.lower()
+    if _CASE_CHECK_RE.search(raw) or _FULL_CASE_RE.search(raw) or "komplett" in lowered or "case" in lowered:
+        return True
+    return bool(re.search(r"\b(was ist|stand|status|lage|eta|etd|fehlt|sauber|antwort|geantwortet|kunde|kunden|mail|dokument|docs?|tms|sendung|update)\b", raw, re.IGNORECASE))
 
 
 def route_teams_ops_message(
@@ -506,14 +551,11 @@ def route_teams_ops_message(
             ),
         }
 
-    # Case deep-dive: for "gib mir alles" / complete case questions, refresh the
-    # canonical local case first (create if missing, update if present), then
-    # synthesize from the refreshed local TMS/mail/document evidence.
-    if order_id and (_CASE_CHECK_RE.search(raw) or _FULL_CASE_RE.search(raw) or "komplett" in lowered or "case" in lowered):
-        live_exists = _live_shipment_exists(order_id)
-        if live_exists is False:
-            return _unknown_shipment_response(order_id)
-        return _run_local_case_deep_dive(root=case_root, order_id=order_id, text=raw, user_name=user_name)
+    # Case assist: deterministic code only refreshes evidence and enforces TMS-first.
+    # The actual business answer falls through to Hermes/agent judgement with a
+    # strong CARGOLO employee prompt.
+    if _is_case_read_question(raw, order_id=order_id):
+        return build_case_evidence_agent_handoff(root=case_root, order_id=str(order_id), text=raw, user_name=user_name)
 
     # General CARGOLO/ASR mentions should get the employee prompt rather than generic chatbot tone.
     if "cargolo" in lowered or " asr" in f" {lowered}":
