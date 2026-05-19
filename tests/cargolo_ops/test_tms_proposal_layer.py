@@ -92,6 +92,58 @@ def test_agentic_proposal_layer_skips_duplicates_and_conflicts(tmp_path: Path) -
     assert len(rows) == 1
 
 
+def test_agentic_proposal_layer_prefers_tms_container_match_and_supersedes_stale_pending(tmp_path: Path) -> None:
+    from plugins.cargolo_ops.tms_proposal_layer import queue_agentic_tms_review_cards
+
+    _write_case(
+        tmp_path,
+        "AN-12218",
+        tms_snapshot={"detail": {"totals": {"total_weight_kg": 0, "total_packages": 0}, "freight_details": {"container_number": "FORU8867533", "seal_number": ""}}},
+        analyzed_documents=[
+            {"filename": "CIMU1670214.pdf", "doc_type": "bill_of_lading", "extracted_fields": {"shipment_number": "AN-12218", "container_number": "CIMU1670214", "gross_weight": "6500", "pieces": "731", "seal_number": "ZH165700"}},
+            {"filename": "FORU8867533.pdf", "doc_type": "bill_of_lading", "extracted_fields": {"shipment_number": "AN-12218", "container_number": "FORU8867533", "gross_weight": "10100", "pieces": "714", "seal_number": "ZH165701"}},
+        ],
+    )
+    first = queue_agentic_tms_review_cards(root=tmp_path, order_id="AN-12218", max_cards=3)
+    assert [(card["target"], card["value"]) for card in first] == [("cargo_weight_kg", "10100"), ("cargo_pieces", "714"), ("seal_number", "ZH165701")]
+
+    # Simulate stale proposals from an earlier weaker pass and ensure stronger
+    # evidence supersedes them instead of being silently suppressed.
+    queue_path = tmp_path / "orders" / "AN-12219" / "teams" / "pending_tms_actions.jsonl"
+    _write_case(
+        tmp_path,
+        "AN-12219",
+        tms_snapshot={"detail": {"totals": {"total_weight_kg": 0}, "freight_details": {"container_number": "FORU8867533"}}},
+        analyzed_documents=[
+            {"filename": "FORU8867533.pdf", "doc_type": "bill_of_lading", "extracted_fields": {"shipment_number": "AN-12219", "container_number": "FORU8867533", "gross_weight": "10100"}},
+        ],
+    )
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    queue_path.write_text(json.dumps({"status": "pending_review", "order_id": "AN-12219", "target": "cargo_weight_kg", "value": "6500"}) + "\n", encoding="utf-8")
+    second = queue_agentic_tms_review_cards(root=tmp_path, order_id="AN-12219", max_cards=1)
+    assert [(card["target"], card["value"]) for card in second] == [("cargo_weight_kg", "10100")]
+    rows = _read_jsonl(queue_path)
+    assert rows[0]["status"] == "superseded"
+    assert rows[0]["superseded_by_value"] == "10100"
+    assert rows[1]["status"] == "pending_review"
+
+
+def test_agentic_proposal_layer_extracts_hs_code_from_goods_description(tmp_path: Path) -> None:
+    from plugins.cargolo_ops.tms_proposal_layer import queue_agentic_tms_review_cards
+
+    _write_case(
+        tmp_path,
+        "AN-12218",
+        tms_snapshot={"detail": {"customs": {"hs_code": ""}}},
+        analyzed_documents=[
+            {"filename": "invoice.pdf", "doc_type": "commercial_invoice", "extracted_fields": {"goods_description": "SHOES (HS CODE: 640212)"}},
+        ],
+    )
+
+    cards = queue_agentic_tms_review_cards(root=tmp_path, order_id="AN-12218", max_cards=3)
+    assert [(card["target"], card["value"]) for card in cards] == [("hs_code", "640212")]
+
+
 def test_agentic_proposal_layer_queues_supported_pickup_date_but_no_write(tmp_path: Path) -> None:
     from plugins.cargolo_ops.tms_proposal_layer import queue_agentic_tms_review_cards
 

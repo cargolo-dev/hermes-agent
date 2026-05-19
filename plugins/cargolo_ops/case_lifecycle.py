@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -16,6 +17,54 @@ from .storage import CaseStore
 
 ASR_MODES = {"air", "sea", "rail", "unknown"}
 DEFAULT_TMS_ADMIN_USER_ID = 106
+MAIL_HISTORY_FRESHNESS_TTL_SECONDS = 10 * 60
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _last_successful_history_sync_at(store: CaseStore, order_id: str) -> datetime | None:
+    path = store.order_path(order_id) / "audit" / "actions.jsonl"
+    if not path.exists():
+        return None
+    latest: datetime | None = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get("action") != "sync_case_lifecycle" or row.get("result") != "ok":
+            continue
+        extra = row.get("extra") if isinstance(row.get("extra"), dict) else row
+        if str(extra.get("history_sync_status") or "") not in {"ok", "no_messages"}:
+            continue
+        seen = _parse_utc(row.get("timestamp"))
+        if seen and (latest is None or seen > latest):
+            latest = seen
+    return latest
+
+
+def _should_skip_fresh_mail_history(store: CaseStore, order_id: str, state: CaseState) -> bool:
+    if not state.last_email_at:
+        return False
+    last_sync = _last_successful_history_sync_at(store, order_id)
+    if not last_sync:
+        return False
+    return (datetime.now(timezone.utc) - last_sync).total_seconds() < MAIL_HISTORY_FRESHNESS_TTL_SECONDS
 
 
 def normalize_asr_mode(value: Any) -> str:
@@ -321,24 +370,28 @@ def sync_case_lifecycle(
     prior_last_email_at = state.last_email_at
     if refresh_history:
         history_sync_mode = "delta" if prior_last_email_at else "full_first"
-        try:
-            history_client_available = processor.build_mail_history_client_from_env() is not None
-        except Exception:
-            history_client_available = None
-        try:
-            history_count = processor._sync_mail_history(store, order_id, state, mailbox, exclude_message_ids=set())
-            if history_client_available is False:
-                history_sync_status = "no_client"
-                history_error = "mail_history_sync_unavailable:no_client"
-            elif history_count > 0:
-                history_sync_status = "ok"
-            else:
-                # A successful call with zero new messages is not a failure, but it
-                # is distinct from an unavailable client or crashed n8n workflow.
-                history_sync_status = "no_messages"
-        except Exception as exc:
-            history_sync_status = "failed"
-            history_error = f"mail_history_sync_failed: {exc}"
+        if _should_skip_fresh_mail_history(store, order_id, state):
+            history_sync_mode = "freshness_skip"
+            history_sync_status = "fresh_skipped"
+        else:
+            try:
+                history_client_available = processor.build_mail_history_client_from_env() is not None
+            except Exception:
+                history_client_available = None
+            try:
+                history_count = processor._sync_mail_history(store, order_id, state, mailbox, exclude_message_ids=set())
+                if history_client_available is False:
+                    history_sync_status = "no_client"
+                    history_error = "mail_history_sync_unavailable:no_client"
+                elif history_count > 0:
+                    history_sync_status = "ok"
+                else:
+                    # A successful call with zero new messages is not a failure, but it
+                    # is distinct from an unavailable client or crashed n8n workflow.
+                    history_sync_status = "no_messages"
+            except Exception as exc:
+                history_sync_status = "failed"
+                history_error = f"mail_history_sync_failed: {exc}"
 
     history_rows = store.list_email_index(order_id)
     latest_history_at = max(

@@ -30,7 +30,7 @@ _ORDER_RE = re.compile(r"\b(?:AN|BU)-\d{3,}\b", re.IGNORECASE)
 _STATUS_RE = re.compile(r"\b(status|health|readiness|zustand|system|läuft|laeuft|cron)\b", re.IGNORECASE)
 _PENDING_RE = re.compile(r"\b(offene?|pending|freigaben?|review|tms[-\s]?freigaben?)\b", re.IGNORECASE)
 _CASE_CHECK_RE = re.compile(r"\b(prüf(?:e|en)?|pruef(?:e|en)?|(?<!-)check|aktualisier(?:e|en)?|sync|zieh(?:e|en)?)\b", re.IGNORECASE)
-_FULL_CASE_RE = re.compile(r"\b(?:gib|geb|zeig|sag|hol|hole)\b.*\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b|\b(?:alles|lage|stand|komplett|übersicht|uebersicht)\b.*\b(?:zu|für|fuer)\b", re.IGNORECASE)
+_FULL_CASE_RE = re.compile(r"\b(?:gib|geb|zeig|sag|hol|hole)\b.*\b(?:alles|infos?|informationen?|details?|lage|stand|komplett|übersicht|uebersicht)\b|\b(?:alles|infos?|informationen?|details?|lage|stand|komplett|übersicht|uebersicht)\b.*\b(?:zu|für|fuer)\b", re.IGNORECASE)
 _WRITE_RE = re.compile(r"\b(schreib(?:e|en)?|setz(?:e|en)?|eintragen|ändern|aendern|update|aktualisier(?:e|en)?)\b", re.IGNORECASE)
 _TMS_FIELD_RE = re.compile(r"\b(TMS|MRN|HBL|MBL|HAWB|Container|Container[-\s]?Nr|Zollreferenz|customs)\b", re.IGNORECASE)
 _MRN_VALUE_RE = re.compile(r"\b([0-9]{2}[A-Z]{2}[A-Z0-9]{3,})\b", re.IGNORECASE)
@@ -514,7 +514,7 @@ def _is_case_read_question(raw: str, *, order_id: str | None) -> bool:
     lowered = raw.lower()
     if _CASE_CHECK_RE.search(raw) or _FULL_CASE_RE.search(raw) or "komplett" in lowered or "case" in lowered:
         return True
-    return bool(re.search(r"\b(was ist|stand|status|lage|eta|etd|fehlt|sauber|antwort|geantwortet|kunde|kunden|mail|dokument|docs?|tms|sendung|update)\b", raw, re.IGNORECASE))
+    return bool(re.search(r"\b(was ist|stand|status|lage|infos?|informationen?|details?|eta|etd|fehlt|sauber|antwort|geantwortet|kunde|kunden|mail|dokument|docs?|tms|sendung|update)\b", raw, re.IGNORECASE))
 
 
 def should_use_case_assist_speed_layer(text: str) -> tuple[bool, str | None]:

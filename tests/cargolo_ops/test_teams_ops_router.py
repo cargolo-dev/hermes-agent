@@ -297,6 +297,8 @@ def test_case_assist_speed_layer_classifier_is_cheap_and_read_only() -> None:
 
     assert use_speed_layer is True
     assert order_id == "AN-12345"
+    assert should_use_case_assist_speed_layer("Gib mir alle Infos zu AN-12218") == (True, "AN-12218")
+    assert should_use_case_assist_speed_layer("Details zu AN-12218") == (True, "AN-12218")
 
 
 def test_case_assist_speed_layer_does_not_swallow_free_chat_or_tms_writes() -> None:

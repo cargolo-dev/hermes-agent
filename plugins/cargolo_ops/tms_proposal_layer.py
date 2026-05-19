@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -17,6 +18,16 @@ _PLACEHOLDERS = {"", "-", "n/a", "na", "none", "null", "unknown", "unbekannt", "
 _WRITE_SUPPORTED_TARGETS = {"customs_reference", "hbl_number", "mbl_number", "hawb_number", "container_number", "pickup_date", "estimated_delivery_date"}
 _REVIEW_ONLY_TARGETS = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code"}
 _SUPPORTED_TARGETS = _WRITE_SUPPORTED_TARGETS | _REVIEW_ONLY_TARGETS
+_TARGET_PRIORITY = {
+    "cargo_weight_kg": 10,
+    "cargo_pieces": 20,
+    "seal_number": 30,
+    "hs_code": 40,
+    "pickup_date": 50,
+    "estimated_delivery_date": 60,
+    "container_number": 70,
+    "customs_reference": 80,
+}
 
 
 _FIELD_SPECS: dict[str, dict[str, Any]] = {
@@ -109,6 +120,17 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+
+
+def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def _clean(value: Any) -> str:
     if value is None:
         return ""
@@ -196,6 +218,47 @@ def _normalize_value(value: Any, kind: str) -> str:
     return text
 
 
+def _extract_hs_code_from_text(value: Any) -> str:
+    text = _clean(value)
+    if not text:
+        return ""
+    matches = re.findall(r"\bHS(?:\s*[-/]?\s*CODE)?\s*[:#-]?\s*(\d{6,10})\b", text, re.IGNORECASE)
+    unique = sorted(set(matches))
+    return ", ".join(unique[:3]) if len(unique) == 1 else ""
+
+
+def _raw_doc_value(fields: dict[str, Any], spec: dict[str, Any]) -> str:
+    for key in spec["doc_keys"]:
+        value = _clean(fields.get(key))
+        if value:
+            return value
+    if str(spec.get("kind") or "") == "hs_code":
+        for key in ("goods_description", "description", "commodity_description", "notes"):
+            value = _extract_hs_code_from_text(fields.get(key))
+            if value:
+                return value
+    return ""
+
+
+def _candidate_score(*, fields: dict[str, Any], analysis: dict[str, Any], source_name: str, tms_snapshot: dict[str, Any], order_id: str) -> int:
+    score = 0
+    order_blob = " ".join(_clean(fields.get(key)) for key in ("shipment_number", "order_id", "reference", "booking_reference", "customer_reference"))
+    if _norm(order_id) and (_norm(order_id) in _norm(order_blob) or _norm(order_id) in _norm(source_name)):
+        score += 60
+    tms_container = _normalize_value(_first_path(tms_snapshot, (("detail", "freight_details", "container_number"), ("freight_details", "container_number"), ("container_number",))), "container")
+    doc_container = _normalize_value(" ".join(_clean(fields.get(key)) for key in ("container_number", "container_no", "container")), "container")
+    if tms_container and doc_container:
+        score += 80 if _norm(tms_container) == _norm(doc_container) else -60
+    elif tms_container and _norm(tms_container) in _norm(source_name):
+        score += 40
+    doc_type = str(analysis.get("doc_type") or "").lower()
+    if doc_type in {"waybill", "bill_of_lading", "master_bl", "house_bl"}:
+        score += 20
+    elif doc_type in {"packing_list", "commercial_invoice", "customs_document"}:
+        score += 10
+    return score
+
+
 def _same_value(left: str, right: str, kind: str) -> bool:
     if not left or not right:
         return False
@@ -259,6 +322,44 @@ def _pending_duplicate_or_conflict(root: Path, order_id: str, target: str, value
     return duplicate, conflict
 
 
+def _supersede_pending_conflicts(root: Path, order_id: str, target: str, value: str, *, operator: str | None, source: str) -> int:
+    queue = root / "orders" / order_id / "teams" / "pending_tms_actions.jsonl"
+    rows = _read_jsonl(queue)
+    changed = 0
+    if not rows:
+        return 0
+    now = None
+    for row in rows:
+        if str(row.get("status") or "") != "pending_review":
+            continue
+        if str(row.get("order_id") or "").strip().upper() != order_id:
+            continue
+        if str(row.get("target") or "").strip() != target:
+            continue
+        existing = _clean(row.get("value"))
+        if existing and _norm(existing) != _norm(value):
+            now = now or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            row["status"] = "superseded"
+            row["superseded_at"] = now
+            row["superseded_by_value"] = value
+            row["superseded_reason"] = "stronger_agentic_evidence_delta"
+            changed += 1
+    if changed:
+        _write_jsonl(queue, rows)
+        _append_jsonl(root / "orders" / order_id / "audit" / "actions.jsonl", {
+            "timestamp": now,
+            "actor": operator or "Hermes Agentic Proposal Layer",
+            "action": "teams_agent_tms_update_intent_superseded",
+            "result": "superseded",
+            "target": target,
+            "value": value,
+            "count": changed,
+            "source": source,
+            "files": [str(queue)],
+        })
+    return changed
+
+
 def _load_case_artifacts(root: Path, order_id: str) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     case_root = root / "orders" / order_id
     case_state = _load_json(case_root / "case_state.json")
@@ -300,8 +401,7 @@ def queue_agentic_tms_review_cards(
         return []
     context_id = context_id or f"{normalized_order}:agentic_tms_proposal"
 
-    candidates: list[dict[str, Any]] = []
-    per_target_values: dict[str, set[str]] = {}
+    raw_candidates: list[dict[str, Any]] = []
     documents = _iter_evidence_documents(case_root, registry or {}, document_summary or {})
     for item in documents:
         row = item["row"]
@@ -309,21 +409,21 @@ def queue_agentic_tms_review_cards(
         fields = item["fields"]
         source_name = _clean(item.get("source")) or "Dokumentanalyse"
         doc_type = _doc_type(row, analysis)
+        score = _candidate_score(fields=fields, analysis=analysis, source_name=source_name, tms_snapshot=tms_snapshot, order_id=normalized_order)
         for target, spec in _FIELD_SPECS.items():
             if target not in _SUPPORTED_TARGETS:
                 continue
             trusted_types = spec.get("trusted_doc_types") or set()
             if doc_type and trusted_types and doc_type not in trusted_types:
                 continue
-            raw_doc = next((_clean(fields.get(key)) for key in spec["doc_keys"] if _clean(fields.get(key))), "")
+            raw_doc = _raw_doc_value(fields, spec)
             value = _normalize_value(raw_doc, str(spec.get("kind") or "text"))
             if not value:
                 continue
             tms_value = _normalize_value(_first_path(tms_snapshot, spec["tms_paths"]), str(spec.get("kind") or "text"))
             if tms_value and _same_value(tms_value, value, str(spec.get("kind") or "text")):
                 continue
-            per_target_values.setdefault(target, set()).add(_norm(value))
-            candidates.append({
+            raw_candidates.append({
                 "target": target,
                 "value": value,
                 "previous_value": tms_value or _first_path(tms_snapshot, spec["tms_paths"]) or "nicht gepflegt",
@@ -333,10 +433,24 @@ def queue_agentic_tms_review_cards(
                 "doc_type": doc_type,
                 "caution": bool(spec.get("caution")),
                 "write_supported": target in _WRITE_SUPPORTED_TARGETS,
+                "score": score,
             })
 
-    # Drop fields where different documents yielded competing values.
-    conflict_targets = {target for target, values in per_target_values.items() if len(values) > 1}
+    # Pick the strongest evidence per target instead of dropping a useful target
+    # just because an older/other document carries a competing value.  If two
+    # competing values are equally strong, skip that target as ambiguous.
+    candidates: list[dict[str, Any]] = []
+    for target in {str(item.get("target")) for item in raw_candidates}:
+        grouped = [item for item in raw_candidates if str(item.get("target")) == target]
+        grouped.sort(key=lambda item: int(item.get("score") or 0), reverse=True)
+        if not grouped:
+            continue
+        top = grouped[0]
+        runner_up = next((item for item in grouped[1:] if _norm(item.get("value")) != _norm(top.get("value"))), None)
+        if runner_up and int(runner_up.get("score") or 0) >= int(top.get("score") or 0):
+            continue
+        candidates.append(top)
+    candidates.sort(key=lambda item: (-int(item.get("score") or 0), _TARGET_PRIORITY.get(str(item.get("target")), 999)))
     seen: set[tuple[str, str]] = set()
     queued_cards: list[dict[str, Any]] = []
     try:
@@ -349,15 +463,15 @@ def queue_agentic_tms_review_cards(
             break
         target = str(candidate["target"])
         value = str(candidate["value"])
-        if target in conflict_targets:
-            continue
         key = (target, _norm(value))
         if key in seen:
             continue
         seen.add(key)
         duplicate, pending_conflict = _pending_duplicate_or_conflict(root, normalized_order, target, value)
-        if duplicate or pending_conflict:
+        if duplicate:
             continue
+        if pending_conflict:
+            _supersede_pending_conflicts(root, normalized_order, target, value, operator=operator, source=source)
         caution = " Vorsicht: HS-Code nur aus Dokument übernehmen, wenn fachlich plausibel." if candidate.get("caution") else ""
         write_note = "Review-only; kein direkter TMS-Write-Zielpfad vorhanden." if not candidate.get("write_supported") else "Bestehender TMS-Writeback-Zielpfad vorhanden; trotzdem nur nach Freigabe."
         text = (

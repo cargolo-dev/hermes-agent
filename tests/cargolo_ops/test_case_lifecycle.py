@@ -132,6 +132,38 @@ def test_sync_case_lifecycle_existing_case_uses_delta_mail_sync(tmp_path):
     assert result["last_email_at"] == "2026-05-18T08:00:00Z"
 
 
+def test_sync_case_lifecycle_skips_recent_successful_mail_history_sync(tmp_path):
+    snapshot = TMSSnapshot(
+        order_id="AN-33337",
+        shipment_number="AN-33337",
+        status="confirmed",
+        source="live",
+        detail={"network": "rail"},
+    )
+    store = CaseStore(tmp_path)
+    state = store.load_case_state("AN-33337")
+    state.last_email_at = "2026-05-18T08:00:00Z"
+    store.save_case_state("AN-33337", state)
+    store.append_audit(
+        "AN-33337",
+        action="sync_case_lifecycle",
+        result="ok",
+        files=[],
+        extra={"history_sync_status": "no_messages", "history_sync_mode": "delta"},
+    )
+
+    with patch("plugins.cargolo_ops.processor._live_shipment_exists", return_value=True), \
+         patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(snapshot, {}, {})), \
+         patch("plugins.cargolo_ops.processor._sync_mail_history") as sync_mock, \
+         patch("plugins.cargolo_ops.case_lifecycle.analyze_case_documents", side_effect=lambda **kwargs: (kwargs["registry"], [])):
+        result = sync_case_lifecycle("AN-33337", storage_root=tmp_path, analyze_documents=True)
+
+    sync_mock.assert_not_called()
+    assert result["history_sync_mode"] == "freshness_skip"
+    assert result["history_sync_status"] == "fresh_skipped"
+    assert result["history_sync_count"] == 0
+
+
 def test_sync_case_lifecycle_marks_initial_mail_history_no_client_as_unreliable(tmp_path):
     snapshot = TMSSnapshot(
         order_id="AN-33335",
