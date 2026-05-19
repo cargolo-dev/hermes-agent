@@ -70,6 +70,117 @@ def test_sync_case_lifecycle_fetches_tms_before_creating_local_case(tmp_path):
     assert (tmp_path / "orders" / "AN-22222" / "tms" / "shipment_detail.json").exists()
 
 
+def test_sync_case_lifecycle_new_tms_case_uses_full_first_mail_sync(tmp_path):
+    snapshot = TMSSnapshot(
+        order_id="AN-33333",
+        shipment_number="AN-33333",
+        status="confirmed",
+        source="live",
+        detail={"network": "sea"},
+    )
+    captured = {}
+
+    def fake_sync(store, order_id, state, mailbox, *, exclude_message_ids=None):
+        captured["prior_last_email_at"] = state.last_email_at
+        store.append_email_index(order_id, {"message_id": "m-1", "received_at": "2026-05-19T08:00:00Z"})
+        return 1
+
+    with patch("plugins.cargolo_ops.processor._live_shipment_exists", return_value=True), \
+         patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(snapshot, {}, {})), \
+         patch("plugins.cargolo_ops.processor.build_mail_history_client_from_env", return_value=object()), \
+         patch("plugins.cargolo_ops.processor._sync_mail_history", side_effect=fake_sync), \
+         patch("plugins.cargolo_ops.case_lifecycle.analyze_case_documents", side_effect=lambda **kwargs: (kwargs["registry"], [])):
+        result = sync_case_lifecycle("AN-33333", storage_root=tmp_path, analyze_documents=True)
+
+    assert captured["prior_last_email_at"] is None
+    assert result["initialized"] is True
+    assert result["history_sync_mode"] == "full_first"
+    assert result["history_sync_status"] == "ok"
+    assert result["history_sync_count"] == 1
+    assert result["last_email_at"] == "2026-05-19T08:00:00Z"
+
+
+def test_sync_case_lifecycle_existing_case_uses_delta_mail_sync(tmp_path):
+    snapshot = TMSSnapshot(
+        order_id="AN-33334",
+        shipment_number="AN-33334",
+        status="confirmed",
+        source="live",
+        detail={"network": "air"},
+    )
+    store = CaseStore(tmp_path)
+    state = store.load_case_state("AN-33334")
+    state.last_email_at = "2026-05-18T08:00:00Z"
+    store.save_case_state("AN-33334", state)
+    captured = {}
+
+    def fake_sync(store, order_id, state, mailbox, *, exclude_message_ids=None):
+        captured["prior_last_email_at"] = state.last_email_at
+        return 0
+
+    with patch("plugins.cargolo_ops.processor._live_shipment_exists", return_value=True), \
+         patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(snapshot, {}, {})), \
+         patch("plugins.cargolo_ops.processor.build_mail_history_client_from_env", return_value=object()), \
+         patch("plugins.cargolo_ops.processor._sync_mail_history", side_effect=fake_sync), \
+         patch("plugins.cargolo_ops.case_lifecycle.analyze_case_documents", side_effect=lambda **kwargs: (kwargs["registry"], [])):
+        result = sync_case_lifecycle("AN-33334", storage_root=tmp_path, analyze_documents=True)
+
+    assert captured["prior_last_email_at"] == "2026-05-18T08:00:00Z"
+    assert result["initialized"] is False
+    assert result["history_sync_mode"] == "delta"
+    assert result["history_sync_status"] == "no_messages"
+    assert result["last_email_at"] == "2026-05-18T08:00:00Z"
+
+
+def test_sync_case_lifecycle_marks_initial_mail_history_no_client_as_unreliable(tmp_path):
+    snapshot = TMSSnapshot(
+        order_id="AN-33335",
+        shipment_number="AN-33335",
+        status="confirmed",
+        source="live",
+        detail={"network": "rail"},
+    )
+
+    with patch("plugins.cargolo_ops.processor._live_shipment_exists", return_value=True), \
+         patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(snapshot, {}, {})), \
+         patch("plugins.cargolo_ops.processor.build_mail_history_client_from_env", return_value=None), \
+         patch("plugins.cargolo_ops.processor._sync_mail_history", return_value=0), \
+         patch("plugins.cargolo_ops.case_lifecycle.analyze_case_documents", side_effect=lambda **kwargs: (kwargs["registry"], [])):
+        result = sync_case_lifecycle("AN-33335", storage_root=tmp_path, analyze_documents=True)
+
+    assert result["initialized"] is True
+    assert result["history_sync_mode"] == "full_first"
+    assert result["history_sync_status"] == "no_client"
+    assert result["history_sync_error"] == "mail_history_sync_unavailable:no_client"
+    state = json.loads((Path(result["case_root"]) / "case_state.json").read_text(encoding="utf-8"))
+    assert "mail_history_sync_unavailable:no_client" in state["open_questions"]
+    assert any("Initial-Mail-Historie nicht belastbar" in item for item in state["open_questions"])
+
+
+def test_sync_case_lifecycle_marks_initial_mail_history_failure_as_unreliable(tmp_path):
+    snapshot = TMSSnapshot(
+        order_id="AN-33336",
+        shipment_number="AN-33336",
+        status="confirmed",
+        source="live",
+        detail={"network": "sea"},
+    )
+
+    with patch("plugins.cargolo_ops.processor._live_shipment_exists", return_value=True), \
+         patch("plugins.cargolo_ops.processor._fetch_tms_bundle", return_value=(snapshot, {}, {})), \
+         patch("plugins.cargolo_ops.processor.build_mail_history_client_from_env", return_value=object()), \
+         patch("plugins.cargolo_ops.processor._sync_mail_history", side_effect=RuntimeError("n8n timeout")), \
+         patch("plugins.cargolo_ops.case_lifecycle.analyze_case_documents", side_effect=lambda **kwargs: (kwargs["registry"], [])):
+        result = sync_case_lifecycle("AN-33336", storage_root=tmp_path, analyze_documents=True)
+
+    assert result["initialized"] is True
+    assert result["history_sync_mode"] == "full_first"
+    assert result["history_sync_status"] == "failed"
+    assert "n8n timeout" in result["history_sync_error"]
+    state = json.loads((Path(result["case_root"]) / "case_state.json").read_text(encoding="utf-8"))
+    assert any("Initial-Mail-Historie nicht belastbar" in item for item in state["open_questions"])
+
+
 def test_sync_case_lifecycle_mirrors_tms_documents_and_updates_registry(tmp_path):
     source_doc = tmp_path / "source_invoice.txt"
     source_doc.write_text("Commercial invoice AN-12345", encoding="utf-8")

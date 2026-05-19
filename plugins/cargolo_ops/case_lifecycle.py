@@ -315,10 +315,29 @@ def sync_case_lifecycle(
 
     history_count = 0
     history_error: str | None = None
+    history_sync_status = "disabled"
+    history_sync_mode = "skipped"
+    history_client_available: bool | None = None
+    prior_last_email_at = state.last_email_at
     if refresh_history:
+        history_sync_mode = "delta" if prior_last_email_at else "full_first"
+        try:
+            history_client_available = processor.build_mail_history_client_from_env() is not None
+        except Exception:
+            history_client_available = None
         try:
             history_count = processor._sync_mail_history(store, order_id, state, mailbox, exclude_message_ids=set())
+            if history_client_available is False:
+                history_sync_status = "no_client"
+                history_error = "mail_history_sync_unavailable:no_client"
+            elif history_count > 0:
+                history_sync_status = "ok"
+            else:
+                # A successful call with zero new messages is not a failure, but it
+                # is distinct from an unavailable client or crashed n8n workflow.
+                history_sync_status = "no_messages"
         except Exception as exc:
+            history_sync_status = "failed"
             history_error = f"mail_history_sync_failed: {exc}"
 
     history_rows = store.list_email_index(order_id)
@@ -371,6 +390,8 @@ def sync_case_lifecycle(
     open_questions = set(analysis_open_questions)
     if history_error:
         open_questions.add(history_error)
+    if not case_existed and refresh_history and history_sync_status in {"no_client", "failed"}:
+        open_questions.add("Initial-Mail-Historie nicht belastbar synchronisiert; operative Mail-/Kundenaussagen nur mit Vorbehalt ableiten.")
     for gap in registry.get("tms_mirroring_gaps", []):
         label = gap.get("label") or gap.get("filename") or gap.get("document_type")
         open_questions.add(f"TMS-Dokument nicht lokal gespiegelt: {label}")
@@ -383,7 +404,10 @@ def sync_case_lifecycle(
     timeline_path = store.append_timeline(
         order_id,
         heading="case lifecycle sync",
-        summary=f"Lifecycle sync: TMS fresh, history +{history_count}, TMS docs mirrored {len(registry.get('mirrored_tms_documents', []))}",
+        summary=(
+            f"Lifecycle sync: TMS fresh, mail_history={history_sync_status}/{history_sync_mode} +{history_count}, "
+            f"TMS docs mirrored {len(registry.get('mirrored_tms_documents', []))}"
+        ),
         delta=f"expected_docs={','.join(registry.get('expected_types', [])) or '-'}; missing_docs={','.join(registry.get('missing_types', [])) or '-'}",
         next_step="Dokumentenmonitoring/Reconciliation auf dieser aktualisierten Evidenz ausführen.",
     )
@@ -395,6 +419,9 @@ def sync_case_lifecycle(
         extra={
             "initialized": not case_existed,
             "history_sync_count": history_count,
+            "history_sync_status": history_sync_status,
+            "history_sync_mode": history_sync_mode,
+            "history_client_available": history_client_available,
             "history_sync_error": history_error,
             "tms_documents_mirrored": len(registry.get("mirrored_tms_documents", [])),
             "tms_mirroring_gaps": len(registry.get("tms_mirroring_gaps", [])),
@@ -408,6 +435,9 @@ def sync_case_lifecycle(
         "case_root": str(case_root),
         "initialized": not case_existed,
         "history_sync_count": history_count,
+        "history_sync_status": history_sync_status,
+        "history_sync_mode": history_sync_mode,
+        "history_client_available": history_client_available,
         "history_sync_error": history_error,
         "last_email_at": state.last_email_at,
         "tms_snapshot_path": str(tms_path),

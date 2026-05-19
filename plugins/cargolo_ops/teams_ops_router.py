@@ -410,6 +410,10 @@ def _case_evidence_prompt(
             value = lifecycle.get(key)
             if value:
                 warning_bits.append(f"{key}={value}")
+    initialized = bool(lifecycle.get("initialized")) if isinstance(lifecycle, dict) else False
+    history_sync_status = str(lifecycle.get("history_sync_status") or "unbekannt") if isinstance(lifecycle, dict) else "unbekannt"
+    history_sync_mode = str(lifecycle.get("history_sync_mode") or "unbekannt") if isinstance(lifecycle, dict) else "unbekannt"
+    history_sync_count = lifecycle.get("history_sync_count") if isinstance(lifecycle, dict) else None
     if lifecycle_error:
         warning_bits.append(f"sync_error={lifecycle_error}")
     warnings = "; ".join(str(item) for item in warning_bits[:4]) or "keine bekannten Sync-Fehler"
@@ -421,6 +425,9 @@ def _case_evidence_prompt(
         "Vorarbeit: Der lokale CARGOLO Case wurde für diese Frage gerade frisch synchronisiert "
         "(TMS-first, Mail-Historie, Dokumentregistry, Dokumentanalyse und Billing-Kontext best-effort).\n"
         f"Evidence Refresh: status={status}; lifecycle_status={lifecycle_status}; case_path={case_path}; warnings={warnings}.\n"
+        f"Mail-Freshness: case_initialized_now={initialized}; mail_sync_status={history_sync_status}; mail_sync_mode={history_sync_mode}; new_mail_rows={history_sync_count}.\n"
+        "Bootstrap-Regel: Wenn case_initialized_now=true und mail_sync_status nicht `ok` oder `no_messages` ist, dann keine vollständige operative Mail-/Kundenaussage treffen; "
+        "nur TMS-basierten Zwischenstand mit klarem Vorbehalt geben und sagen, dass die initiale Mail-Historie nicht belastbar ist.\n"
         "Nutze für die Antwort ausschließlich belastbare Evidenz aus dem lokalen Case und verfügbaren CARGOLO/TMS-Tools: "
         "case_state.json, tms_snapshot.json, tms/*, email_index.jsonl, documents/registry.json, documents/analysis/latest_summary.json, Billing-Kontext. "
         "Wenn eine Quelle fehlt oder der Refresh teilweise fehlschlug, sag das knapp als Vorbehalt und rate nicht.\n"
