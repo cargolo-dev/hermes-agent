@@ -6,6 +6,7 @@ from pathlib import Path
 from plugins.cargolo_ops.teams_reply_loop import (
     build_card_context,
     handle_teams_message,
+    process_teams_tms_card_action,
     record_sent_card,
 )
 
@@ -383,6 +384,49 @@ def test_explicit_approval_requires_fresh_verification_match(tmp_path: Path) -> 
     queue = _read_jsonl(pending_path)
     assert queue[-1]["status"] == "verification_failed"
     assert queue[-1]["verified_value"] == "26DE12345"
+
+
+def test_review_only_confirmation_closes_pending_without_tms_write(tmp_path: Path) -> None:
+    root = tmp_path / "cargolo_asr"
+    (root / "orders" / "AN-12218" / "teams").mkdir(parents=True)
+    pending_path = root / "orders" / "AN-12218" / "teams" / "pending_tms_actions.jsonl"
+    pending_path.write_text(
+        json.dumps({
+            "timestamp": "2026-05-19T08:00:00Z",
+            "action_id": "act-review-only",
+            "status": "pending_review",
+            "order_id": "AN-12218",
+            "target": "cargo_weight_kg",
+            "value": "10100",
+            "write_supported": False,
+            "write_policy": "no_auto_write_without_review",
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    calls: list[tuple[dict, dict]] = []
+
+    result = process_teams_tms_card_action(
+        root=root,
+        data={
+            "hermes_action": "cargolo_asr_tms_approve",
+            "order_id": "AN-12218",
+            "action_id": "act-review-only",
+            "target": "cargo_weight_kg",
+            "value": "10100",
+        },
+        user_name="Operator",
+        enable_tms_writeback=True,
+        apply_tms_update=lambda action, context: calls.append((action, context)) or {"status": "applied"},
+    )
+
+    assert result["handled"] is True
+    assert result["status"] == "review_confirmed"
+    assert result["derived_action"]["type"] == "tms_review_only_confirmed"
+    assert calls == []
+    queue = _read_jsonl(pending_path)
+    assert queue[-1]["status"] == "review_confirmed"
+    confirmed = _read_jsonl(root / "orders" / "AN-12218" / "teams" / "confirmed_tms_review_actions.jsonl")
+    assert confirmed[-1]["target"] == "cargo_weight_kg"
 
 
 def test_quoted_card_with_tms_words_but_unrelated_operator_reply_is_not_tms_update(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message
+from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message, should_use_case_assist_speed_layer
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -290,6 +290,18 @@ def test_unrelated_message_is_not_intercepted(tmp_path: Path) -> None:
     result = route_teams_ops_message(text="was gibt es zum Mittag?", root=tmp_path / "cargolo_asr")
 
     assert result == {"handled": False}
+
+
+def test_case_assist_speed_layer_classifier_is_cheap_and_read_only() -> None:
+    use_speed_layer, order_id = should_use_case_assist_speed_layer("Sag mir alles zu AN-12345")
+
+    assert use_speed_layer is True
+    assert order_id == "AN-12345"
+
+
+def test_case_assist_speed_layer_does_not_swallow_free_chat_or_tms_writes() -> None:
+    assert should_use_case_assist_speed_layer("erzähl mal einen witz") == (False, None)
+    assert should_use_case_assist_speed_layer("AN-11755 bitte MRN 26DE99999 ins TMS eintragen") == (False, "AN-11755")
 
 
 class _FakeTMSProvider:

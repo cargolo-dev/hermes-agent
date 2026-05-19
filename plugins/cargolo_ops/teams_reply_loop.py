@@ -281,6 +281,10 @@ def record_agent_tms_update_intent(
     reply_to_message_id: str | None = None,
     context_id: str | None = None,
     confidence: str = "agent_decided",
+    source: str = "teams_agent_decision",
+    evidence: dict[str, Any] | None = None,
+    previous_value: str | None = None,
+    write_supported: bool | None = None,
 ) -> dict[str, Any]:
     """Persist an LLM/agent-decided Teams TMS update intent as pending review.
 
@@ -294,14 +298,32 @@ def record_agent_tms_update_intent(
     if not normalized_order or not _ORDER_RE.fullmatch(normalized_order):
         return {"status": "validation_error", "queued": False, "error": "invalid_order_id"}
     normalized_target = str(target or "").strip()
-    if normalized_target not in _SHORT_TO_FULL_TARGET:
-        return {"status": "validation_error", "queued": False, "error": "unsupported_target", "supported_targets": sorted(_SHORT_TO_FULL_TARGET)}
+    if normalized_target not in _SUPPORTED_INTENT_TARGETS:
+        return {"status": "validation_error", "queued": False, "error": "unsupported_target", "supported_targets": sorted(_SUPPORTED_INTENT_TARGETS)}
     normalized_value = str(value or "").strip()
     if not normalized_value:
         return {"status": "validation_error", "queued": False, "error": "missing_value"}
 
-    now = utc_now_iso()
     teams_dir = root / "orders" / normalized_order / "teams"
+    queue_path = teams_dir / "pending_tms_actions.jsonl"
+    for existing in _read_jsonl(queue_path):
+        if str(existing.get("status") or "") != "pending_review":
+            continue
+        if str(existing.get("order_id") or "").strip().upper() != normalized_order:
+            continue
+        if str(existing.get("target") or "").strip() == normalized_target and str(existing.get("value") or "").strip().upper() == normalized_value.upper():
+            return {
+                "status": "ok",
+                "queued": False,
+                "duplicate": True,
+                "action_id": existing.get("action_id"),
+                "order_id": normalized_order,
+                "target": normalized_target,
+                "value": normalized_value,
+                "queue_path": str(queue_path),
+            }
+
+    now = utc_now_iso()
     action_id = _pending_action_id(
         order_id=normalized_order,
         target=normalized_target,
@@ -318,13 +340,16 @@ def record_agent_tms_update_intent(
         "activity_id": None,
         "target": normalized_target,
         "value": normalized_value,
+        "previous_value": previous_value,
         "confidence": confidence,
-        "source": "teams_agent_decision",
+        "source": source,
+        "evidence": evidence or None,
         "source_message_id": source_message_id,
         "reply_to_message_id": reply_to_message_id,
         "operator": operator,
         "text": text,
         "write_policy": "no_auto_write_without_review",
+        "write_supported": bool(normalized_target in _SHORT_TO_FULL_TARGET) if write_supported is None else bool(write_supported),
     }
     _append_jsonl(teams_dir / "pending_tms_actions.jsonl", row)
     _append_jsonl(teams_dir / "case_learning.jsonl", {
@@ -335,7 +360,7 @@ def record_agent_tms_update_intent(
         "classification": "agent_tms_update_intent",
         "learning": text,
         "context_id": context_id,
-        "derived_action": {"type": "pending_tms_update", "target": normalized_target, "value": normalized_value},
+        "derived_action": {"type": "pending_tms_update", "target": normalized_target, "value": normalized_value, "previous_value": previous_value, "source": source},
     })
     _append_jsonl(root / "orders" / normalized_order / "audit" / "actions.jsonl", {
         "timestamp": now,
@@ -366,6 +391,8 @@ _SHORT_TO_FULL_TARGET: dict[str, str] = {
     "pickup_date": "shipment.dates.pickup_date",
     "estimated_delivery_date": "shipment.dates.estimated_delivery_date",
 }
+_REVIEW_ONLY_TARGETS = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code"}
+_SUPPORTED_INTENT_TARGETS = set(_SHORT_TO_FULL_TARGET) | _REVIEW_ONLY_TARGETS
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -553,6 +580,8 @@ def _button_response_text(order_id: str, action: dict[str, Any]) -> str:
         return f"❌ Abgelehnt für {order_id}: {action.get('target')} = {action.get('value')} wurde nicht ins TMS geschrieben."
     if action.get("type") == "tms_update_correction_requested":
         return f"✏️ Korrektur angefordert für {order_id}: {action.get('target')} = {action.get('value')} wurde nicht ins TMS geschrieben. Bitte mit korrigiertem Ziel/Wert antworten."
+    if action.get("type") == "tms_review_only_confirmed":
+        return f"✅ Fachlich bestätigt für {order_id}: {action.get('target')} = {action.get('value')} ist dokumentiert. Kein TMS-Write wurde ausgeführt."
     if action.get("type") == "case_check_requested":
         summary = str(action.get("summary") or "").strip()
         if summary:
@@ -707,6 +736,38 @@ def process_teams_tms_card_action(
         })
         return {"handled": True, "status": "case_check_completed", "order_id": order_id, "derived_action": action, "response_text": _button_response_text(order_id, action), "case_check": check_result}
 
+    target_write_supported = bool(pending_action.get("write_supported", str(pending_action.get("target") or "") in _SHORT_TO_FULL_TARGET))
+    if not target_write_supported:
+        updated = {
+            **pending_action,
+            "status": "review_confirmed",
+            "review_confirmed_at": event["timestamp"],
+            "review_confirmed_by": user_name,
+            "review_confirmed_by_user_id": user_id,
+        }
+        rows[pending_index] = updated
+        _write_jsonl(pending_path, rows)
+        action = {
+            "type": "tms_review_only_confirmed",
+            "target": pending_action.get("target"),
+            "value": pending_action.get("value"),
+            "status": "review_confirmed",
+        }
+        confirmed_path = teams_dir / "confirmed_tms_review_actions.jsonl"
+        _append_jsonl(confirmed_path, {**updated, "source": "teams_adaptive_card"})
+        _append_jsonl(root / "orders" / order_id / "audit" / "actions.jsonl", {
+            "timestamp": event["timestamp"],
+            "actor": user_name or "Teams Operator",
+            "action": "teams_tms_review_only_confirmed",
+            "result": "review_confirmed",
+            "target": action.get("target"),
+            "value": action.get("value"),
+            "order_id": order_id,
+            "files": [str(pending_path), str(confirmed_path)],
+            "should_write_tms": False,
+        })
+        return {"handled": True, "status": "review_confirmed", "order_id": order_id, "derived_action": action, "response_text": _button_response_text(order_id, action)}
+
     if enable_tms_writeback is None:
         writeback_enabled = str(os.getenv("CARGOLO_ASR_TEAMS_TMS_WRITEBACK") or "").strip().lower() in {"1", "true", "yes", "on"}
     else:
@@ -800,6 +861,35 @@ def _apply_approved_pending_tms_action(
         rows[pending_index] = {**pending_action, **base_update, "status": "approval_blocked", "block_reason": "unsupported_or_missing_target_value"}
         _write_jsonl(pending_path, rows)
         return {"type": "tms_update_approval_blocked", "target": short_target, "value": value, "status": "approval_blocked"}
+
+    # Best-effort two-click guard: claim the pending row before the external
+    # TMS write so a second sequential click sees the action as no longer open.
+    # (The Teams UI is also replaced after the first invoke.)
+    latest_rows = _read_jsonl(pending_path)
+    match_action_id = str(pending_action.get("action_id") or "")
+    latest_index = None
+    latest_action: dict[str, Any] | None = None
+    for idx, row in enumerate(latest_rows):
+        same_action_id = match_action_id and str(row.get("action_id") or "") == match_action_id
+        same_target_value = (
+            str(row.get("order_id") or "").strip().upper() == order_id
+            and str(row.get("target") or "").strip() == short_target
+            and str(row.get("value") or "").strip() == str(value or "").strip()
+        )
+        if same_action_id or same_target_value:
+            latest_index = idx
+            latest_action = row
+            break
+    if latest_index is None or latest_action is None:
+        return {"type": "tms_update_approval_blocked", "target": short_target, "value": value, "status": "already_resolved", "reason": "pending_action_missing"}
+    if str(latest_action.get("status") or "") != "pending_review":
+        return {"type": "tms_update_approval_blocked", "target": short_target, "value": value, "status": "already_resolved", "reason": "pending_action_not_open"}
+    claimed_action = {**latest_action, **base_update, "status": "approved_pending_apply"}
+    latest_rows[latest_index] = claimed_action
+    _write_jsonl(pending_path, latest_rows)
+    rows = latest_rows
+    pending_index = latest_index
+    pending_action = claimed_action
 
     writeback_action = {
         "action_type": "field_update",

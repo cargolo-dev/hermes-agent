@@ -838,11 +838,17 @@ class TestTeamsMessageHandling:
                 "classification": "case_evidence_refreshed_agent_handoff",
                 "order_id": "AN-11755",
                 "agent_prompt": "Rolle: Du bist Hermes CARGOLO\nEvidence Refresh: ok\nOriginalfrage: Was ist mit AN-11755 los?",
+                "teams_tms_review_cards": [{"action_id": "review-1", "order_id": "AN-11755", "target": "hs_code", "value": "8501"}],
             }
 
         monkeypatch.setattr("plugins.cargolo_ops.teams_reply_loop.handle_teams_message", fake_handle_teams_message, raising=False)
         monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
         monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", fake_route_teams_ops_message, raising=False)
+
+        async def immediate_to_thread(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(_teams_mod.asyncio, "to_thread", immediate_to_thread)
 
         adapter = TeamsAdapter(_make_config(
             client_id="bot-id",
@@ -856,6 +862,7 @@ class TestTeamsMessageHandling:
         mock_app.send = AsyncMock()
         adapter._app = mock_app
         adapter.handle_message = AsyncMock()
+        adapter.send_cargolo_asr_tms_review_card = AsyncMock(return_value=MagicMock(success=True))
 
         activity = self._make_activity(
             text="Was ist mit AN-11755 los?",
@@ -864,9 +871,12 @@ class TestTeamsMessageHandling:
             channel_data={"channel": {"id": "cargolo-hermes"}},
         )
         await adapter._on_message(self._make_ctx(activity))
+        await asyncio.sleep(0)
 
         mock_app.send.assert_awaited_once()
+        assert "Bin dran" in mock_app.send.await_args.args[1]
         adapter.handle_message.assert_awaited_once()
+        adapter.send_cargolo_asr_tms_review_card.assert_awaited_once()
         event = adapter.handle_message.call_args[0][0]
         assert event.text.startswith("Rolle: Du bist Hermes CARGOLO")
         assert "Evidence Refresh: ok" in event.text
@@ -993,7 +1003,7 @@ class TestTeamsMessageHandling:
         assert route_calls[0]["root"].name == "cargolo_asr"
 
     @pytest.mark.asyncio
-    async def test_cargolo_employee_deep_dive_sends_typing_before_sync_route(self, monkeypatch):
+    async def test_cargolo_employee_deep_dive_sends_ack_then_background_result(self, monkeypatch):
         def fake_handle_teams_employee_message(**kwargs):
             raise AssertionError("deep dive must be handled by ops router before employee handoff")
 
@@ -1009,6 +1019,11 @@ class TestTeamsMessageHandling:
 
         monkeypatch.setattr("plugins.cargolo_ops.teams_employee_handoff.handle_teams_employee_message", fake_handle_teams_employee_message, raising=False)
         monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", fake_route_teams_ops_message, raising=False)
+
+        async def immediate_to_thread(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(_teams_mod.asyncio, "to_thread", immediate_to_thread)
 
         adapter = TeamsAdapter(_make_config(
             client_id="bot-id",
@@ -1032,10 +1047,13 @@ class TestTeamsMessageHandling:
             channel_data={"channel": {"id": "cargolo-hermes"}},
         )
         await adapter._on_message(self._make_ctx(activity))
+        await asyncio.sleep(0)
 
         adapter.handle_message.assert_not_awaited()
         assert mock_app.send.await_count == 2
         assert mock_app.send.await_args_list[0].args[0] == "19:abc@thread.v2"
+        assert "Bin dran" in mock_app.send.await_args_list[0].args[1]
+        assert "kein TMS-Write" in mock_app.send.await_args_list[0].args[1]
         assert "Fallprüfung AN-13038" in mock_app.send.await_args_list[1].args[1]
         assert route_calls[0]["text"] == "Sag mir alles zu AN-13038"
 
@@ -1113,7 +1131,7 @@ class TestTeamsMessageHandling:
         adapter.handle_message = AsyncMock()
 
         activity = self._make_activity(
-            text="Was ist mit AN-11755 los?",
+            text="Hallo CARGOLO, kurze interne Frage",
             activity_id="msg-employee-conv-allowlist",
             conversation_id="19:logged-thread@thread.v2",
             conversation_type="channel",
@@ -1122,9 +1140,9 @@ class TestTeamsMessageHandling:
         await adapter._on_message(self._make_ctx(activity))
 
         adapter.handle_message.assert_not_awaited()
-        assert mock_app.send.await_count == 2
+        mock_app.send.assert_awaited_once()
         assert handoff_calls[0]["channel_id"] == "19:logged-thread@thread.v2"
-        assert handoff_calls[0]["text"] == "Was ist mit AN-11755 los?"
+        assert handoff_calls[0]["text"] == "Hallo CARGOLO, kurze interne Frage"
 
     @pytest.mark.asyncio
     async def test_cargolo_employee_dedicated_top_level_an_message_bypasses_card_fallback(self, monkeypatch):

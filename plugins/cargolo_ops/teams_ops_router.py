@@ -86,7 +86,13 @@ def _pending_action_id_for_row(item: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-_SUPPORTED_TMS_REVIEW_TARGETS = {"customs_reference", "hbl_number", "mbl_number", "hawb_number", "container_number", "pickup_date", "estimated_delivery_date"}
+_SUPPORTED_TMS_REVIEW_TARGETS = {
+    "customs_reference", "hbl_number", "mbl_number", "hawb_number", "container_number",
+    "pickup_date", "estimated_delivery_date",
+    # Agentic proposal-layer review-only targets. Approval stays blocked until a
+    # dedicated TMS writeback mapping exists; cards are still useful for ops review.
+    "cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code",
+}
 
 
 def _collect_pending_tms_actions(root: Path, limit: int = 8) -> list[dict[str, Any]]:
@@ -463,6 +469,22 @@ def build_case_evidence_agent_handoff(*, root: Path, order_id: str, text: str, u
         except Exception as exc:
             lifecycle_error = str(exc)
 
+    tms_review_cards: list[dict[str, Any]] = []
+    if lifecycle_error is None:
+        try:
+            from .tms_proposal_layer import queue_agentic_tms_review_cards
+
+            tms_review_cards = queue_agentic_tms_review_cards(
+                root=root,
+                order_id=order_id,
+                source="teams_case_evidence_refresh",
+                operator="Hermes Agentic Proposal Layer",
+                context_id=f"{order_id}:teams_case_evidence_refresh",
+                max_cards=3,
+            )
+        except Exception:
+            tms_review_cards = []
+
     prompt = _case_evidence_prompt(
         text=text,
         root=root,
@@ -482,6 +504,7 @@ def build_case_evidence_agent_handoff(*, root: Path, order_id: str, text: str, u
         "should_send_to_teams": False,
         "should_write_tms": False,
         "should_send_customer_message": False,
+        "teams_tms_review_cards": tms_review_cards,
     }
 
 
@@ -492,6 +515,29 @@ def _is_case_read_question(raw: str, *, order_id: str | None) -> bool:
     if _CASE_CHECK_RE.search(raw) or _FULL_CASE_RE.search(raw) or "komplett" in lowered or "case" in lowered:
         return True
     return bool(re.search(r"\b(was ist|stand|status|lage|eta|etd|fehlt|sauber|antwort|geantwortet|kunde|kunden|mail|dokument|docs?|tms|sendung|update)\b", raw, re.IGNORECASE))
+
+
+def should_use_case_assist_speed_layer(text: str) -> tuple[bool, str | None]:
+    """Cheaply decide whether a Teams message should get immediate Case-Assist ack.
+
+    This intentionally performs no filesystem, TMS, mail, or lifecycle work.  The
+    Teams adapter uses it before calling ``route_teams_ops_message`` so real case
+    reads can be moved to a background task while normal/free chat still flows
+    through the existing synchronous path.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return False, None
+    order_match = _ORDER_RE.search(raw)
+    order_id = order_match.group(0).upper() if order_match else None
+    if not _is_case_read_question(raw, order_id=order_id):
+        return False, order_id
+    # Do not background write-looking TMS instructions; those need the existing
+    # deterministic guard response immediately and must never look like a deep
+    # read-only case assist.
+    if order_id and _WRITE_RE.search(raw) and _TMS_FIELD_RE.search(raw):
+        return False, order_id
+    return True, order_id
 
 
 def route_teams_ops_message(

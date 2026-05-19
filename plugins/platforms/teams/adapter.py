@@ -784,8 +784,120 @@ class TeamsAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         logger.info("[teams] Disconnected")
 
+    async def _send_cargolo_review_cards(
+        self,
+        *,
+        conv_id: str,
+        msg_id: str | None,
+        ops_result: dict[str, Any],
+        card_delay_seconds: float = 0.0,
+    ) -> None:
+        """Send optional CARGOLO TMS review cards from an ops/router result."""
+        for pending_action in ops_result.get("teams_tms_review_cards") or []:
+            if isinstance(pending_action, dict):
+                if card_delay_seconds > 0:
+                    await asyncio.sleep(card_delay_seconds)
+                await self.send_cargolo_asr_tms_review_card(
+                    conv_id,
+                    pending_action,
+                    reply_to=str(msg_id) if msg_id else None,
+                )
+
+    async def _send_cargolo_ops_result(
+        self,
+        *,
+        conv_id: str,
+        msg_id: str | None,
+        ops_result: dict[str, Any],
+        card_delay_seconds: float = 0.0,
+    ) -> None:
+        """Send a deterministic CARGOLO ops response plus optional review cards."""
+        await self.send(
+            conv_id,
+            str(ops_result.get("response_text") or "Gespeichert."),
+            reply_to=str(msg_id) if msg_id else None,
+        )
+        await self._send_cargolo_review_cards(
+            conv_id=conv_id,
+            msg_id=msg_id,
+            ops_result=ops_result,
+            card_delay_seconds=card_delay_seconds,
+        )
+
+    async def _run_cargolo_case_assist_speed_layer(
+        self,
+        *,
+        text: str,
+        source: Any,
+        conv_id: str,
+        msg_id: str | None,
+        user_id: str,
+        user_name: str,
+        order_id: str | None,
+    ) -> None:
+        """Refresh/answer a CARGOLO Teams Case-Assist request after the immediate ack."""
+        try:
+            from hermes_constants import get_hermes_home
+            from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message
+
+            ops_result = await asyncio.to_thread(
+                route_teams_ops_message,
+                text=text,
+                root=get_hermes_home() / "cargolo_asr",
+                chat_id=conv_id,
+                user_id=user_id,
+                user_name=user_name,
+                message_id=str(msg_id) if msg_id else None,
+            )
+            if ops_result.get("handled"):
+                await self._send_cargolo_ops_result(
+                    conv_id=conv_id,
+                    msg_id=msg_id,
+                    ops_result=ops_result,
+                )
+                return
+            if ops_result.get("allow_generic_chat") and ops_result.get("agent_prompt"):
+                await self._send_cargolo_review_cards(conv_id=conv_id, msg_id=msg_id, ops_result=ops_result)
+                event = MessageEvent(
+                    text=str(ops_result.get("agent_prompt")),
+                    source=source,
+                    message_type=MessageType.TEXT,
+                    message_id=msg_id,
+                    reply_to_message_id=None,
+                )
+                await self.handle_message(event)
+                return
+            logger.info(
+                "[teams] CARGOLO speed-layer route no-op for %s: %s",
+                order_id or "AN/BU?",
+                ops_result.get("classification") or ops_result.get("reason") or "unhandled",
+            )
+        except Exception as exc:
+            logger.error("[teams] CARGOLO Case-Assist speed layer failed: %s", exc, exc_info=True)
+            try:
+                await self.send(
+                    conv_id,
+                    "⚠️ Ich konnte die CARGOLO Fallprüfung gerade nicht sicher abschließen; nichts wurde ins TMS geschrieben und keine Kundenmail gesendet.",
+                    reply_to=str(msg_id) if msg_id else None,
+                )
+            except Exception:
+                logger.debug("[teams] CARGOLO speed-layer failure notification failed", exc_info=True)
+
+    def _start_cargolo_case_assist_speed_layer(self, **kwargs: Any) -> None:
+        task = asyncio.create_task(self._run_cargolo_case_assist_speed_layer(**kwargs))
+
+        def _log_done(done: asyncio.Task[Any]) -> None:
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                logger.debug("[teams] CARGOLO Case-Assist speed-layer task cancelled")
+            except Exception:
+                logger.exception("[teams] CARGOLO Case-Assist speed-layer task crashed")
+
+        task.add_done_callback(_log_done)
+
     async def _on_message(self, ctx: ActivityContext[MessageActivity]) -> None:
-        """Process an incoming Teams message and dispatch to the gateway."""
+        """Handle incoming Teams messages."""
         activity = ctx.activity
 
         # Self-message filter
@@ -868,17 +980,25 @@ class TeamsAdapter(BasePlatformAdapter):
             and not self._looks_like_quoted_cargolo_operator_card(text)
         ):
             from hermes_constants import get_hermes_home
-            from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message
+            from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message, should_use_case_assist_speed_layer
 
-            # Case-assist refreshes can run synchronously before the generic
-            # gateway loop, so the normal gateway typing indicator would not fire.
-            # Send an early Teams typing activity for AN/BU transport questions.
-            if re.search(r"\b(?:AN|BU)-\d{3,}\b", text or "", re.IGNORECASE) and re.search(
-                r"\b(?:gib|geb|zeig|sag|hol|hole|prüf(?:e|en)?|pruef(?:e|en)?|was ist|stand|status|lage|eta|etd|fehlt|sauber|antwort|geantwortet|kunde|mail|dokument|docs?|tms|sendung|update|komplett|übersicht|uebersicht)\b",
-                text or "",
-                re.IGNORECASE,
-            ):
-                await self.send_typing(str(conv.id))
+            use_speed_layer, speed_order_id = should_use_case_assist_speed_layer(text)
+            if use_speed_layer:
+                ack_text = (
+                    f"Bin dran – ich prüfe {speed_order_id or 'den Fall'} TMS-first im Hintergrund. "
+                    "Ich poste gleich die belastbare Lage; kein TMS-Write, keine Kundenmail."
+                )
+                await self.send(str(conv.id), ack_text, reply_to=str(msg_id) if msg_id else None)
+                self._start_cargolo_case_assist_speed_layer(
+                    text=text,
+                    source=source,
+                    conv_id=str(conv.id),
+                    msg_id=str(msg_id) if msg_id else None,
+                    user_id=str(user_id),
+                    user_name=user_name,
+                    order_id=speed_order_id,
+                )
+                return
 
             ops_result = route_teams_ops_message(
                 text=text,
@@ -889,19 +1009,20 @@ class TeamsAdapter(BasePlatformAdapter):
                 message_id=str(msg_id) if msg_id else None,
             )
             if ops_result.get("handled"):
-                await self.send(
-                    str(conv.id),
-                    str(ops_result.get("response_text") or "Gespeichert."),
-                    reply_to=str(msg_id) if msg_id else None,
+                await self._send_cargolo_ops_result(
+                    conv_id=str(conv.id),
+                    msg_id=str(msg_id) if msg_id else None,
+                    ops_result=ops_result,
+                    card_delay_seconds=1.0,
                 )
-                for pending_action in ops_result.get("teams_tms_review_cards") or []:
-                    if isinstance(pending_action, dict):
-                        await asyncio.sleep(1.0)
-                        await self.send_cargolo_asr_tms_review_card(
-                            str(conv.id), pending_action, reply_to=str(msg_id) if msg_id else None
-                        )
                 return
             if ops_result.get("allow_generic_chat") and ops_result.get("agent_prompt"):
+                await self._send_cargolo_review_cards(
+                    conv_id=str(conv.id),
+                    msg_id=str(msg_id) if msg_id else None,
+                    ops_result=ops_result,
+                    card_delay_seconds=1.0,
+                )
                 text = str(ops_result.get("agent_prompt"))
                 dedicated_generic_prompt_applied = True
             else:
@@ -1002,6 +1123,11 @@ class TeamsAdapter(BasePlatformAdapter):
                         return
                     if ops_result.get("allow_generic_chat") and ops_result.get("agent_prompt"):
                         asr_agent_prompt = str(ops_result.get("agent_prompt"))
+                        await self._send_cargolo_review_cards(
+                            conv_id=str(conv.id),
+                            msg_id=str(msg_id) if msg_id else None,
+                            ops_result=ops_result,
+                        )
                         text = asr_agent_prompt
                     elif self._looks_like_cargolo_asr_control_message(text):
                         await self.send(
@@ -1232,6 +1358,27 @@ class TeamsAdapter(BasePlatformAdapter):
             "value": value,
             "context_id": context_id,
         }
+        review_only_targets = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code"}
+        write_supported = bool(pending_action.get("write_supported", target not in review_only_targets))
+        raw_evidence = pending_action.get("evidence")
+        evidence: dict[str, Any] = raw_evidence if isinstance(raw_evidence, dict) else {}
+        previous_value = str(pending_action.get("previous_value") or evidence.get("tms_value") or "").strip()
+        source_text = str(evidence.get("source") or evidence.get("document") or evidence.get("source_file") or pending_action.get("source") or operator).strip()
+        evidence_value = str(evidence.get("evidence_value") or evidence.get("value") or "").strip()
+        evidence_bits = []
+        if previous_value:
+            evidence_bits.append(f"TMS bisher: {previous_value}")
+        if evidence_value and evidence_value != value:
+            evidence_bits.append(f"Evidenzwert: {evidence_value}")
+        if source_text:
+            evidence_bits.append(f"Quelle: {source_text}")
+        evidence_line = " · ".join(evidence_bits) or f"Quelle: {operator}"
+        action_text = (
+            "Ja schreibt nur nach Live-Writeback + frischer Verifikation ins TMS; Nein/Korrektur/Fall prüfen schreiben nie ins TMS."
+            if write_supported
+            else "Review-only: Für dieses Feld gibt es noch keinen direkten TMS-Writeback. Bestätigen blockiert den Auto-Write und hält die fachliche Prüfung fest."
+        )
+        approve_title = "✅ Ja, TMS schreiben" if write_supported else "✅ Fachlich bestätigen"
         card = (
             AdaptiveCard()
             .with_version("1.4")
@@ -1239,12 +1386,13 @@ class TeamsAdapter(BasePlatformAdapter):
                 TextBlock(text=f"CARGOLO ASR · TMS-Freigabe {order_id}", wrap=True, weight="Bolder"),
                 TextBlock(text=question or f"Soll dieser TMS-Wert aus dem Dokument übernommen werden?", wrap=True, weight="Bolder"),
                 TextBlock(text=f"Vorschlag: {target} = {value}", wrap=True),
-                TextBlock(text=f"Quelle: {operator} · Status: pending_review", wrap=True, isSubtle=True),
-                TextBlock(text="Ja schreibt nur nach Live-Writeback + frischer Verifikation ins TMS; Nein/Korrektur/Fall prüfen schreiben nie ins TMS.", wrap=True),
+                TextBlock(text=evidence_line, wrap=True, isSubtle=True),
+                TextBlock(text=f"Status: pending_review · Erzeugt von: {operator}", wrap=True, isSubtle=True),
+                TextBlock(text=action_text, wrap=True),
             ])
             .with_actions([
                 ExecuteAction(
-                    title="✅ Ja, TMS schreiben",
+                    title=approve_title,
                     verb="cargolo_asr_tms_approve",
                     data={**data_base, "hermes_action": "cargolo_asr_tms_approve"},
                     style="positive",
@@ -1297,6 +1445,7 @@ class TeamsAdapter(BasePlatformAdapter):
         status_label = {
             "rejected": "❌ Abgelehnt",
             "correction_requested": "✏️ Korrektur angefordert",
+            "review_confirmed": "✅ Fachlich bestätigt · kein TMS-Write",
             "applied": "✅ Ins TMS geschrieben und verifiziert",
             "verification_failed": "⚠️ TMS-Write nicht sauber verifiziert",
             "apply_failed": "⚠️ TMS-Write fehlgeschlagen",
