@@ -115,6 +115,56 @@ def _append_profile_blocker(findings: list[dict[str, Any]], *, filename: Any, co
     })
 
 
+def _normalize_note(value: Any) -> str:
+    return " ".join(str(value or "").replace("_", " ").strip().split())
+
+
+def _row_doc_type(row: dict[str, Any]) -> str:
+    return str(row.get("analysis_doc_type") or row.get("doc_type") or "").strip().lower()
+
+
+def _is_spreadsheet_like(row: dict[str, Any]) -> bool:
+    filename = str(row.get("filename") or "").strip().lower()
+    return filename.endswith((".xls", ".xlsx"))
+
+
+def _is_packlist_like(row: dict[str, Any]) -> bool:
+    doc_type = _row_doc_type(row)
+    return doc_type in {"packing_list", "packlist", "packing list"}
+
+
+def _is_low_signal_document_note(value: Any, *, row: dict[str, Any] | None = None) -> bool:
+    """Suppress model/tooling noise that should not create an ops exception.
+
+    Keep this deliberately narrow: concrete mismatch phrases must still surface.
+    Bare date/status labels are global noise; net-weight-zero suppression is only
+    for the observed spreadsheet/packing-list artefact and never for invoices or
+    customs documents.
+    """
+    text = _normalize_note(value).lower()
+    if not text:
+        return True
+    if text in {"date", "datum", "document ok", "ok"}:
+        return True
+    if re.fullmatch(r"(?:field|feld)?\s*(?:date|datum)", text):
+        return True
+    spreadsheet_packlist_artifact = bool(row) and _is_packlist_like(row or {})
+    if spreadsheet_packlist_artifact and text in {"net weight", "missing net weight"}:
+        return True
+    if spreadsheet_packlist_artifact and "net weight" in text and re.search(r"\b(?:specified as|value is|wert|=|:)\s*0(?:[.,]0+)?\b|\(\s*0(?:[.,]0+)?\s*\)", text):
+        return True
+    return False
+
+
+def _humanize_document_note(value: Any) -> str:
+    text = _normalize_note(value)
+    replacements = {
+        "missing net weight": "Nettogewicht im Beleg nicht belastbar lesbar",
+        "net weight specified as 0": "Nettogewicht im Beleg mit 0 angegeben; nur fachlich relevant, wenn Netto-Gewicht benötigt wird",
+    }
+    return replacements.get(text.lower(), text)
+
+
 def _append_content_reconciliation(findings: list[dict[str, Any]], *, tms_snapshot: dict[str, Any], registry: dict[str, Any]) -> None:
     totals = _tms_totals(tms_snapshot)
     tms_reference = _tms_customs_reference(tms_snapshot)
@@ -223,18 +273,22 @@ def reconcile_documents(*, order_id: str, tms_snapshot: dict[str, Any], registry
         if not isinstance(row, dict):
             continue
         for flag in row.get("operational_flags") or []:
+            if _is_low_signal_document_note(flag, row=row):
+                continue
             findings.append({
                 "type": "document_flag",
                 "severity": "medium",
                 "filename": row.get("filename"),
-                "summary": str(flag),
+                "summary": _humanize_document_note(flag),
             })
         for item in row.get("missing_or_unreadable") or []:
+            if _is_low_signal_document_note(item, row=row):
+                continue
             findings.append({
                 "type": "document_open_question",
                 "severity": "low",
                 "filename": row.get("filename"),
-                "summary": str(item),
+                "summary": _humanize_document_note(item),
             })
     for gap in registry.get("tms_mirroring_gaps", []) or []:
         if isinstance(gap, dict):

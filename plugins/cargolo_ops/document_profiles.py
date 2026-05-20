@@ -37,6 +37,8 @@ COMMON_FIELDS: tuple[str, ...] = (
     "currency",
     "eta",
     "etd",
+    "ata",
+    "atd",
 )
 
 
@@ -58,7 +60,27 @@ DOCUMENT_PROFILES: dict[str, DocumentProfile] = {
     "offer": DocumentProfile(
         "offer",
         aliases=("angebot", "quotation", "quote"),
-        relevant_fields=("document_number", "date", "issuer", "recipient", "customer", "tms_reference", "customer_reference", "goods_description", "goods_value", "currency", "eta", "etd"),
+        relevant_fields=(
+            "document_number",
+            "date",
+            "issuer",
+            "recipient",
+            "customer",
+            "tms_reference",
+            "shipment_number",
+            "customer_reference",
+            "loading_place",
+            "unloading_place",
+            "incoterm_named_place",
+            "pieces",
+            "packaging_type",
+            "gross_weight",
+            "volume",
+            "goods_description",
+            "goods_value",
+            "currency",
+            "amount",
+        ),
     ),
     "customs_power_of_attorney": DocumentProfile(
         "customs_power_of_attorney",
@@ -94,13 +116,13 @@ DOCUMENT_PROFILES: dict[str, DocumentProfile] = {
     "master_bill_of_lading": DocumentProfile(
         "master_bill_of_lading",
         aliases=("m/b", "mbl", "master b/l", "master_bl", "master bill of lading"),
-        relevant_fields=("document_number", "date", "issuer", "recipient", "booking_number", "mbl_number", "container_number", "seal_number", "vessel", "voyage", "loading_place", "unloading_place", "pol", "pod", "pieces", "gross_weight", "volume", "goods_description", "eta", "etd"),
-        trusted_tms_update_fields=("mbl_number", "container_number", "seal_number", "vessel", "voyage", "pol", "pod", "eta", "etd"),
+        relevant_fields=("document_number", "date", "issuer", "recipient", "booking_number", "mbl_number", "container_number", "seal_number", "vessel", "voyage", "loading_place", "unloading_place", "pol", "pod", "pieces", "gross_weight", "volume", "goods_description", "eta", "etd", "ata", "atd"),
+        trusted_tms_update_fields=("mbl_number", "container_number", "seal_number", "vessel", "voyage", "pol", "pod", "eta", "etd", "ata", "atd"),
     ),
     "house_bill_of_lading": DocumentProfile(
         "house_bill_of_lading",
         aliases=("hbl", "h/b/l", "house_bl", "house b/l", "house bill of lading"),
-        relevant_fields=("document_number", "date", "issuer", "recipient", "booking_number", "hbl_number", "mbl_number", "container_number", "seal_number", "vessel", "voyage", "pol", "pod", "pieces", "gross_weight", "volume", "goods_description", "eta", "etd"),
+        relevant_fields=("document_number", "date", "issuer", "recipient", "booking_number", "hbl_number", "mbl_number", "container_number", "seal_number", "vessel", "voyage", "pol", "pod", "pieces", "gross_weight", "volume", "goods_description", "eta", "etd", "ata", "atd"),
         trusted_tms_update_fields=("hbl_number", "container_number", "seal_number", "pol", "pod"),
     ),
     "telex_release": DocumentProfile(
@@ -129,8 +151,8 @@ DOCUMENT_PROFILES: dict[str, DocumentProfile] = {
     "shipment_advice": DocumentProfile(
         "shipment_advice",
         aliases=("shipment advice", "versandavis", "shipping advice", "avis"),
-        relevant_fields=("document_number", "date", "issuer", "recipient", "customer", "shipment_number", "customer_reference", "booking_number", "eta", "etd", "loading_place", "unloading_place", "pieces", "gross_weight", "volume"),
-        trusted_tms_update_fields=("eta", "etd"),
+        relevant_fields=("document_number", "date", "issuer", "recipient", "customer", "shipment_number", "customer_reference", "booking_number", "eta", "etd", "ata", "atd", "loading_place", "unloading_place", "pieces", "gross_weight", "volume"),
+        trusted_tms_update_fields=("eta", "etd", "ata", "atd"),
     ),
     "terminal_receipt": DocumentProfile(
         "terminal_receipt",
@@ -143,6 +165,29 @@ DOCUMENT_PROFILES: dict[str, DocumentProfile] = {
         aliases=("ausgangsrechnung", "outgoing invoice", "ar_invoice", "customer_invoice"),
         relevant_fields=("document_number", "date", "issuer", "recipient", "customer", "tms_reference", "shipment_number", "customer_reference", "invoice_number", "goods_value", "currency"),
         trusted_tms_update_fields=("invoice_number",),
+    ),
+    "billing": DocumentProfile(
+        "billing",
+        aliases=("abrechnung", "abrechnungsbeleg", "billing", "rechnung", "frachtrechnung", "transportrechnung"),
+        relevant_fields=(
+            "document_number",
+            "date",
+            "issuer",
+            "recipient",
+            "customer",
+            "tms_reference",
+            "shipment_number",
+            "customer_reference",
+            "invoice_number",
+            "mrn",
+            "container_number",
+            "pieces",
+            "gross_weight",
+            "volume",
+            "goods_description",
+            "currency",
+            "amount",
+        ),
     ),
     "freight_cost_invoice_cfr_cpt": DocumentProfile(
         "freight_cost_invoice_cfr_cpt",
@@ -172,7 +217,14 @@ def trusted_update_fields(doc_type: Any) -> tuple[str, ...]:
 
 def is_trusted_source_for_field(doc_type: Any, field: str) -> bool:
     profile = get_document_profile(doc_type)
-    if field in profile.trusted_tms_update_fields:
+    field_aliases = {
+        "estimated_delivery_date": "eta",
+        "actual_delivery_date": "ata",
+        "etd_main_carriage": "etd",
+        "atd_main_carriage": "atd",
+    }
+    effective_field = field_aliases.get(str(field or ""), str(field or ""))
+    if effective_field in profile.trusted_tms_update_fields:
         return True
-    sources = profile.trusted_sources.get(field, ())
+    sources = profile.trusted_sources.get(effective_field, ())
     return profile.document_type in sources

@@ -28,13 +28,14 @@ EXPECTED_PROFILE_KEYS = {
     "shipment_advice",
     "terminal_receipt",
     "outgoing_invoice",
+    "billing",
     "freight_cost_invoice_cfr_cpt",
     "tax_assessment",
     "internal_misc",
 }
 
 
-def test_all_18_document_profiles_exist():
+def test_all_document_profiles_exist():
     assert set(DOCUMENT_PROFILES) == EXPECTED_PROFILE_KEYS
     for key in EXPECTED_PROFILE_KEYS:
         assert get_document_profile(key).document_type == key

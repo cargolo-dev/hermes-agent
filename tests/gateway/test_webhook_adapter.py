@@ -760,8 +760,8 @@ class TestDeliverCrossPlatformThreadId:
         )
 
     @pytest.mark.asyncio
-    async def test_cargolo_teams_delivery_appends_context_marker_and_records_index(self, tmp_path, monkeypatch):
-        """CARGOLO native Teams cards carry a compact context marker for deterministic replies."""
+    async def test_cargolo_teams_delivery_records_context_without_visible_debug_marker(self, tmp_path, monkeypatch):
+        """CARGOLO native Teams cards store reply context without visible ASRCTX noise."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         adapter = _make_adapter()
         sleep_mock = AsyncMock()
@@ -795,7 +795,8 @@ class TestDeliverCrossPlatformThreadId:
 
         assert result.success is True
         sent_content = mock_target.send.await_args.args[1]
-        assert "ASRCTX:AN-11755:1203:delivery-marker" in sent_content
+        assert "ASRCTX:" not in sent_content
+        assert "Kontext:" not in sent_content
         index_path = tmp_path / ".hermes" / "cargolo_asr" / "runtime" / "teams_card_index.json"
         index = json.loads(index_path.read_text(encoding="utf-8"))
         assert index["by_message_id"]["teams-msg-777"]["context_id"] == "AN-11755:1203:delivery-marker"

@@ -183,6 +183,8 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
     assert "Frage:" not in body["message_text"]
     assert "Vorschlag:" not in body["message_text"]
     assert "123kg vs 500kg" in body["message_text"]
+    assert "invoice.pdf" not in body["message_text"]
+    assert "ASRCTX:" not in body["message_text"]
     assert "Erkannte Dokumente:" not in body["message_text"]
     assert len(body["message_text"]) < 2400
     assert "color:#111827" not in body["message_text"]
@@ -191,6 +193,63 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
     assert "background:#ffffff" not in body["message_text"]
     assert "color:#f8fafc" in body["message_text"]
     assert "color:#ffffff" in body["message_text"]
+
+
+def test_document_activity_notification_labels_generic_email_by_analyzed_offer_profile(tmp_path):
+    analysis_path = tmp_path / "offer_analysis.json"
+    registry_path = tmp_path / "registry.json"
+    report_path = tmp_path / "report.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": "Angebot-AN-13380-V1.pdf",
+                "doc_type": "unknown",
+                "suggested_registry_types": ["offer"],
+                "extracted_fields": {"document_type": "Angebot", "shipment_number": "AN-13380"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {"analyzed_documents": [{"filename": "Angebot-AN-13380-V1.pdf", "analysis_path": str(analysis_path), "doc_type": "unknown"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "order_id": "AN-13380",
+                "lifecycle": {"document_registry_path": str(registry_path)},
+                "tms_context": {"network": "road", "status": "pickup_scheduled"},
+                "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+                "trigger_event": {"metadata": {"document_type": "email", "email_subject": "CARGOLO Transportauftrag: AN-13380"}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    body = build_manual_ops_notification_body(
+        run_type="document_activity_monitor",
+        payload={
+            "order_id": "AN-13380",
+            "activity_event": {"metadata": {"document_type": "email", "email_subject": "CARGOLO Transportauftrag: AN-13380"}},
+            "processor_result": {
+                "order_id": "AN-13380",
+                "status": "document_uploaded_checked",
+                "document_activity_document_type": "offer",
+                "document_monitoring_report_path": str(report_path),
+                "message": "Lage: AN-13380 · Angebot wurde geprüft\nEmpfehlung: Keine direkte Aktion nötig",
+            },
+        },
+    )
+
+    assert "AN-13380 · Angebot · TMS unverändert" in body["message_text"]
+    assert "AN-13380 · email" not in body["message_text"]
+    assert "AN-13380 · unbekannt" not in body["message_text"]
 
 
 def test_send_manual_ops_notification_uses_native_teams_gateway_route(tmp_path, monkeypatch):
@@ -270,6 +329,67 @@ def test_send_manual_ops_notification_uses_native_teams_gateway_route(tmp_path, 
     assert "Nächster Schritt:" in captured["json"]["message_text"]
     assert "Mail +7" in captured["json"]["message_text"]
     assert len(captured["json"]["message_text"].splitlines()) <= 4
+
+
+def test_document_activity_notification_uses_dedicated_documents_teams_route(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "webhook_subscriptions.json").write_text(
+        json.dumps(
+            {
+                "cargolo-asr-ops-teams": {
+                    "events": ["cargolo_asr_manual_ops_notification"],
+                    "secret": "ops-secret",
+                    "deliver_only": True,
+                    "deliver": "teams",
+                    "prompt": "{message_text}",
+                },
+                "cargolo-asr-documents-teams": {
+                    "events": ["cargolo_asr_manual_ops_notification"],
+                    "secret": "docs-secret",
+                    "deliver_only": True,
+                    "deliver": "teams",
+                    "deliver_extra": {"chat_id": "19:docs@thread.v2"},
+                    "prompt": "{message_text}",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_CARGOLO_ASR_OPS_DELIVERY", raising=False)
+
+    captured = {}
+
+    def _fake_request(method, url, data=None, headers=None, timeout=None):
+        assert data is not None
+        captured["url"] = url
+        captured["json"] = json.loads(data.decode("utf-8"))
+        captured["headers"] = headers
+        return _Response()
+
+    with patch("plugins.cargolo_ops.ops_notifications.requests.request", side_effect=_fake_request):
+        result = send_manual_ops_notification(
+            run_type="document_activity_monitor",
+            payload={
+                "order_id": "AN-12140",
+                "processor_result": {
+                    "order_id": "AN-12140",
+                    "status": "document_uploaded_checked",
+                    "message": "Lage: B/L geprüft\nEmpfehlung: fachlich prüfen",
+                },
+            },
+            allow_route_fallback=True,
+        )
+
+    assert result["enabled"] is True
+    assert result["delivered"] == 1
+    assert result["targets"] == ["native_teams_route:cargolo-asr-documents-teams"]
+    assert captured["url"] == "http://127.0.0.1:8644/webhooks/cargolo-asr-documents-teams"
+    assert captured["headers"]["X-Hub-Signature-256"].startswith("sha256=")
+    assert captured["json"]["payload"]["run_type"] == "document_activity_monitor"
+    assert captured["json"]["payload"]["processor_result"]["order_id"] == "AN-12140"
+    assert captured["json"]["route"] == "cargolo-asr-documents-teams"
 
 
 def test_process_event_tool_includes_ops_notification_by_default(tmp_path):

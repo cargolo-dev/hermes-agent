@@ -322,6 +322,12 @@ TOOLSETS = {
         "tools": [],
         "includes": ["web", "vision", "image_gen"]
     },
+
+    "no_tools": {
+        "description": "No tools; pure model reasoning for isolated review/classification hooks",
+        "tools": [],
+        "includes": []
+    },
     
     # ==========================================================================
     # Full Hermes toolsets (CLI + messaging platforms)

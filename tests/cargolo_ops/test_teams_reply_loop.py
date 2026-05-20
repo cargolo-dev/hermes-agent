@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from plugins.cargolo_ops.teams_reply_loop import (
+    _default_tms_verify,
     build_card_context,
     handle_teams_message,
     process_teams_tms_card_action,
@@ -15,6 +16,22 @@ def _read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_default_tms_verify_reads_snapshot_bundle_detail(monkeypatch) -> None:
+    class FakeSnapshot:
+        detail = {"freight_details": {"container_number": "CIMU1670214"}}
+
+    class FakeProvider:
+        def snapshot_bundle(self, an: str, customer_hint: str | None = None) -> FakeSnapshot:
+            assert an == "AN-12218"
+            return FakeSnapshot()
+
+    from plugins.cargolo_ops import tms_provider
+
+    monkeypatch.setattr(tms_provider, "build_tms_provider_from_env", lambda: FakeProvider())
+
+    assert _default_tms_verify("AN-12218", "container_number") == "CIMU1670214"
 
 
 def test_record_sent_card_persists_context_and_message_index(tmp_path: Path) -> None:
@@ -398,7 +415,7 @@ def test_review_only_confirmation_closes_pending_without_tms_write(tmp_path: Pat
             "order_id": "AN-12218",
             "target": "cargo_weight_kg",
             "value": "10100",
-            "write_supported": False,
+            "write_supported": "false",
             "write_policy": "no_auto_write_without_review",
         }, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -826,3 +843,47 @@ def test_teams_button_click_on_already_resolved_action_is_not_reapplied(tmp_path
 
     assert result["status"] == "already_resolved"
     assert "bereits" in result["response_text"]
+
+
+
+def test_explicit_approval_without_value_does_not_apply_ambiguous_pending_action(tmp_path: Path) -> None:
+    root = tmp_path / "cargolo_asr"
+    (root / "orders" / "AN-11755" / "teams").mkdir(parents=True)
+    pending_path = root / "orders" / "AN-11755" / "teams" / "pending_tms_actions.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-05-08T11:58:25Z",
+            "status": "pending_review",
+            "order_id": "AN-11755",
+            "action_id": "act-customs",
+            "context_id": "AN-11755:manual",
+            "target": "customs_reference",
+            "value": "26DE99999",
+            "write_policy": "no_auto_write_without_review",
+        },
+        {
+            "timestamp": "2026-05-08T11:59:25Z",
+            "status": "pending_review",
+            "order_id": "AN-11755",
+            "action_id": "act-container",
+            "context_id": "AN-11755:manual",
+            "target": "container_number",
+            "value": "MSCU1234567",
+            "write_policy": "no_auto_write_without_review",
+        },
+    ]
+    pending_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+
+    result = handle_teams_message(
+        root=root,
+        text="AN-11755 freigegeben, bitte jetzt ins TMS übernehmen",
+        chat_id="teams-chat",
+        user_name="Operator",
+        message_id="reply-ambiguous-approve",
+        enable_tms_writeback=True,
+        apply_tms_update=lambda action, context: (_ for _ in ()).throw(AssertionError("must not apply ambiguous approval")),
+    )
+
+    assert result["handled"] is False
+    assert result["classification"] == "agent_decision_required"
+    assert [row["status"] for row in _read_jsonl(pending_path)] == ["pending_review", "pending_review"]

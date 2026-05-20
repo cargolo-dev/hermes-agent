@@ -15,8 +15,17 @@ from typing import Any, Iterable
 
 _ORDER_RE = re.compile(r"\b(?:AN|BU)-\d{3,}\b", re.IGNORECASE)
 _PLACEHOLDERS = {"", "-", "n/a", "na", "none", "null", "unknown", "unbekannt", "nicht lesbar", "not readable", "unreadable"}
-_WRITE_SUPPORTED_TARGETS = {"customs_reference", "hbl_number", "mbl_number", "hawb_number", "container_number", "pickup_date", "estimated_delivery_date"}
-_REVIEW_ONLY_TARGETS = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code"}
+_WRITE_SUPPORTED_TARGETS = {
+    "customs_reference",
+    "hbl_number",
+    "mbl_number",
+    "hawb_number",
+    "container_number",
+    "pickup_date",
+    "estimated_delivery_date",
+    "actual_delivery_date",
+}
+_REVIEW_ONLY_TARGETS = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code", "etd_main_carriage", "atd_main_carriage"}
 _SUPPORTED_TARGETS = _WRITE_SUPPORTED_TARGETS | _REVIEW_ONLY_TARGETS
 _TARGET_PRIORITY = {
     "cargo_weight_kg": 10,
@@ -25,6 +34,9 @@ _TARGET_PRIORITY = {
     "hs_code": 40,
     "pickup_date": 50,
     "estimated_delivery_date": 60,
+    "actual_delivery_date": 65,
+    "etd_main_carriage": 66,
+    "atd_main_carriage": 67,
     "container_number": 70,
     "customs_reference": 80,
 }
@@ -36,42 +48,63 @@ _FIELD_SPECS: dict[str, dict[str, Any]] = {
         "doc_keys": ("total_weight_kg", "weight_kg", "gross_weight_kg", "gross_weight", "weight"),
         "tms_paths": (("detail", "totals", "total_weight_kg"), ("detail", "totals", "weight_kg"), ("totals", "total_weight_kg"), ("weight_kg",)),
         "kind": "number",
-        "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "packing_list", "commercial_invoice", "delivery_note"},
+        "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "packing_list", "commercial_invoice", "delivery_note"},
     },
     "cargo_pieces": {
         "label": "Packstücke",
         "doc_keys": ("total_packages", "total_pieces", "packages", "pieces", "cartons", "quantity", "package_count"),
         "tms_paths": (("detail", "totals", "total_packages"), ("detail", "totals", "total_pieces"), ("totals", "total_packages"), ("pieces",)),
         "kind": "integer",
-        "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "packing_list", "commercial_invoice", "delivery_note"},
+        "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "packing_list", "commercial_invoice", "delivery_note"},
     },
     "seal_number": {
         "label": "Seal",
         "doc_keys": ("seal_number", "seal", "seal_no", "seal_no_", "container_seal"),
         "tms_paths": (("detail", "freight_details", "seal_number"), ("detail", "freight_details", "seal"), ("freight_details", "seal_number")),
         "kind": "code",
-        "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "packing_list"},
+        "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "packing_list"},
     },
     "pickup_date": {
         "label": "Pickup/Loading Date",
         "doc_keys": ("pickup_date", "loading_date", "load_date", "delivery_date", "shipment_date"),
         "tms_paths": (("detail", "dates", "pickup_date"), ("dates", "pickup_date"), ("pickup_date",)),
         "kind": "date",
-        "trusted_doc_types": {"waybill", "cmr", "delivery_note", "packing_list", "bill_of_lading", "master_bl", "house_bl"},
+        "trusted_doc_types": {"waybill", "cmr", "delivery_note", "packing_list", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading"},
     },
     "estimated_delivery_date": {
         "label": "ETA/Delivery Date",
-        "doc_keys": ("estimated_delivery_date", "delivery_date", "eta"),
+        "doc_keys": ("estimated_delivery_date", "delivery_date", "eta", "estimated_arrival_date"),
         "tms_paths": (("detail", "dates", "estimated_delivery_date"), ("dates", "estimated_delivery_date"), ("estimated_delivery_date",)),
         "kind": "date",
-        "trusted_doc_types": {"waybill", "delivery_note", "bill_of_lading", "master_bl", "house_bl"},
+        "trusted_doc_types": {"waybill", "delivery_note", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "shipment_advice"},
+    },
+    "actual_delivery_date": {
+        "label": "ATA/Actual Delivery Date",
+        "doc_keys": ("actual_delivery_date", "ata", "actual_arrival_date", "arrival_date"),
+        "tms_paths": (("detail", "dates", "actual_delivery_date"), ("dates", "actual_delivery_date"), ("actual_delivery_date",)),
+        "kind": "date",
+        "trusted_doc_types": {"waybill", "proof_of_delivery", "delivery_note", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "shipment_advice"},
+    },
+    "etd_main_carriage": {
+        "label": "ETD Hauptlauf",
+        "doc_keys": ("etd", "estimated_departure_date", "estimated_departure", "etd_main_carriage"),
+        "tms_paths": (("detail", "milestones", "etd_main_carriage"), ("milestones", "etd_main_carriage"), ("detail", "transport_legs", "main_carriage", "etd")),
+        "kind": "date",
+        "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "booking_confirmation", "shipment_advice"},
+    },
+    "atd_main_carriage": {
+        "label": "ATD Hauptlauf",
+        "doc_keys": ("atd", "actual_departure_date", "actual_departure", "atd_main_carriage"),
+        "tms_paths": (("detail", "milestones", "atd_main_carriage"), ("milestones", "atd_main_carriage"), ("detail", "transport_legs", "main_carriage", "atd")),
+        "kind": "date",
+        "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "booking_confirmation", "shipment_advice"},
     },
     "container_number": {
         "label": "Container",
         "doc_keys": ("container_number", "container_no", "container"),
         "tms_paths": (("detail", "freight_details", "container_number"), ("freight_details", "container_number"), ("container_number",)),
         "kind": "container",
-        "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "packing_list"},
+        "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "packing_list"},
     },
     "customs_reference": {
         "label": "Zollreferenz/MRN",
@@ -147,6 +180,13 @@ def _norm(value: Any) -> str:
 def _path_get(data: dict[str, Any], path: Iterable[str]) -> Any:
     current: Any = data
     for part in path:
+        if isinstance(current, list):
+            if part == "main_carriage":
+                current = next((row for row in current if isinstance(row, dict) and str(row.get("leg_type") or "") == "main_carriage"), None)
+                if current is None:
+                    return None
+                continue
+            return None
         if not isinstance(current, dict):
             return None
         current = current.get(part)
@@ -197,10 +237,20 @@ def _normalize_value(value: Any, kind: str) -> str:
     if kind == "date":
         match = re.search(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", text)
         if match:
-            return f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+            normalized = f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+            try:
+                datetime.strptime(normalized, "%Y-%m-%d")
+            except ValueError:
+                return ""
+            return normalized
         match = re.search(r"\b(\d{1,2})[./-](\d{1,2})[./-](20\d{2})\b", text)
         if match:
-            return f"{match.group(3)}-{int(match.group(2)):02d}-{int(match.group(1)):02d}"
+            normalized = f"{match.group(3)}-{int(match.group(2)):02d}-{int(match.group(1)):02d}"
+            try:
+                datetime.strptime(normalized, "%Y-%m-%d")
+            except ValueError:
+                return ""
+            return normalized
         return ""
     if kind == "container":
         match = re.search(r"\b([A-Z]{4}\d{7})\b", text.upper())
@@ -273,7 +323,24 @@ def _same_value(left: str, right: str, kind: str) -> bool:
 
 
 def _doc_type(row: dict[str, Any], analysis: dict[str, Any]) -> str:
-    return str(row.get("analysis_doc_type") or row.get("doc_type") or analysis.get("doc_type") or "").strip().lower()
+    try:
+        from .document_schema import normalize_document_type
+    except Exception:
+        normalize_document_type = None  # type: ignore[assignment]
+    for candidate in (row.get("analysis_doc_type"), row.get("doc_type"), analysis.get("doc_type")):
+        value = str(candidate or "").strip().lower()
+        if value and value not in {"unknown", "email", "unbekannt"}:
+            return str(normalize_document_type(value) if normalize_document_type else value).lower()
+    suggested = analysis.get("suggested_registry_types")
+    if isinstance(suggested, list):
+        for candidate in suggested:
+            value = str(candidate or "").strip().lower()
+            if value and value not in {"unknown", "email", "unbekannt"}:
+                return str(normalize_document_type(value) if normalize_document_type else value).lower()
+    raw_fields = analysis.get("extracted_fields")
+    fields: dict[str, Any] = raw_fields if isinstance(raw_fields, dict) else {}
+    value = str(fields.get("document_type") or analysis.get("doc_type") or row.get("doc_type") or "").strip().lower()
+    return str(normalize_document_type(value) if normalize_document_type else value).lower()
 
 
 def _iter_evidence_documents(case_root: Path, registry: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, Any]]:

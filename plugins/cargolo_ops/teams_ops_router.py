@@ -88,10 +88,10 @@ def _pending_action_id_for_row(item: dict[str, Any]) -> str:
 
 _SUPPORTED_TMS_REVIEW_TARGETS = {
     "customs_reference", "hbl_number", "mbl_number", "hawb_number", "container_number",
-    "pickup_date", "estimated_delivery_date",
+    "pickup_date", "estimated_delivery_date", "actual_delivery_date",
     # Agentic proposal-layer review-only targets. Approval stays blocked until a
     # dedicated TMS writeback mapping exists; cards are still useful for ops review.
-    "cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code",
+    "cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code", "etd_main_carriage", "atd_main_carriage",
 }
 
 
@@ -154,6 +154,7 @@ def _extract_correction_value(raw: str, *, target: str) -> str | None:
         "container_number": r"\b([A-Z]{4}\d{7})\b",
         "pickup_date": r"\b(\d{4}-\d{2}-\d{2})\b",
         "estimated_delivery_date": r"\b(\d{4}-\d{2}-\d{2})\b",
+        "actual_delivery_date": r"\b(\d{4}-\d{2}-\d{2})\b",
     }
     pattern = field_patterns.get(target)
     if not pattern:

@@ -1358,13 +1358,13 @@ class TeamsAdapter(BasePlatformAdapter):
             "value": value,
             "context_id": context_id,
         }
-        review_only_targets = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code"}
-        write_supported = bool(pending_action.get("write_supported", target not in review_only_targets))
+        review_only_targets = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code", "etd_main_carriage", "atd_main_carriage"}
+        write_supported = _parse_bool(pending_action.get("write_supported"), default=target not in review_only_targets)
         raw_evidence = pending_action.get("evidence")
         evidence: dict[str, Any] = raw_evidence if isinstance(raw_evidence, dict) else {}
-        previous_value = str(pending_action.get("previous_value") or evidence.get("tms_value") or "").strip()
-        source_text = str(evidence.get("source") or evidence.get("document") or evidence.get("source_file") or pending_action.get("source") or operator).strip()
-        evidence_value = str(evidence.get("evidence_value") or evidence.get("value") or "").strip()
+        previous_value = str(pending_action.get("previous_value") or evidence.get("previous_value") or evidence.get("tms_value") or "").strip()
+        source_text = str(evidence.get("source") or evidence.get("document_type") or pending_action.get("source") or operator).strip()
+        evidence_value = str(evidence.get("document_value") or evidence.get("evidence_value") or evidence.get("value") or "").strip()
         evidence_bits = []
         if previous_value:
             evidence_bits.append(f"TMS bisher: {previous_value}")
@@ -1374,20 +1374,20 @@ class TeamsAdapter(BasePlatformAdapter):
             evidence_bits.append(f"Quelle: {source_text}")
         evidence_line = " · ".join(evidence_bits) or f"Quelle: {operator}"
         action_text = (
-            "Ja schreibt nur nach Live-Writeback + frischer Verifikation ins TMS; Nein/Korrektur/Fall prüfen schreiben nie ins TMS."
+            "Hermes hat noch nichts geändert. Bestätigen schreibt diesen Wert erst nach Live-Writeback und frischer Verifikation ins TMS; Ablehnen/Korrektur/Fall prüfen schreiben nie."
             if write_supported
-            else "Review-only: Für dieses Feld gibt es noch keinen direkten TMS-Writeback. Bestätigen blockiert den Auto-Write und hält die fachliche Prüfung fest."
+            else "Review-only: Bestätigen hält die fachliche Prüfung fest; ein direkter TMS-Write ist für dieses Feld nicht aktiv."
         )
-        approve_title = "✅ Ja, TMS schreiben" if write_supported else "✅ Fachlich bestätigen"
+        approve_title = "✅ Bestätigen & ins TMS schreiben" if write_supported else "✅ Fachlich bestätigen"
         card = (
             AdaptiveCard()
             .with_version("1.4")
             .with_body([
-                TextBlock(text=f"CARGOLO ASR · TMS-Freigabe {order_id}", wrap=True, weight="Bolder"),
+                TextBlock(text=f"Hermes · TMS-Vorschlag prüfen ({order_id})", wrap=True, weight="Bolder"),
                 TextBlock(text=question or f"Soll dieser TMS-Wert aus dem Dokument übernommen werden?", wrap=True, weight="Bolder"),
-                TextBlock(text=f"Vorschlag: {target} = {value}", wrap=True),
+                TextBlock(text=f"Im TMS: {previous_value or 'nicht gepflegt'}", wrap=True),
+                TextBlock(text=f"Vorschlag aus Evidenz: {target} = {value}", wrap=True),
                 TextBlock(text=evidence_line, wrap=True, isSubtle=True),
-                TextBlock(text=f"Status: pending_review · Erzeugt von: {operator}", wrap=True, isSubtle=True),
                 TextBlock(text=action_text, wrap=True),
             ])
             .with_actions([
@@ -1398,7 +1398,7 @@ class TeamsAdapter(BasePlatformAdapter):
                     style="positive",
                 ),
                 ExecuteAction(
-                    title="✏️ Korrektur nötig",
+                    title="✏️ Korrigieren",
                     verb="cargolo_asr_tms_correct",
                     data={**data_base, "hermes_action": "cargolo_asr_tms_correct"},
                 ),
@@ -1408,7 +1408,7 @@ class TeamsAdapter(BasePlatformAdapter):
                     data={**data_base, "hermes_action": "cargolo_asr_case_check"},
                 ),
                 ExecuteAction(
-                    title="❌ Nein, nicht übernehmen",
+                    title="❌ Ablehnen",
                     verb="cargolo_asr_tms_reject",
                     data={**data_base, "hermes_action": "cargolo_asr_tms_reject"},
                     style="destructive",

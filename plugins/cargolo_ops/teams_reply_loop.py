@@ -349,7 +349,7 @@ def record_agent_tms_update_intent(
         "operator": operator,
         "text": text,
         "write_policy": "no_auto_write_without_review",
-        "write_supported": bool(normalized_target in _SHORT_TO_FULL_TARGET) if write_supported is None else bool(write_supported),
+        "write_supported": bool(normalized_target in _SHORT_TO_FULL_TARGET),
     }
     _append_jsonl(teams_dir / "pending_tms_actions.jsonl", row)
     _append_jsonl(teams_dir / "case_learning.jsonl", {
@@ -390,9 +390,23 @@ _SHORT_TO_FULL_TARGET: dict[str, str] = {
     "container_number": "shipment.freight_details.container_number",
     "pickup_date": "shipment.dates.pickup_date",
     "estimated_delivery_date": "shipment.dates.estimated_delivery_date",
+    "actual_delivery_date": "shipment.dates.actual_delivery_date",
 }
-_REVIEW_ONLY_TARGETS = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code"}
+_REVIEW_ONLY_TARGETS = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code", "etd_main_carriage", "atd_main_carriage"}
 _SUPPORTED_INTENT_TARGETS = set(_SHORT_TO_FULL_TARGET) | _REVIEW_ONLY_TARGETS
+
+
+def _coerce_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return default
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -435,12 +449,16 @@ def _find_pending_tms_action(root: Path, order_id: str, text: str) -> tuple[Path
     if not pending:
         return None
     raw = str(text or "")
+    raw_upper = raw.upper()
+    for idx, row in reversed(pending):
+        action_id = str(row.get("action_id") or "").strip()
+        if action_id and action_id in raw:
+            return queue_path, rows, idx, row
     for idx, row in reversed(pending):
         value = str(row.get("value") or "").strip()
-        if value and value in raw:
+        if value and value.upper() in raw_upper:
             return queue_path, rows, idx, row
-    idx, row = pending[-1]
-    return queue_path, rows, idx, row
+    return None
 
 
 def _find_pending_tms_action_by_button_data(
@@ -736,7 +754,10 @@ def process_teams_tms_card_action(
         })
         return {"handled": True, "status": "case_check_completed", "order_id": order_id, "derived_action": action, "response_text": _button_response_text(order_id, action), "case_check": check_result}
 
-    target_write_supported = bool(pending_action.get("write_supported", str(pending_action.get("target") or "") in _SHORT_TO_FULL_TARGET))
+    target_write_supported = _coerce_bool(
+        pending_action.get("write_supported"),
+        default=str(pending_action.get("target") or "") in _SHORT_TO_FULL_TARGET,
+    )
     if not target_write_supported:
         updated = {
             **pending_action,
@@ -820,7 +841,7 @@ def _extract_snapshot_value(snapshot: dict[str, Any], target: str) -> Any:
     if target in {"hbl_number", "mbl_number", "hawb_number", "container_number"}:
         freight = shipment.get("freight_details") if isinstance(shipment.get("freight_details"), dict) else {}
         return freight.get(target) or shipment.get(target)
-    if target in {"pickup_date", "estimated_delivery_date"}:
+    if target in {"pickup_date", "estimated_delivery_date", "actual_delivery_date"}:
         dates = shipment.get("dates") if isinstance(shipment.get("dates"), dict) else {}
         return dates.get(target) or shipment.get(target)
     return None
@@ -832,7 +853,18 @@ def _default_tms_verify(order_id: str, target: str) -> Any:
     provider = build_tms_provider_from_env()
     if provider is None:
         raise RuntimeError("TMS read provider is not configured")
-    snapshot = provider.snapshot(order_id)
+    snapshot: dict[str, Any]
+    snapshot_reader = getattr(provider, "snapshot", None)
+    if callable(snapshot_reader):
+        raw_snapshot = snapshot_reader(order_id)
+        snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
+    else:
+        snapshot_obj = provider.snapshot_bundle(order_id)
+        if hasattr(snapshot_obj, "detail") and isinstance(snapshot_obj.detail, dict):
+            snapshot = {"shipment": snapshot_obj.detail}
+        else:
+            raw_snapshot = snapshot_obj.model_dump(mode="json") if hasattr(snapshot_obj, "model_dump") else {}
+            snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
     return _extract_snapshot_value(snapshot, target)
 
 
@@ -974,7 +1006,8 @@ def _agent_prompt_for_contextual_reply(order_id: str, context: dict[str, Any], t
         "Wenn du aus dem Kontext einen sinnvollen nächsten Schritt erkennst, schlage ihn proaktiv vor.\n"
         "TMS-Sicherheit: Wenn die Nachricht fachlich ein TMS-Änderungswunsch ist, schreibe NICHT direkt ins TMS. "
         "Nutze ausschließlich das Tool `cargolo_asr_record_teams_tms_intent` mit order_id, target, value, text, context_id, source_message_id, operator. "
-        "Unterstützte targets: customs_reference, hbl_number, mbl_number, hawb_number, container_number, pickup_date, estimated_delivery_date. "
+        "Unterstützte targets: customs_reference, hbl_number, mbl_number, hawb_number, container_number, pickup_date, estimated_delivery_date, actual_delivery_date; "
+        "review-only ohne direkten TMS-Write: etd_main_carriage, atd_main_carriage. "
         "Wenn target oder value unklar sind, frage nach statt zu raten.\n"
         "Antwortstil: kurz, deutsch, operativ, mit klarer Aussage: geprüft/gespeichert/nicht geschrieben/nächster Schritt. "
         "Wenn es kein TMS-Änderungswunsch ist, antworte natürlich als Kollege und behaupte keinen TMS-Wunsch.\n"

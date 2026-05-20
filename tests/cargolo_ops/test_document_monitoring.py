@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +11,7 @@ import pytest
 from plugins.cargolo_ops.document_monitoring import run_document_monitoring
 from plugins.cargolo_ops.document_reconciliation import reconcile_documents
 from plugins.cargolo_ops.document_activity_monitor import _processor_result_from_report, run_document_activity_monitor
+from plugins.cargolo_ops.document_schema import normalize_mode
 
 
 def _processor_result_for_uploaded_fields(
@@ -93,6 +96,21 @@ def test_reconciliation_does_not_turn_missing_docs_alone_into_risk():
     assert report["risk"] == "low"
     assert report["needs_human_review"] is False
     assert report["missing_policy"] == "missing_documents_are_inventory_context_not_risk"
+
+
+def test_reconciliation_normalizes_asr_landtransport_to_road():
+    report = reconcile_documents(
+        order_id="AN-LAND",
+        tms_snapshot={"detail": {"network": "Landtransport", "status": "confirmed"}},
+        registry={"expected_types": [], "received_types": [], "received_documents": [], "analyzed_documents": []},
+    )
+
+    assert report["mode"] == "road"
+
+
+@pytest.mark.parametrize("mode", ["road", "Landtransport", "land_transport", "truck", "LTL", "FTL", "CargoLine", "OSL"])
+def test_normalize_mode_accepts_asr_landtransport_aliases(mode):
+    assert normalize_mode(mode) == "road"
 
 
 def test_reconciliation_flags_present_document_weight_mismatch_against_tms(tmp_path):
@@ -202,6 +220,77 @@ def test_processor_result_uses_human_document_message_without_risk_dump():
     assert "Soll wegen Top-3" not in message
     assert result["analysis_priority"] == "high"
     assert result["pending_action_summary"]["review"] == 1
+    assert result["document_agent_review"]["mode"] == "guardrailed_fallback"
+    assert result["document_agent_evidence_packet"]["contract"] == "agent_first_document_review_v1"
+
+
+def test_processor_result_uses_external_agent_review_when_available():
+    agent_review = {
+        "mode": "external_agent",
+        "sections": {
+            "lage": "Packing List gelesen; operativ nur Gewicht/Packstücke relevant.",
+            "abgleich": "Packstücke passen zum TMS; keine sichere TMS-Korrektur ableitbar.",
+            "auffaellig": "Kein harter Konflikt, aber Gewicht sollte bei Gelegenheit gegengeprüft werden.",
+            "empfehlung": "Nicht eskalieren; Sendung weiter beobachten.",
+            "naechster_schritt": "Keine Kachel nötig; erst bei weiterem Beleg erneut bewerten.",
+        },
+        "decision": "observe",
+        "priority": "medium",
+        "needs_review": False,
+        "confidence": "high",
+    }
+    with patch("plugins.cargolo_ops.document_activity_monitor._run_document_agent_review", return_value=agent_review) as mock_review:
+        result = _processor_result_from_report(
+            {
+                "order_id": "AN-AGENT",
+                "tms_context": {"status": "in_transit", "network": "rail"},
+                "lifecycle": {},
+                "registry_summary": {},
+                "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+            },
+            {"id": 88, "changed_at": "2026-05-19T10:00:00Z", "metadata": {"file_name": "packing.pdf", "document_type": "packing_list"}},
+        )
+
+    packet = mock_review.call_args.args[0]
+    assert packet["contract"] == "agent_first_document_review_v1"
+    assert packet["guardrails"]["writes_allowed"] is False
+    assert "Packing List gelesen" in result["message"]
+    assert "Nicht eskalieren" in result["message"]
+    assert result["analysis_priority"] == "medium"
+    assert result["document_decision"] == "Agentische Bewertung: weiter beobachten"
+    assert result["document_agent_review"]["mode"] == "external_agent"
+    assert result["side_effects"] == {"tms_updates": 0, "queued_tms_actions": 0, "customer_notifications": 0}
+
+
+def test_processor_result_does_not_let_agent_downgrade_deterministic_review_intent(tmp_path):
+    agent_review = {
+        "mode": "external_agent",
+        "sections": {
+            "lage": "Beleg gelesen.",
+            "abgleich": "MBL fehlt im TMS, Dokument nennt NGP3497068.",
+            "auffaellig": "Sicherer Feldkandidat vorhanden.",
+            "empfehlung": "Freigabe-Kachel prüfen.",
+            "naechster_schritt": "Bestätigen oder ablehnen.",
+        },
+        "decision": "no_action",
+        "priority": "low",
+        "needs_review": False,
+    }
+    with patch("plugins.cargolo_ops.document_activity_monitor._run_document_agent_review", return_value=agent_review):
+        result = _processor_result_for_uploaded_fields(
+            tmp_path,
+            filename="mbl.pdf",
+            event_doc_type="master_bl",
+            analysis_doc_type="master_bl",
+            field_sources={"mbl_number": "explicit_bl_number"},
+            extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
+        )
+
+    assert result["document_review_intents"]
+    assert result["pending_action_summary"]["review"] == 1
+    assert result["agent_review_required"] is True
+    assert result["analysis_priority"] == "medium"
+    assert result["document_decision"] == "TMS-Korrektur nur nach Agent-/Operator-Freigabe prüfen"
 
 
 def test_processor_result_escalates_blocker_finding_to_high_priority():
@@ -311,7 +400,7 @@ def test_processor_result_prioritizes_uploaded_document_and_labels_master_bl():
     assert "3100 kg" not in message
 
 
-def test_processor_result_keeps_untrusted_invoice_mbl_text_but_skips_teams_card(tmp_path):
+def test_processor_result_ignores_untrusted_invoice_mbl_noise_and_skips_teams_card(tmp_path):
     result = _processor_result_for_uploaded_fields(
         tmp_path,
         filename="invoice-with-mbl.pdf",
@@ -320,7 +409,8 @@ def test_processor_result_keeps_untrusted_invoice_mbl_text_but_skips_teams_card(
         extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
     )
 
-    assert "MBL / B/L-Nr. fehlt im TMS" in result["message"]
+    assert "MBL / B/L-Nr. fehlt im TMS" not in result["message"]
+    assert result["document_field_comparison"] == []
     assert result["teams_tms_review_cards"] == []
 
 
@@ -333,7 +423,60 @@ def test_processor_result_queues_trusted_master_bl_mbl_card(tmp_path):
         extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
     )
 
-    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+    assert [(intent["target"], intent["value"]) for intent in result["document_review_intents"]] == [("mbl_number", "NGP3497068")]
+
+
+def test_processor_result_queues_eta_ata_date_cards_from_shipment_advice(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="arrival-advice.pdf",
+        event_doc_type="shipment_advice",
+        analysis_doc_type="shipment_advice",
+        extracted_fields={"eta": "2026-06-20", "ata": "21.06.2026", "shipment_number": "AN-11790"},
+    )
+
+    assert [(intent["target"], intent["value"], intent["guardrails"]["write_supported"]) for intent in result["document_review_intents"]] == [
+        ("estimated_delivery_date", "2026-06-20", True),
+        ("actual_delivery_date", "2026-06-21", True),
+    ]
+
+
+def test_processor_result_surfaces_etd_atd_as_review_only_cards(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="departure-advice.pdf",
+        event_doc_type="shipment_advice",
+        analysis_doc_type="shipment_advice",
+        extracted_fields={"etd": "2026-06-18", "atd": "19.06.2026", "shipment_number": "AN-11790"},
+    )
+
+    assert [(intent["target"], intent["value"], intent["guardrails"]["write_supported"]) for intent in result["document_review_intents"]] == [
+        ("etd_main_carriage", "2026-06-18", False),
+        ("atd_main_carriage", "2026-06-19", False),
+    ]
+
+
+def test_processor_result_offer_filename_overrides_false_billing_analysis(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="Angebot-AN-13322-V1.pdf",
+        event_doc_type="email",
+        analysis_doc_type="billing",
+        extracted_fields={
+            "document_type": "Angebot",
+            "document_number": "AN-13322-V1",
+            "amount": "3480.24",
+            "currency": "EUR",
+            "customer": "Mainhattan-Wheels GmbH",
+            "incoterm_named_place": "EXW",
+            "shipment_number": "AN-13322",
+        },
+    )
+
+    assert result["document_activity_document_type"] == "offer"
+    assert "Angebot geprüft" in result["message"]
+    assert "Abrechnungsbeleg" not in result["message"]
+    assert "Angebotsdaten:" in result["message"]
 
 
 def test_processor_result_uses_analyzed_master_bl_type_when_event_has_legacy_bill_of_lading(tmp_path):
@@ -345,7 +488,7 @@ def test_processor_result_uses_analyzed_master_bl_type_when_event_has_legacy_bil
         extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
     )
 
-    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+    assert [(intent["target"], intent["value"]) for intent in result["document_review_intents"]] == [("mbl_number", "NGP3497068")]
 
 
 def test_processor_result_allows_legacy_bill_of_lading_with_explicit_bl_field_evidence(tmp_path):
@@ -357,7 +500,7 @@ def test_processor_result_allows_legacy_bill_of_lading_with_explicit_bl_field_ev
         extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
     )
 
-    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+    assert [(intent["target"], intent["value"]) for intent in result["document_review_intents"]] == [("mbl_number", "NGP3497068")]
 
 
 def test_processor_result_uses_analyzed_master_bl_type_when_event_doc_type_missing(tmp_path):
@@ -369,7 +512,7 @@ def test_processor_result_uses_analyzed_master_bl_type_when_event_doc_type_missi
         extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
     )
 
-    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+    assert [(intent["target"], intent["value"]) for intent in result["document_review_intents"]] == [("mbl_number", "NGP3497068")]
 
 
 def test_processor_result_allows_missing_event_type_with_analyzed_legacy_bl_evidence(tmp_path):
@@ -381,7 +524,7 @@ def test_processor_result_allows_missing_event_type_with_analyzed_legacy_bl_evid
         extracted_fields={"mbl_number": "NGP3497068", "pol": "Ningbo, China", "pod": "Hamburg, Germany"},
     )
 
-    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+    assert [(intent["target"], intent["value"]) for intent in result["document_review_intents"]] == [("mbl_number", "NGP3497068")]
 
 
 def test_processor_result_blocks_mbl_card_when_field_source_is_booking_number(tmp_path):
@@ -443,7 +586,7 @@ def test_processor_result_queues_mbl_card_when_field_source_is_master_bl_number(
         },
     )
 
-    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("mbl_number", "NGP3497068")]
+    assert [(intent["target"], intent["value"]) for intent in result["document_review_intents"]] == [("mbl_number", "NGP3497068")]
 
 
 def test_processor_result_queues_trusted_packing_list_valid_container_card(tmp_path):
@@ -456,7 +599,7 @@ def test_processor_result_queues_trusted_packing_list_valid_container_card(tmp_p
         references=["XHCU2996441"],
     )
 
-    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("container_number", "XHCU2996441")]
+    assert [(intent["target"], intent["value"]) for intent in result["document_review_intents"]] == [("container_number", "XHCU2996441")]
 
 
 def test_processor_result_blocks_master_bl_cards_when_uploaded_file_has_blocker_finding(tmp_path):
@@ -545,7 +688,7 @@ def test_processor_result_rejects_date_like_document_number_as_mbl_but_keeps_con
         f"{card['target']}={card['value']}" for card in result["teams_tms_review_cards"]
     )
     assert "MBL / B/L-Nr. fehlt im TMS" not in message
-    assert [(card["target"], card["value"]) for card in result["teams_tms_review_cards"]] == [("container_number", "XHCU2996441")]
+    assert [(intent["target"], intent["value"]) for intent in result["document_review_intents"]] == [("container_number", "XHCU2996441")]
 
 
 @pytest.mark.parametrize(
@@ -699,11 +842,187 @@ def test_processor_result_compares_uploaded_explicit_bl_fields_against_tms(tmp_p
     assert "ETA nicht explizit" not in message
     assert "Entwurf (Draft)" not in message
     assert result["pending_action_summary"]["review"] == 1
-    cards = result["teams_tms_review_cards"]
-    assert [(card["target"], card["value"]) for card in cards] == [("mbl_number", "NGP3497068"), ("container_number", "XHCU2996441")]
-    assert all(card["action_id"] for card in cards)
+    intents = result["document_review_intents"]
+    assert [(intent["target"], intent["value"]) for intent in intents] == [
+        ("etd_main_carriage", "2026-05-06"),
+        ("mbl_number", "NGP3497068"),
+        ("container_number", "XHCU2996441"),
+    ]
+    etd_intent = next(intent for intent in intents if intent["target"] == "etd_main_carriage")
+    assert etd_intent["guardrails"]["write_supported"] is False
+    assert result["teams_tms_review_cards"] == []
+    assert result["side_effects"]["queued_tms_actions"] == 0
     pending_path = tmp_path / "orders" / "AN-11790" / "teams" / "pending_tms_actions.jsonl"
-    assert pending_path.exists()
+    assert not pending_path.exists()
+
+
+def test_processor_result_uses_profile_fields_for_billing_without_route_noise(tmp_path):
+    analysis_path = tmp_path / "billing_analysis.json"
+    registry_path = tmp_path / "billing_registry.json"
+    snapshot_path = tmp_path / "billing_tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": "Rechnung-209390.pdf",
+                "doc_type": "billing",
+                "summary": "Frachtrechnung mit Abgaben und Verzollung.",
+                "references": ["AN-11849", "26DE4851ECA01VTYR8"],
+                "extracted_fields": {
+                    "invoice_number": "209390",
+                    "amount": "37197,51",
+                    "currency": "EUR",
+                    "mrn": "26DE4851ECA01VTYR8",
+                    "container_number": "CICU9983004",
+                    "pol": "Shenzhen",
+                    "pod": "Hamburg",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "analyzed_documents": [
+                    {"filename": "Rechnung-209390.pdf", "analysis_path": str(analysis_path), "analysis_doc_type": "billing"}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "freight_details": {"pol_code": "Zhengzhou", "pod_code": "DEHAM", "container_number": "CICU9983004"},
+                    "transport_legs": [],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-11849",
+            "case_root": str(tmp_path / "orders" / "AN-11849"),
+            "tms_context": {"status": "customs_clearance", "network": "rail", "origin_city": "Shenzhen", "origin_country": "CN", "destination_city": "Erfurt", "destination_country": "DE"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+        },
+        {"id": 1814, "changed_at": "2026-05-19T11:10:00Z", "metadata": {"document_type": "email", "invoice_number": "209390", "email_subject": "Ihre Rechnung 209390 | Sendung AN-11849"}},
+    )
+
+    message = result["message"]
+    assert "Abrechnungsbeleg" in message
+    assert "Aus dem Beleg sicher gelesen" in message or "Gelesen:" in message
+    assert "Rechnungsnr. 209390" in message
+    assert "Betrag 37197,51 EUR" in message
+    assert "POL" not in message
+    assert "POD" not in message
+    assert result["document_field_comparison"] == [
+        {"label": "Container", "tms": "CICU9983004", "doc": "CICU9983004", "status": "match", "target": "container_number"}
+    ]
+    assert result["document_review_intents"] == []
+
+
+def test_processor_result_uses_suggested_profile_for_generic_email_offer_document(tmp_path):
+    analysis_path = tmp_path / "offer_analysis.json"
+    registry_path = tmp_path / "offer_registry.json"
+    snapshot_path = tmp_path / "offer_tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": "Angebot-AN-13380-V1.pdf",
+                "doc_type": "unknown",
+                "confidence": "high",
+                "suggested_registry_types": ["offer"],
+                "extracted_fields": {
+                    "document_type": "Angebot",
+                    "shipment_number": "AN-13380",
+                    "loading_place": "Wiesbaden",
+                    "unloading_place": "Duisburg",
+                    "incoterm_named_place": "EXW",
+                    "pieces": "1",
+                    "volume": "1.435 m³",
+                    "goods_description": "Warenautomat",
+                    "amount": "380,00",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "analyzed_documents": [
+                    {"filename": "Angebot-AN-13380-V1.pdf", "analysis_path": str(analysis_path), "doc_type": "unknown"}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps({"detail": {"freight_details": {}, "transport_legs": []}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-13380",
+            "case_root": str(tmp_path / "orders" / "AN-13380"),
+            "tms_context": {"status": "pickup_scheduled", "network": "road", "origin_city": "Wiesbaden", "origin_country": "DE", "destination_city": "Duisburg", "destination_country": "DE"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+        },
+        {"id": 1843, "changed_at": "2026-05-19T13:09:00Z", "metadata": {"document_type": "email", "email_type": "transportauftrag", "email_subject": "CARGOLO Transportauftrag: AN-13380", "attached_documents_count": 1}},
+    )
+
+    assert result["document_activity_document_type"] == "offer"
+    assert "Angebot" in result["message"]
+    assert "email" not in result["message"].lower()
+    assert "ETD" not in result["message"]
+
+
+def test_processor_result_offer_filename_overrides_wrong_billing_event_type(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="Angebot-AN-13322-V1.pdf",
+        event_doc_type="billing",
+        analysis_doc_type="billing",
+        extracted_fields={
+            "document_type": "Angebot",
+            "document_number": "AN-13322-V1",
+            "amount": "3480.24 EUR",
+            "customer_name": "Mainhattan-Wheels GmbH",
+            "incoterm_named_place": "EXW",
+        },
+    )
+
+    assert result["document_activity_document_type"] == "offer"
+    assert "Angebot" in result["message"]
+    assert "Abrechnungsbeleg" not in result["message"]
+    assert result["document_review_intents"] == []
+
+
+def test_processor_result_rejects_impossible_date_review_intent(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="arrival.pdf",
+        event_doc_type="shipment_advice",
+        analysis_doc_type="shipment_advice",
+        extracted_fields={"eta": "31.02.2026"},
+        freight_details={"pol_code": "CNNGB", "pod_code": "DEHAM", "mbl_number": "", "container_number": ""},
+    )
+
+    assert all(intent.get("target") != "estimated_delivery_date" for intent in result["document_review_intents"])
 
 
 @pytest.mark.parametrize("placeholder", ["unknown", "nicht lesbar", "not readable", "unreadable", "n/a"])
@@ -827,8 +1146,8 @@ def test_processor_result_rejects_eu_date_like_explicit_mbl_fields(tmp_path, dat
         {"id": 1266, "changed_at": "2026-05-11T10:00:00Z", "metadata": {"file_name": "draft-bl.pdf", "document_type": "master_bl"}},
     )
 
-    cards = result["teams_tms_review_cards"]
-    assert all(card["target"] != "mbl_number" for card in cards)
+    intents = result["document_review_intents"]
+    assert all(intent["target"] != "mbl_number" for intent in intents)
     assert "MBL / B/L-Nr. fehlt im TMS" not in result["message"]
 
 
@@ -913,6 +1232,101 @@ def test_document_activity_monitor_filters_new_document_uploads_and_updates_curs
     assert state["last_seen_activity_id"] == 9
 
 
+def test_document_activity_monitor_baseline_now_sets_cursor_without_processing_or_notify(tmp_path):
+    class FakeProvider:
+        def list_asr_activity_log(self, **kwargs):
+            return {
+                "status": "ok",
+                "items": [
+                    {"id": 100, "entity_type": "document", "action": "upload", "metadata": {"file_name": "old.pdf"}, "asr_request": {"request_number": "AN-10000"}},
+                    {"id": 105, "entity_type": "document", "action": "create", "metadata": {"file_name": "latest.pdf"}, "asr_request": {"request_number": "AN-10001"}},
+                    {"id": 110, "entity_type": "shipment", "action": "update", "asr_request": {"request_number": "AN-10002"}},
+                ],
+            }
+
+    with patch("plugins.cargolo_ops.document_activity_monitor.build_tms_provider_from_env", return_value=FakeProvider()), patch(
+        "plugins.cargolo_ops.document_activity_monitor.run_document_monitoring"
+    ) as mock_monitor, patch("plugins.cargolo_ops.document_activity_monitor.send_manual_ops_notification") as mock_notify:
+        result = run_document_activity_monitor(storage_root=tmp_path, baseline_now=True)
+
+    assert result["status"] == "baselined"
+    assert result["baselined_activity_id"] == 105
+    assert result["processed_count"] == 0
+    mock_monitor.assert_not_called()
+    mock_notify.assert_not_called()
+    state = json.loads((tmp_path / "runtime" / "document_activity_monitor_state.json").read_text(encoding="utf-8"))
+    assert state["last_seen_activity_id"] == 105
+    assert state["processed_activity_ids"] == []
+    assert state["baseline"]["policy"] == "old_backlog_deleted_start_from_current_activity_log"
+
+
+def test_document_activity_monitor_after_baseline_processes_only_newer_events(tmp_path):
+    (tmp_path / "runtime").mkdir(parents=True)
+    (tmp_path / "runtime" / "document_activity_monitor_state.json").write_text(
+        json.dumps({"last_seen_activity_id": 105, "processed_activity_ids": []}),
+        encoding="utf-8",
+    )
+
+    class FakeProvider:
+        def list_asr_activity_log(self, **kwargs):
+            return {
+                "status": "ok",
+                "items": [
+                    {"id": 104, "entity_type": "document", "action": "upload", "metadata": {"file_name": "old.pdf"}, "asr_request": {"request_number": "AN-OLD"}},
+                    {"id": 106, "entity_type": "document", "action": "upload", "metadata": {"file_name": "new.pdf"}, "asr_request": {"request_number": "AN-NEW"}},
+                ],
+            }
+
+    fake_report = {
+        "order_id": "AN-NEW",
+        "lifecycle": {},
+        "registry_summary": {},
+        "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+    }
+    with patch("plugins.cargolo_ops.document_activity_monitor.build_tms_provider_from_env", return_value=FakeProvider()), patch(
+        "plugins.cargolo_ops.document_activity_monitor.run_document_monitoring", return_value=fake_report
+    ) as mock_monitor, patch("plugins.cargolo_ops.document_activity_monitor.send_manual_ops_notification", return_value={"enabled": True, "delivered": 1}):
+        result = run_document_activity_monitor(storage_root=tmp_path, max_events=5)
+
+    assert result["processed_count"] == 1
+    assert result["processed"][0]["activity_id"] == 106
+    mock_monitor.assert_called_once()
+
+
+def test_document_activity_monitor_keeps_failed_event_retryable(tmp_path):
+    (tmp_path / "runtime").mkdir(parents=True)
+    (tmp_path / "runtime" / "document_activity_monitor_state.json").write_text(
+        json.dumps({"last_seen_activity_id": 8, "processed_activity_ids": []}),
+        encoding="utf-8",
+    )
+
+    class FakeProvider:
+        def list_asr_activity_log(self, **kwargs):
+            return {
+                "status": "ok",
+                "items": [
+                    {"id": 9, "entity_type": "document", "action": "upload", "metadata": {"file_name": "broken.pdf"}, "asr_request": {"request_number": "AN-FAIL"}},
+                    {"id": 10, "entity_type": "document", "action": "upload", "metadata": {"file_name": "ok.pdf"}, "asr_request": {"request_number": "AN-OK"}},
+                ],
+            }
+
+    def fake_monitor(order_id, **kwargs):
+        if order_id == "AN-FAIL":
+            raise RuntimeError("temporary processing failure")
+        return {"order_id": order_id, "lifecycle": {}, "registry_summary": {}, "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []}}
+
+    with patch("plugins.cargolo_ops.document_activity_monitor.build_tms_provider_from_env", return_value=FakeProvider()), patch(
+        "plugins.cargolo_ops.document_activity_monitor.run_document_monitoring", side_effect=fake_monitor
+    ), patch("plugins.cargolo_ops.document_activity_monitor.send_manual_ops_notification", return_value={"enabled": True, "delivered": 1}):
+        result = run_document_activity_monitor(storage_root=tmp_path, max_events=5)
+
+    assert result["status"] == "partial_error"
+    assert result["error_count"] == 1
+    state = json.loads((tmp_path / "runtime" / "document_activity_monitor_state.json").read_text(encoding="utf-8"))
+    assert state["last_seen_activity_id"] == 8
+    assert 10 in state["processed_activity_ids"]
+
+
 def test_document_activity_monitor_dry_run_does_not_update_cursor_or_notify(tmp_path):
     class FakeProvider:
         def list_asr_activity_log(self, **kwargs):
@@ -939,6 +1353,40 @@ def test_document_activity_monitor_dry_run_does_not_update_cursor_or_notify(tmp_
     assert not (tmp_path / "runtime" / "document_activity_monitor_state.json").exists()
     mock_monitor.assert_not_called()
     mock_notify.assert_not_called()
+
+
+def test_document_agent_review_script_accepts_valid_json_from_nonzero_hermes_exit(tmp_path):
+    fake_hermes = tmp_path / "fake_hermes"
+    argv_path = tmp_path / "argv.json"
+    fake_hermes.write_text(
+        "#!/usr/bin/env bash\n"
+        f"ARGV_PATH={str(argv_path)!r} {sys.executable} - \"$@\" <<'PY'\n"
+        "import json, os, sys\n"
+        "open(os.environ['ARGV_PATH'], 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n"
+        "print(json.dumps({\"sections\":{\"lage\":\"ok\",\"abgleich\":\"ok\",\"auffaellig\":\"ok\",\"empfehlung\":\"ok\",\"naechster_schritt\":\"ok\"},\"decision\":\"observe\",\"priority\":\"low\",\"needs_review\":False,\"confidence\":\"high\"}))\n"
+        "sys.exit(250)\n"
+        "PY\n",
+        encoding="utf-8",
+    )
+    fake_hermes.chmod(0o755)
+    packet = {"contract": "agent_first_document_review_v1", "order_id": "AN-TEST"}
+
+    completed = subprocess.run(
+        [sys.executable, "scripts/cargolo_document_agent_review.py"],
+        input=json.dumps(packet),
+        text=True,
+        capture_output=True,
+        cwd=Path(__file__).resolve().parents[2],
+        env={"HERMES_BIN": str(fake_hermes)},
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    argv = json.loads(argv_path.read_text(encoding="utf-8"))
+    assert "--toolsets" in argv
+    assert argv[argv.index("--toolsets") + 1] == "no_tools"
+    parsed = json.loads(completed.stdout)
+    assert parsed["decision"] == "observe"
 
 
 def test_document_activity_monitor_accepts_document_create_events(tmp_path):

@@ -1043,8 +1043,10 @@ class WebhookAdapter(BasePlatformAdapter):
         if thread_id:
             metadata = {"thread_id": thread_id}
 
+        route_name = str(delivery.get("route_name") or "")
+        cargolo_teams_routes = {"cargolo-asr-ops-teams", "cargolo-asr-documents-teams"}
         card_context = None
-        if platform_name == "teams" and str(delivery.get("route_name") or "") == "cargolo-asr-ops-teams":
+        if platform_name == "teams" and route_name in cargolo_teams_routes:
             try:
                 from plugins.cargolo_ops.teams_reply_loop import build_card_context
 
@@ -1054,9 +1056,10 @@ class WebhookAdapter(BasePlatformAdapter):
                     payload=delivery.get("payload") if isinstance(delivery.get("payload"), dict) else {},
                     chat_id=str(chat_id),
                 )
+                # Keep the Teams message human-facing: context is stored in
+                # teams_reply_loop sent-card index, not appended as visible ASRCTX debug text.
                 context_id = str(card_context.get("context_id") or "").strip()
-                if context_id and f"ASRCTX:{context_id}" not in content:
-                    content = f"{content}\n\nKontext: ASRCTX:{context_id}"
+                del context_id
             except Exception as exc:
                 logger.warning("[webhook] could not build CARGOLO Teams card context marker: %s", exc)
 
@@ -1069,7 +1072,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 record_sent_card(context=card_context)
             except Exception as exc:
                 logger.warning("[webhook] could not record CARGOLO Teams card context: %s", exc)
-        if result.success and platform_name == "teams" and str(delivery.get("route_name") or "") == "cargolo-asr-ops-teams":
+        if result.success and platform_name == "teams" and route_name in cargolo_teams_routes:
             try:
                 effective_payload = delivery.get("payload") if isinstance(delivery.get("payload"), dict) else {}
                 if isinstance(effective_payload.get("payload"), dict):

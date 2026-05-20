@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-ASR_MODES = {"air", "sea", "rail", "unknown"}
+ASR_MODES = {"air", "sea", "rail", "road", "unknown"}
 GOODS_DOCUMENT_TYPES = {"commercial_invoice", "packing_list", "customs_document", "bill_of_lading", "air_waybill", "proof_of_delivery"}
 BILLING_DOCUMENT_TYPES = {"billing", "supplier_invoice", "agent_invoice"}
 
@@ -34,6 +34,10 @@ def normalize_document_type(value: Any) -> str:
         "bl": "bill_of_lading",
         "b_l": "bill_of_lading",
         "bill_of_lading": "bill_of_lading",
+        "master_bl": "master_bill_of_lading",
+        "master_bill_of_lading": "master_bill_of_lading",
+        "house_bl": "house_bill_of_lading",
+        "house_bill_of_lading": "house_bill_of_lading",
         "pod": "proof_of_delivery",
         "proof_of_delivery": "proof_of_delivery",
         "customs": "customs_document",
@@ -60,10 +64,27 @@ def normalize_document_type(value: Any) -> str:
 
 def normalize_mode(value: Any) -> str:
     raw = str(value or "").strip().lower()
-    if raw in {"air", "airfreight", "air_freight"}:
+    normalized = raw.replace("-", "_").replace(" ", "_")
+    if normalized in {"air", "airfreight", "air_freight"}:
         return "air"
-    if raw in {"sea", "ocean", "oceanfreight", "sea_freight"}:
+    if normalized in {"sea", "ocean", "oceanfreight", "sea_freight"}:
         return "sea"
-    if raw in {"rail", "train"}:
+    if normalized in {"rail", "train"}:
         return "rail"
+    if normalized in {
+        "road",
+        "truck",
+        "trucking",
+        "land",
+        "landverkehr",
+        "landtransport",
+        "land_transport",
+        "roadfreight",
+        "road_freight",
+        "ltl",
+        "ftl",
+        "cargoline",
+        "osl",
+    }:
+        return "road"
     return "unknown"

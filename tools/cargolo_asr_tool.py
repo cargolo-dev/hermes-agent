@@ -273,7 +273,7 @@ TMS_AGENT_INTENT_SCHEMA = {
         "type": "object",
         "properties": {
             "order_id": {"type": "string", "description": "Shipment/order number like AN-11755 or BU-4664."},
-            "target": {"type": "string", "description": "customs_reference | hbl_number | mbl_number | hawb_number | container_number | pickup_date | estimated_delivery_date"},
+            "target": {"type": "string", "description": "customs_reference | hbl_number | mbl_number | hawb_number | container_number | pickup_date | estimated_delivery_date | actual_delivery_date | etd_main_carriage (review-only) | atd_main_carriage (review-only)"},
             "value": {"type": "string", "description": "Requested field value exactly as the operator intended."},
             "text": {"type": "string", "description": "Short reason / relevant operator message."},
             "context_id": {"type": "string", "description": "ASRCTX/context id from the card, if known."},

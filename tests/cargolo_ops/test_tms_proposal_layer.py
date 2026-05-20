@@ -161,3 +161,51 @@ def test_agentic_proposal_layer_queues_supported_pickup_date_but_no_write(tmp_pa
     row = _read_jsonl(tmp_path / "orders" / "AN-12218" / "teams" / "pending_tms_actions.jsonl")[0]
     assert row["source"] == "case_evidence_refresh"
     assert row["write_supported"] is True
+
+
+def test_agentic_proposal_layer_queues_eta_and_ata_write_supported_dates(tmp_path: Path) -> None:
+    from plugins.cargolo_ops.tms_proposal_layer import queue_agentic_tms_review_cards
+
+    _write_case(
+        tmp_path,
+        "AN-12218",
+        tms_snapshot={"detail": {"dates": {"estimated_delivery_date": "", "actual_delivery_date": ""}}},
+        analyzed_documents=[
+            {
+                "filename": "arrival-advice.pdf",
+                "doc_type": "shipment_advice",
+                "extracted_fields": {"shipment_number": "AN-12218", "eta": "2026-06-20", "ata": "21.06.2026"},
+            },
+        ],
+    )
+
+    cards = queue_agentic_tms_review_cards(root=tmp_path, order_id="AN-12218", max_cards=3)
+
+    assert [(card["target"], card["value"], card["write_supported"]) for card in cards] == [
+        ("estimated_delivery_date", "2026-06-20", True),
+        ("actual_delivery_date", "2026-06-21", True),
+    ]
+
+
+def test_agentic_proposal_layer_surfaces_etd_and_atd_as_review_only_until_write_target_exists(tmp_path: Path) -> None:
+    from plugins.cargolo_ops.tms_proposal_layer import queue_agentic_tms_review_cards
+
+    _write_case(
+        tmp_path,
+        "AN-12218",
+        tms_snapshot={"detail": {"milestones": {"etd_main_carriage": "", "atd_main_carriage": ""}}},
+        analyzed_documents=[
+            {
+                "filename": "departure-advice.pdf",
+                "doc_type": "shipment_advice",
+                "extracted_fields": {"shipment_number": "AN-12218", "etd": "2026-06-18", "atd": "19.06.2026"},
+            },
+        ],
+    )
+
+    cards = queue_agentic_tms_review_cards(root=tmp_path, order_id="AN-12218", max_cards=3)
+
+    assert [(card["target"], card["value"], card["write_supported"]) for card in cards] == [
+        ("etd_main_carriage", "2026-06-18", False),
+        ("atd_main_carriage", "2026-06-19", False),
+    ]

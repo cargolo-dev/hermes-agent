@@ -15,11 +15,14 @@ from typing import Any
 import requests
 
 from hermes_constants import get_hermes_home
+from .document_schema import normalize_document_type
+from .document_profiles import get_document_profile
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ROUTE_NAME = "cargolo-asr-ingest"
 _DEFAULT_NATIVE_TEAMS_ROUTE_NAME = "cargolo-asr-ops-teams"
+_DEFAULT_DOCUMENT_TEAMS_ROUTE_NAME = "cargolo-asr-documents-teams"
 _DEFAULT_GATEWAY_WEBHOOK_BASE = "http://127.0.0.1:8644"
 
 
@@ -67,7 +70,18 @@ def _load_gateway_route_config(route_name: str) -> dict[str, Any]:
     return route if isinstance(route, dict) else {}
 
 
-def _load_native_teams_targets() -> list[dict[str, Any]]:
+def _native_teams_route_name_for_run_type(run_type: str = "") -> str:
+    """Pick the native Teams route for a CARGOLO ops notification type."""
+    if str(run_type or "").strip() == "document_activity_monitor":
+        document_route = str(
+            os.getenv("HERMES_CARGOLO_ASR_DOCUMENTS_TEAMS_ROUTE", _DEFAULT_DOCUMENT_TEAMS_ROUTE_NAME)
+        ).strip()
+        if document_route and _load_gateway_route_config(document_route):
+            return document_route
+    return str(os.getenv("HERMES_CARGOLO_ASR_OPS_TEAMS_ROUTE", _DEFAULT_NATIVE_TEAMS_ROUTE_NAME)).strip()
+
+
+def _load_native_teams_targets(*, run_type: str = "") -> list[dict[str, Any]]:
     """Return the internal gateway deliver_only route used for native Teams.
 
     CARGOLO ops notifications no longer post to n8n by default. Instead they
@@ -75,7 +89,7 @@ def _load_native_teams_targets() -> list[dict[str, Any]]:
     is ``teams``; the running gateway then sends via the native Teams adapter
     and its configured Teams home channel.
     """
-    route_name = str(os.getenv("HERMES_CARGOLO_ASR_OPS_TEAMS_ROUTE", _DEFAULT_NATIVE_TEAMS_ROUTE_NAME)).strip()
+    route_name = _native_teams_route_name_for_run_type(run_type)
     route = _load_gateway_route_config(route_name)
     if not route:
         return []
@@ -92,6 +106,7 @@ def _load_native_teams_targets() -> list[dict[str, Any]]:
             "secret": secret,
             "source": f"native_teams_route:{route_name}",
             "kind": "native_teams_gateway",
+            "route_name": route_name,
         }
     ]
 
@@ -117,12 +132,12 @@ def _load_webhook_targets(*, route_name: str, allow_route_fallback: bool) -> lis
     return []
 
 
-def _load_targets(*, route_name: str, allow_route_fallback: bool) -> list[dict[str, Any]]:
+def _load_targets(*, route_name: str, allow_route_fallback: bool, run_type: str = "") -> list[dict[str, Any]]:
     delivery_mode = str(os.getenv("HERMES_CARGOLO_ASR_OPS_DELIVERY", "native_teams")).strip().lower()
     if delivery_mode in {"", "native", "native_teams", "teams"}:
-        return _load_native_teams_targets()
+        return _load_native_teams_targets(run_type=run_type)
     if delivery_mode in {"both", "native_teams_and_webhook", "teams_and_webhook"}:
-        return _load_native_teams_targets() + _load_webhook_targets(
+        return _load_native_teams_targets(run_type=run_type) + _load_webhook_targets(
             route_name=route_name,
             allow_route_fallback=allow_route_fallback,
         )
@@ -211,6 +226,18 @@ def _first_present(*values: Any, empty: str = "-") -> str:
     return empty
 
 
+def _sanitize_teams_document_text(value: Any) -> str:
+    """Remove file/debug noise from human-facing Teams document text."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"Kontext:\s*ASRCTX:[^\n<]+", "", text)
+    text = re.sub(r"ASRCTX:[A-Za-z0-9:_.-]+", "", text)
+    text = re.sub(r"'[^']+\.(?:pdf|msg|eml|docx?|xlsx?|png|jpe?g)'", "den Beleg", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b[\wÄÖÜäöüß ().,_-]+\.(?:pdf|msg|eml|docx?|xlsx?|png|jpe?g)\b", "Beleg", text, flags=re.IGNORECASE)
+    return " ".join(text.split())
+
+
 def _load_json_file(path_value: Any) -> dict[str, Any]:
     path = str(path_value or "").strip()
     if not path:
@@ -227,7 +254,7 @@ def _load_json_file(path_value: Any) -> dict[str, Any]:
 
 
 def _doc_type_label(value: Any) -> str:
-    raw = str(value or "unknown").strip().lower()
+    raw = normalize_document_type(value)
     return {
         "commercial_invoice": "Handelsrechnung",
         "packing_list": "Packliste",
@@ -242,8 +269,27 @@ def _doc_type_label(value: Any) -> str:
         "customs_document": "Zolldokument",
         "billing": "Abrechnungsbeleg",
         "offer": "Angebot",
+        "telex_release": "Telex Release",
+        "transport_order": "Transportauftrag",
         "unknown": "unbekannt",
     }.get(raw, raw.replace("_", " ") or "unbekannt")
+
+
+def _effective_analysis_doc_type(analysis: dict[str, Any], uploaded_doc: dict[str, Any], event_doc_type: Any = None) -> str:
+    fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    strong_offer_signals = [fields.get("document_type"), uploaded_doc.get("filename"), analysis.get("filename")]
+    if any(normalize_document_type(value) == "offer" for value in strong_offer_signals):
+        return "offer"
+    candidates: list[Any] = [analysis.get("doc_type"), uploaded_doc.get("analysis_doc_type"), uploaded_doc.get("doc_type")]
+    suggested = analysis.get("suggested_registry_types")
+    if isinstance(suggested, list):
+        candidates.extend(suggested)
+    candidates.extend([fields.get("document_type"), uploaded_doc.get("filename"), analysis.get("filename"), event_doc_type])
+    for candidate in candidates:
+        normalized = normalize_document_type(candidate)
+        if normalized and normalized != "unknown" and get_document_profile(normalized).document_type != "internal_misc":
+            return normalized
+    return normalize_document_type(event_doc_type)
 
 
 def _format_route_from_context(context: dict[str, Any]) -> str:
@@ -306,12 +352,10 @@ def _finding_summary_de(finding: dict[str, Any]) -> str:
 
 def _finding_text(finding: Any) -> str:
     if isinstance(finding, dict):
-        filename = str(finding.get("filename") or "").strip()
         summary = _finding_summary_de(finding)
         severity = str(finding.get("severity") or "").strip()
-        prefix = f"{filename}: " if filename else ""
         suffix = f" ({severity})" if severity else ""
-        return f"{prefix}{summary}{suffix}"
+        return f"{summary}{suffix}"
     return str(finding or "").strip()
 
 
@@ -441,7 +485,8 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
     and only adds minimal visual grouping around it.
     """
     model = _build_document_activity_model(payload, report)
-    result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}
+    raw_result = payload.get("processor_result")
+    result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
     hermes_message = str(result.get("message") or result.get("analysis_summary") or "").strip()
     if not hermes_message:
         findings = model.get("findings") if isinstance(model.get("findings"), list) else []
@@ -452,19 +497,35 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
             "Nächster Schritt: Führenden Wert festlegen; bei TMS-Korrektur anschließend bewusst freigeben." if findings else "Nächster Schritt: Nur weiter beobachten, bis ein fachlicher Trigger entsteht.",
         ])
 
-    lage = _section_from_hermes_message(hermes_message, "Lage") or hermes_message
-    auffaellig = _section_from_hermes_message(hermes_message, "Auffällig")
-    abgleich = _section_from_hermes_message(hermes_message, "Abgleich")
-    empfehlung = _section_from_hermes_message(hermes_message, "Empfehlung")
-    naechster = _section_from_hermes_message(hermes_message, "Nächster Schritt")
+    raw_sections = result.get("document_message_sections")
+    sections: dict[str, Any] = raw_sections if isinstance(raw_sections, dict) else {}
+    lage = _sanitize_teams_document_text(sections.get("lage") or _section_from_hermes_message(hermes_message, "Lage") or hermes_message)
+    auffaellig = _sanitize_teams_document_text(sections.get("auffaellig") or _section_from_hermes_message(hermes_message, "Auffällig") or "")
+    abgleich = _sanitize_teams_document_text(sections.get("abgleich") or _section_from_hermes_message(hermes_message, "Abgleich") or "")
+    empfehlung = _sanitize_teams_document_text(sections.get("empfehlung") or _section_from_hermes_message(hermes_message, "Empfehlung") or "")
+    naechster = _sanitize_teams_document_text(sections.get("naechster_schritt") or _section_from_hermes_message(hermes_message, "Nächster Schritt") or "")
+    raw_review_intents = result.get("document_review_intents")
+    review_intents: list[Any] = raw_review_intents if isinstance(raw_review_intents, list) else []
+    if review_intents:
+        card_count = len(result.get("teams_tms_review_cards") if isinstance(result.get("teams_tms_review_cards"), list) else [])
+        naechster = (
+            f"Bitte die separate TMS-Freigabe-Kachel bestätigen oder ablehnen ({card_count} offen). Vorher wurde nichts im TMS geändert."
+            if card_count else
+            "Hermes/Operator prüft die vorgeschlagenen TMS-Feldwerte; es wurde nichts automatisch geändert."
+        )
 
     risk = str(model.get("risk") or "low").strip().lower() or "low"
     has_issue = bool(auffaellig and "keine fachlichen" not in auffaellig.lower())
     tone = "danger" if risk in {"high", "critical"} else "warn" if has_issue else "good"
     border = {"danger": "#f87171", "warn": "#fbbf24", "good": "#34d399"}.get(tone, "#60a5fa")
     doc_type = _doc_type_label(model.get("analysis_doc_type") or model.get("event_doc_type"))
-    uploaded = _truncate(str(model.get("filename") or "Dokument"), 58)
     order_id = str(model.get("order_id") or "-")
+    review_card_count = len(result.get("teams_tms_review_cards") if isinstance(result.get("teams_tms_review_cards"), list) else [])
+    subline_bits = [order_id, doc_type]
+    if review_card_count:
+        subline_bits.append(f"{review_card_count} TMS-Freigabe{'n' if review_card_count != 1 else ''} wartet")
+    else:
+        subline_bits.append("TMS unverändert")
 
     issue_items = [item.strip() for item in re.split(r"\s+\|\s+", auffaellig or "") if item.strip()]
     if not issue_items and auffaellig:
@@ -474,7 +535,7 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
         f"<div style='border:1px solid #475569;border-left:6px solid {border};border-radius:14px;"
         "padding:14px 16px;background:#111827;color:#f8fafc;font-family:Segoe UI,Arial,sans-serif;line-height:1.35;'>",
         f"<div style='font-size:18px;font-weight:800;margin-bottom:4px;color:#ffffff;'>Hermes · Dokument geprüft</div>",
-        f"<div style='font-size:13px;margin-bottom:10px;color:#cbd5e1;'>{_html_escape(order_id)} · <b>{_html_escape(uploaded)}</b> · {_html_escape(doc_type)}</div>",
+        f"<div style='font-size:13px;margin-bottom:10px;color:#cbd5e1;'>{_html_escape(' · '.join(subline_bits))}</div>",
         _html_hermes_section("Lage", _html_escape(_truncate_sentence(lage, 260)), tone="neutral"),
     ]
     if abgleich:
@@ -491,7 +552,8 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
     return "".join(html_parts)
 
 def _build_document_activity_model(payload: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
-    result = payload.get("processor_result") if isinstance(payload.get("processor_result"), dict) else {}
+    raw_result = payload.get("processor_result")
+    result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
     event = payload.get("activity_event") if isinstance(payload.get("activity_event"), dict) else {}
     trigger = report.get("trigger_event") if isinstance(report.get("trigger_event"), dict) else {}
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else trigger.get("metadata") if isinstance(trigger.get("metadata"), dict) else {}
@@ -504,6 +566,11 @@ def _build_document_activity_model(payload: dict[str, Any], report: dict[str, An
     filename = _first_present(metadata.get("file_name"), metadata.get("filename"), result.get("document_activity_file_name"), result.get("latest_subject"), empty="Dokument")
     uploaded_doc = _select_uploaded_document(registry, filename)
     analysis = _load_document_analysis(uploaded_doc.get("analysis_path"))
+    result_doc_type = result.get("document_activity_document_type")
+    event_doc_type = _first_present(metadata.get("document_type"), result_doc_type, empty="unbekannt")
+    analysis_doc_type = _effective_analysis_doc_type(analysis, uploaded_doc, event_doc_type)
+    if normalize_document_type(event_doc_type) in {"email", "unknown"} and normalize_document_type(result_doc_type) not in {"email", "unknown"}:
+        event_doc_type = str(result_doc_type)
     fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
     findings = reconciliation.get("findings") if isinstance(reconciliation.get("findings"), list) else []
     unreadable = list(analysis.get("missing_or_unreadable") or uploaded_doc.get("missing_or_unreadable") or [])
@@ -529,8 +596,8 @@ def _build_document_activity_model(payload: dict[str, Any], report: dict[str, An
         "status": result.get("status") or report.get("tms_status") or "document_uploaded_checked",
         "priority": result.get("analysis_priority") or ("medium" if tone == "warn" else "high" if tone == "danger" else "low"),
         "filename": filename,
-        "event_doc_type": _first_present(metadata.get("document_type"), result.get("document_activity_document_type"), empty="unbekannt"),
-        "analysis_doc_type": analysis.get("doc_type") or uploaded_doc.get("doc_type") or uploaded_doc.get("analysis_doc_type"),
+        "event_doc_type": event_doc_type,
+        "analysis_doc_type": analysis_doc_type,
         "confidence": analysis.get("confidence") or uploaded_doc.get("confidence") or uploaded_doc.get("analysis_confidence"),
         "summary": analysis.get("summary") or uploaded_doc.get("summary") or uploaded_doc.get("analysis_summary"),
         "fields": fields,
@@ -548,7 +615,10 @@ def _build_document_activity_model(payload: dict[str, Any], report: dict[str, An
         "operational_flags": operational_flags,
         "consistency_notes": consistency_notes,
         "tms_matches": uploaded_doc.get("tms_matches") or analysis.get("tms_matches") or [],
-        "result_label": result_label,
+        "document_review_intents": result.get("document_review_intents") if isinstance(result.get("document_review_intents"), list) else [],
+        "agent_review_required": bool(result.get("agent_review_required")),
+        "side_effects": result.get("side_effects") if isinstance(result.get("side_effects"), dict) else {},
+        "result_label": result.get("document_decision") or result_label,
         "next_step": _truncate_sentence(next_step, 180),
         "tone": tone,
         "report_path": result.get("document_monitoring_report_path") or report.get("report_json_path"),
@@ -1087,7 +1157,7 @@ def send_manual_ops_notification(
     route_name: str = _DEFAULT_ROUTE_NAME,
     allow_route_fallback: bool = False,
 ) -> dict[str, Any]:
-    targets = _load_targets(route_name=route_name, allow_route_fallback=allow_route_fallback)
+    targets = _load_targets(route_name=route_name, allow_route_fallback=allow_route_fallback, run_type=run_type)
     if not targets:
         return {
             "enabled": False,
@@ -1099,7 +1169,10 @@ def send_manual_ops_notification(
 
     timeout_raw = str(os.getenv("HERMES_CARGOLO_ASR_OPS_WEBHOOK_TIMEOUT", "30")).strip()
     timeout = int(timeout_raw) if timeout_raw.isdigit() else 30
-    body = build_manual_ops_notification_body(run_type=run_type, payload=payload, route_name=route_name)
+    body_route_name = route_name
+    if targets and str(targets[0].get("kind") or "") == "native_teams_gateway":
+        body_route_name = str(targets[0].get("route_name") or body_route_name)
+    body = build_manual_ops_notification_body(run_type=run_type, payload=payload, route_name=body_route_name)
 
     delivered = 0
     errors: list[str] = []

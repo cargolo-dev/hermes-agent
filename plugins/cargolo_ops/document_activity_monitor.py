@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shlex
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .document_monitoring import run_document_monitoring
-from .document_profiles import is_trusted_source_for_field
+from .document_profiles import get_document_profile, is_trusted_source_for_field
 from .document_schema import normalize_document_type
 from .models import utc_now_iso
 from .ops_notifications import send_manual_ops_notification
@@ -93,7 +96,9 @@ def _doc_type_label(value: Any) -> str:
         "air_waybill": "AWB/HAWB",
         "bill_of_lading": "B/L",
         "master_bl": "Master B/L",
+        "master_bill_of_lading": "Master B/L",
         "house_bl": "House B/L",
+        "house_bill_of_lading": "House B/L",
         "hbl": "House B/L",
         "mbl": "Master B/L",
         "proof_of_delivery": "POD",
@@ -101,6 +106,8 @@ def _doc_type_label(value: Any) -> str:
         "customs_document": "Zolldokument",
         "billing": "Abrechnungsbeleg",
         "offer": "Angebot",
+        "telex_release": "Telex Release",
+        "transport_order": "Transportauftrag",
         "unknown": "Dokument",
         "unbekannt": "Dokument",
     }.get(raw, raw.replace("_", " ") or "Dokument")
@@ -160,7 +167,50 @@ def _select_uploaded_analysis(report: dict[str, Any], filename: str) -> dict[str
         if isinstance(row, dict) and str(row.get("filename") or "").strip().lower() == uploaded_norm:
             analysis = _load_json(row.get("analysis_path"))
             return {**row, "analysis": analysis}
+    analyzed = [row for row in registry.get("analyzed_documents") or [] if isinstance(row, dict)]
+    if len(analyzed) == 1:
+        row = analyzed[0]
+        analysis = _load_json(row.get("analysis_path"))
+        return {**row, "analysis": analysis}
     return {}
+
+
+def _infer_uploaded_filename(report: dict[str, Any], event: dict[str, Any]) -> str:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    explicit = metadata.get("file_name") or metadata.get("filename") or event.get("field_name")
+    if _clean(explicit):
+        return str(explicit)
+    lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
+    registry = _load_json(lifecycle.get("document_registry_path"))
+    invoice_number = _norm(metadata.get("invoice_number"))
+    subject = _norm(metadata.get("email_subject"))
+    analyzed = [row for row in registry.get("analyzed_documents") or [] if isinstance(row, dict)]
+    for row in analyzed:
+        filename = str(row.get("filename") or "")
+        if invoice_number and invoice_number in _norm(filename):
+            return filename
+        analysis = _load_json(row.get("analysis_path"))
+        fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+        if invoice_number and invoice_number in {_norm(fields.get("invoice_number")), _norm(fields.get("document_number"))}:
+            return filename
+        field_refs = {
+            _norm(fields.get("shipment_number")),
+            _norm(fields.get("tms_reference")),
+            _norm(fields.get("document_number")),
+            _norm(fields.get("customer_reference")),
+        }
+        if subject and any(ref and ref in subject for ref in field_refs):
+            return filename
+        if subject and filename and _norm(filename) in subject:
+            return filename
+    if len(analyzed) == 1 and str(analyzed[0].get("filename") or "").strip():
+        return str(analyzed[0].get("filename") or "")
+    received = [row for row in registry.get("received_documents") or [] if isinstance(row, dict)]
+    for row in received:
+        filename = str(row.get("filename") or "")
+        if invoice_number and invoice_number in _norm(filename):
+            return filename
+    return "Dokument"
 
 
 def _clean(value: Any) -> str:
@@ -177,6 +227,29 @@ def _date_from_ms(value: Any) -> str:
     if number <= 0:
         return ""
     return datetime.fromtimestamp(number / 1000, tz=timezone.utc).date().isoformat()
+
+
+def _normalize_date_value(value: Any) -> str:
+    text = _clean(value)
+    if not text:
+        return ""
+    match = re.search(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", text)
+    if match:
+        normalized = f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+        try:
+            datetime.strptime(normalized, "%Y-%m-%d")
+        except ValueError:
+            return ""
+        return normalized
+    match = re.search(r"\b(\d{1,2})[./-](\d{1,2})[./-](20\d{2})\b", text)
+    if match:
+        normalized = f"{match.group(3)}-{int(match.group(2)):02d}-{int(match.group(1)):02d}"
+        try:
+            datetime.strptime(normalized, "%Y-%m-%d")
+        except ValueError:
+            return ""
+        return normalized
+    return ""
 
 
 def _display_timestamp(value: Any) -> str:
@@ -304,8 +377,17 @@ def _effective_trusted_doc_type(event_doc_type: Any, uploaded: dict[str, Any], t
         analysis.get("doc_type"),
         uploaded.get("analysis_doc_type"),
         uploaded.get("doc_type"),
-        event_doc_type,
     ]
+    suggested = analysis.get("suggested_registry_types")
+    if isinstance(suggested, list):
+        candidates.extend(suggested)
+    fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    candidates.extend([
+        fields.get("document_type"),
+        uploaded.get("filename"),
+        analysis.get("filename"),
+        event_doc_type,
+    ])
     legacy_bl_seen = False
     fallback_normalized = ""
     for candidate in candidates:
@@ -314,13 +396,12 @@ def _effective_trusted_doc_type(event_doc_type: Any, uploaded: dict[str, Any], t
             legacy_bl_seen = True
             fallback_normalized = normalized
             continue
-        if normalized and normalized != "unknown":
+        if normalized and normalized != "unknown" and get_document_profile(normalized).document_type != "internal_misc":
             return normalized
         if normalized and not fallback_normalized:
             fallback_normalized = normalized
 
     if legacy_bl_seen:
-        fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
         has_bl_evidence = bool(
             _select_explicit_mbl_candidate(fields)
             or _clean(fields.get("hbl_number") or fields.get("house_bl_number"))
@@ -370,10 +451,100 @@ def _contains_reference(haystack: dict[str, Any], value: Any) -> bool:
     return needle in _norm(blob)
 
 
+def _uploaded_analysis_doc_type(event_doc_type: Any, uploaded: dict[str, Any]) -> str:
+    analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+    fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    strong_offer_signals = [
+        fields.get("document_type"),
+        uploaded.get("filename"),
+        analysis.get("filename"),
+    ]
+    if any(normalize_document_type(value) == "offer" for value in strong_offer_signals):
+        return "offer"
+    candidates: list[Any] = [
+        analysis.get("doc_type"),
+        uploaded.get("analysis_doc_type"),
+        uploaded.get("doc_type"),
+    ]
+    suggested = analysis.get("suggested_registry_types")
+    if isinstance(suggested, list):
+        candidates.extend(suggested)
+    candidates.extend([
+        fields.get("document_type"),
+        uploaded.get("filename"),
+        analysis.get("filename"),
+        event_doc_type,
+    ])
+    for candidate in candidates:
+        normalized = normalize_document_type(candidate)
+        if normalized and normalized != "unknown" and get_document_profile(normalized).document_type != "internal_misc":
+            return normalized
+    return normalize_document_type(event_doc_type)
+
+
+def _relevant_fields_for_uploaded_document(event_doc_type: Any, uploaded: dict[str, Any]) -> set[str]:
+    doc_type = _uploaded_analysis_doc_type(event_doc_type, uploaded)
+    profile = get_document_profile(doc_type)
+    return {str(field) for field in profile.relevant_fields}
+
+
+def _build_document_evidence_lines(report: dict[str, Any], filename: str, limit: int = 6) -> list[str]:
+    uploaded = _select_uploaded_analysis(report, filename)
+    analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+    fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    if not fields:
+        return []
+    metadata = (report.get("trigger_event") or {}).get("metadata") if isinstance(report.get("trigger_event"), dict) else {}
+    event_doc_type = metadata.get("document_type") if isinstance(metadata, dict) else None
+    relevant = _relevant_fields_for_uploaded_document(event_doc_type, uploaded)
+    doc_type = _uploaded_analysis_doc_type(event_doc_type, uploaded)
+    preferred = (
+        ("document_number", "amount", "currency", "customer", "incoterm_named_place", "shipment_number", "pieces", "goods_description", "gross_weight", "volume")
+        if doc_type == "offer"
+        else ("invoice_number", "document_number", "amount", "currency", "mrn", "container_number", "shipment_number", "customer_reference", "etd", "eta", "atd", "ata", "gross_weight", "volume")
+    )
+    labels = {
+        "invoice_number": "Rechnungsnr.",
+        "document_number": "Dokumentnr.",
+        "amount": "Betrag",
+        "currency": "Währung",
+        "mrn": "MRN",
+        "container_number": "Container",
+        "shipment_number": "Sendung",
+        "customer_reference": "Kundenref.",
+        "etd": "ETD",
+        "eta": "ETA",
+        "atd": "ATD",
+        "ata": "ATA",
+        "gross_weight": "Gewicht",
+        "volume": "Volumen",
+        "customer": "Kunde",
+        "incoterm_named_place": "Incoterm",
+        "pieces": "Packstücke",
+        "goods_description": "Ware",
+    }
+    lines: list[str] = []
+    for key in preferred:
+        value = _clean(fields.get(key))
+        if not value or key not in relevant:
+            continue
+        if key == "currency" and _clean(fields.get("amount")):
+            continue
+        if key == "amount" and _clean(fields.get("currency")):
+            value = f"{value} {fields.get('currency')}"
+        lines.append(f"{labels.get(key, key)} {value}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
 def _build_document_field_comparison(report: dict[str, Any], filename: str) -> list[dict[str, str]]:
     uploaded = _select_uploaded_analysis(report, filename)
     analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
     fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    metadata = (report.get("trigger_event") or {}).get("metadata") if isinstance(report.get("trigger_event"), dict) else {}
+    event_doc_type = metadata.get("document_type") if isinstance(metadata, dict) else None
+    relevant_fields = _relevant_fields_for_uploaded_document(event_doc_type, uploaded)
     detail = report.get("tms_snapshot", {}).get("detail") if isinstance(report.get("tms_snapshot"), dict) else {}
     if not detail:
         lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
@@ -388,12 +559,16 @@ def _build_document_field_comparison(report: dict[str, Any], filename: str) -> l
 
     refs = analysis.get("references") if isinstance(analysis.get("references"), list) else []
     mbl_doc = _select_explicit_mbl_candidate(fields)
-    container_doc = next((str(ref).strip() for ref in refs if _is_valid_container_candidate(ref)), "")
+    container_doc = _clean(fields.get("container_number"))
+    if not container_doc:
+        container_doc = next((str(ref).strip() for ref in refs if _is_valid_container_candidate(ref)), "")
     vessel_doc = "EVER GREET" if _contains_reference(analysis, "EVER GREET") else ""
 
     comparisons: list[dict[str, str]] = []
 
-    def add(label: str, tms: Any, doc: Any, *, match: bool | None = None, target: str = "") -> None:
+    def add(label: str, tms: Any, doc: Any, *, match: bool | None = None, target: str = "", field: str = "") -> None:
+        if field and field not in relevant_fields:
+            return
         tms_s = _clean(tms)
         doc_s = _clean(doc)
         if not tms_s and not doc_s:
@@ -418,17 +593,19 @@ def _build_document_field_comparison(report: dict[str, Any], filename: str) -> l
                 status = "diff"
         comparisons.append({"label": label, "tms": tms_s or "nicht gepflegt", "doc": doc_s or "nicht lesbar", "status": status, "target": target})
 
-    add("POL", freight.get("pol_code") or main_leg.get("origin"), fields.get("pol"), match=_same_location(freight.get("pol_code") or main_leg.get("origin"), fields.get("pol")))
-    add("POD", freight.get("pod_code") or main_leg.get("destination"), fields.get("pod"), match=_same_location(freight.get("pod_code") or main_leg.get("destination"), fields.get("pod")))
-    add("ETD", _date_from_ms(main_leg.get("etd")) or _date_from_ms((detail.get("milestones") or {}).get("etd_main_carriage")), fields.get("etd"), target="Hauptlauf-ETD")
-    add("ETA", dates.get("estimated_delivery_date") or _date_from_ms((detail.get("milestones") or {}).get("eta_main_carriage")), fields.get("eta"), target="ETA")
-    add("MBL / B/L-Nr.", freight.get("mbl_number") or freight.get("bl_number"), mbl_doc, target="mbl_number")
-    add("Container", freight.get("container_number"), container_doc, target="container_number")
+    add("POL", freight.get("pol_code") or main_leg.get("origin"), fields.get("pol"), match=_same_location(freight.get("pol_code") or main_leg.get("origin"), fields.get("pol")), field="pol")
+    add("POD", freight.get("pod_code") or main_leg.get("destination"), fields.get("pod"), match=_same_location(freight.get("pod_code") or main_leg.get("destination"), fields.get("pod")), field="pod")
+    add("ETD", _date_from_ms(main_leg.get("etd")) or _date_from_ms((detail.get("milestones") or {}).get("etd_main_carriage")), fields.get("etd"), target="etd_main_carriage", field="etd")
+    add("ETA", dates.get("estimated_delivery_date") or _date_from_ms((detail.get("milestones") or {}).get("eta_main_carriage")), fields.get("eta"), target="estimated_delivery_date", field="eta")
+    add("ATD", _date_from_ms(main_leg.get("atd")) or _date_from_ms((detail.get("milestones") or {}).get("atd_main_carriage")), fields.get("atd"), target="atd_main_carriage", field="atd")
+    add("ATA", dates.get("actual_delivery_date") or _date_from_ms((detail.get("milestones") or {}).get("ata_main_carriage")), fields.get("ata"), target="actual_delivery_date", field="ata")
+    add("MBL / B/L-Nr.", freight.get("mbl_number") or freight.get("bl_number"), mbl_doc, target="mbl_number", field="mbl_number")
+    add("Container", freight.get("container_number"), container_doc, target="container_number", field="container_number")
     if vessel_doc or main_leg.get("carrier") or main_leg.get("vessel_name"):
-        add("Schiff", main_leg.get("vessel_name") or main_leg.get("carrier"), vessel_doc, target="Vessel/Hauptlauf")
+        add("Schiff", main_leg.get("vessel_name") or main_leg.get("carrier"), vessel_doc, target="Vessel/Hauptlauf", field="vessel")
     weight_doc = _clean(fields.get("weight_kg") or fields.get("total_weight_kg") or fields.get("gross_weight_kg"))
     if weight_doc:
-        add("Gewicht", totals.get("total_weight_kg"), weight_doc, target="Gewicht")
+        add("Gewicht", totals.get("total_weight_kg"), weight_doc, target="Gewicht", field="gross_weight")
     return comparisons
 
 
@@ -456,6 +633,185 @@ def _comparison_lines(comparisons: list[dict[str, str]], statuses: set[str], lim
     return lines
 
 
+def _priority_rank(value: Any) -> int:
+    return {"low": 0, "medium": 1, "high": 2, "critical": 3}.get(str(value or "low").strip().lower(), 0)
+
+
+def _priority_max(*values: Any) -> str:
+    labels = ["low", "medium", "high", "critical"]
+    rank = max((_priority_rank(value) for value in values), default=0)
+    return labels[min(rank, len(labels) - 1)]
+
+
+def _build_document_agent_evidence_packet(
+    *,
+    report: dict[str, Any],
+    event: dict[str, Any],
+    filename: str,
+    doc_type: Any,
+    context: dict[str, Any],
+    findings: list[Any],
+    needs_review: bool,
+    priority: str,
+    comparisons: list[dict[str, str]],
+    evidence_lines: list[str],
+    document_review_intents: list[dict[str, Any]],
+) -> dict[str, Any]:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
+    uploaded = _select_uploaded_analysis(report, filename)
+    analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+    effective_doc_type = _uploaded_analysis_doc_type(doc_type, uploaded)
+    profile = get_document_profile(effective_doc_type)
+    return {
+        "contract": "agent_first_document_review_v1",
+        "language": "de",
+        "operator_surface": "microsoft_teams_internal_cargolo",
+        "task": "Bewerte den neuen TMS-Dokument-Upload wie ein interner ASR-Mitarbeiter. Nutze nur diese Evidenz; rate nicht. Keine TMS-Änderung und keine Kundenkommunikation auslösen.",
+        "order_id": report.get("order_id"),
+        "document": {
+            "filename": filename,
+            "event_document_type": metadata.get("document_type"),
+            "effective_document_type": effective_doc_type,
+            "label": _doc_type_label(effective_doc_type),
+            "profile_relevant_fields": sorted(str(field) for field in profile.relevant_fields),
+            "extracted_fields": analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {},
+            "field_sources": analysis.get("field_sources") if isinstance(analysis.get("field_sources"), dict) else {},
+            "summary": analysis.get("summary"),
+        },
+        "upload": {
+            "activity_id": _activity_id(event),
+            "changed_at": event.get("changed_at"),
+            "changed_by": event.get("changed_by_name") or event.get("changed_by"),
+            "metadata": metadata,
+        },
+        "shipment_context": context,
+        "lifecycle": {
+            "tms_snapshot_path": lifecycle.get("tms_snapshot_path"),
+            "document_registry_path": lifecycle.get("document_registry_path"),
+            "history_sync_count": lifecycle.get("history_sync_count", 0),
+            "history_sync_error": lifecycle.get("history_sync_error"),
+            "last_email_at": lifecycle.get("last_email_at"),
+        },
+        "deterministic_evidence": {
+            "priority_floor": priority,
+            "needs_review_floor": needs_review,
+            "field_comparisons": comparisons,
+            "readable_evidence_lines": evidence_lines,
+            "findings": findings,
+            "safe_tms_review_intents": document_review_intents,
+        },
+        "guardrails": {
+            "writes_allowed": False,
+            "customer_messages_allowed": False,
+            "safe_writeback_targets": ["mbl_number", "hbl_number", "hawb_number", "container_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date"],
+            "review_only_targets": ["etd_main_carriage", "atd_main_carriage"],
+            "agent_may_raise_priority": True,
+            "agent_may_not_hide_safe_review_intents": True,
+            "agent_may_not_downgrade_blockers": True,
+        },
+        "expected_agent_json": {
+            "sections": {"lage": "...", "abgleich": "...", "auffaellig": "...", "empfehlung": "...", "naechster_schritt": "..."},
+            "decision": "no_action|observe|manual_review|queue_review_card",
+            "priority": "low|medium|high|critical",
+            "needs_review": "boolean",
+            "confidence": "low|medium|high",
+        },
+    }
+
+
+def _sanitize_agent_section(value: Any, fallback: str = "-") -> str:
+    text = " ".join(str(value or "").replace("\r", " ").split())
+    if not text:
+        return fallback
+    blocked = ("ASRCTX", "report_json_path", "document_registry_path", "tms_snapshot_path", "/root/.hermes")
+    for token in blocked:
+        text = text.replace(token, "")
+    return text[:420].strip() or fallback
+
+
+def _parse_document_agent_review(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    sections = raw.get("sections") if isinstance(raw.get("sections"), dict) else raw
+    required = ("lage", "abgleich", "auffaellig", "empfehlung", "naechster_schritt")
+    if not all(_clean(sections.get(key)) for key in required):
+        return None
+    priority = str(raw.get("priority") or "").strip().lower()
+    if priority not in {"low", "medium", "high", "critical"}:
+        priority = "medium"
+    decision = str(raw.get("decision") or "manual_review").strip().lower()
+    if decision not in {"no_action", "observe", "manual_review", "queue_review_card"}:
+        decision = "manual_review"
+    needs_review_raw = raw.get("needs_review")
+    if isinstance(needs_review_raw, bool):
+        needs_review = needs_review_raw
+    elif isinstance(needs_review_raw, str) and needs_review_raw.strip().lower() in {"true", "false"}:
+        needs_review = needs_review_raw.strip().lower() == "true"
+    else:
+        needs_review = decision in {"manual_review", "queue_review_card"}
+    return {
+        "mode": "external_agent",
+        "sections": {key: _sanitize_agent_section(sections.get(key)) for key in required},
+        "decision": decision,
+        "priority": priority,
+        "needs_review": needs_review,
+        "confidence": str(raw.get("confidence") or "medium").strip().lower(),
+        "raw": raw,
+    }
+
+
+def _run_document_agent_review(packet: dict[str, Any]) -> dict[str, Any] | None:
+    """Optional agent-review hook.
+
+    The monitor itself stays safe and deterministic for evidence gathering.  If
+    `HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_CMD` is configured, the command gets
+    the evidence packet on stdin and must return a small JSON review.  This lets
+    production wire the packet to a Hermes/LLM worker without letting it perform
+    writes; invalid/slow responses fall back to the local guardrailed message.
+    """
+    command = os.environ.get("HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_CMD", "").strip()
+    if not command:
+        return None
+    try:
+        timeout = float(os.environ.get("HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_TIMEOUT", "90") or 90)
+    except Exception:
+        timeout = 90.0
+    try:
+        completed = subprocess.run(
+            shlex.split(command),
+            input=json.dumps(packet, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=max(1.0, timeout),
+            check=False,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return _parse_document_agent_review(completed.stdout)
+
+
+def _message_from_agent_review(order_id: Any, review: dict[str, Any]) -> str:
+    sections = review.get("sections") if isinstance(review.get("sections"), dict) else {}
+    return "\n".join([
+        f"Lage: {order_id} · {_sanitize_agent_section(sections.get('lage'))}",
+        f"Abgleich: {_sanitize_agent_section(sections.get('abgleich'))}",
+        f"Auffällig: {_sanitize_agent_section(sections.get('auffaellig'))}",
+        f"Empfehlung: {_sanitize_agent_section(sections.get('empfehlung'))}",
+        f"Nächster Schritt: {_sanitize_agent_section(sections.get('naechster_schritt'))}",
+    ])
+
+
 def _human_document_message(
     *,
     order_id: Any,
@@ -465,34 +821,45 @@ def _human_document_message(
     findings: list[Any],
     needs_review: bool,
     comparisons: list[dict[str, str]] | None = None,
+    evidence_lines: list[str] | None = None,
     uploaded_by: Any = None,
     uploaded_at: Any = None,
 ) -> str:
+    normalized_doc_type = normalize_document_type(doc_type)
     label = _doc_type_label(doc_type)
     route = _route_hint(context)
     status = str(context.get("status") or "").strip()
     network = str(context.get("network") or context.get("mode") or "").strip()
     context_bits = [bit for bit in (network, status, route) if bit]
-    lage = f"{label} '{filename}' wurde gegen die im TMS gepflegten Sendungsdaten geprüft."
+    lage = f"Neuer Beleg geprüft: {label}. Ich habe ihn mit dem aktuellen TMS-Stand abgeglichen."
+    if normalized_doc_type == "offer":
+        lage = "Angebot geprüft. Ich habe Angebotsdaten und TMS-Kontext abgeglichen; daraus wurde keine automatische TMS-Korrektur abgeleitet."
     uploader = str(uploaded_by or "").strip()
     upload_time = _display_timestamp(uploaded_at)
     if uploader and uploader != "-":
-        lage += f" Upload laut TMS-Activity-Log: {uploader}"
+        lage += f" Upload laut TMS: {uploader}"
         if upload_time and upload_time != "-":
-            lage += f" am {upload_time}"
+            lage += f" · {upload_time}"
         lage += "."
     if context_bits:
-        lage += " Kontext: " + " · ".join(context_bits) + "."
+        lage += " Kontext: " + " · ".join(context_bits[:3]) + "."
 
     comparisons = comparisons or []
-    matching = _comparison_lines(comparisons, {"match"}, limit=3)
-    problems = _comparison_lines(comparisons, {"diff", "missing_tms"}, limit=3)
+    matching = _comparison_lines(comparisons, {"match"}, limit=4)
+    problems = _comparison_lines(comparisons, {"diff", "missing_tms"}, limit=4)
     unknown = _comparison_lines(comparisons, {"missing_doc"}, limit=2)
 
+    evidence_lines = evidence_lines or []
     if matching:
         abgleich = " | ".join(matching)
+        if evidence_lines:
+            abgleich += " | Gelesen: " + " | ".join(evidence_lines[:5])
+    elif evidence_lines:
+        abgleich = "Aus dem Beleg sicher gelesen: " + " | ".join(evidence_lines[:6]) + ". Keine direkte TMS-Korrektur daraus abgeleitet."
+        if normalized_doc_type == "offer":
+            abgleich = "Angebotsdaten: " + " | ".join(evidence_lines[:7]) + ". Kein direkt schreibbares TMS-Feld daraus abgeleitet."
     else:
-        abgleich = "Für dieses Dokument konnten noch keine belastbaren TMS-Feldtreffer bestätigt werden."
+        abgleich = "Noch kein sicherer Feldtreffer aus dem lesbaren Dokumenttext. Ich werte das deshalb nicht als TMS-Bestätigung."
 
     uploaded_norm = str(filename or "").strip().lower()
     blocker_findings = [
@@ -510,16 +877,30 @@ def _human_document_message(
         blocker_lines.extend(_finding_text(row) for row in sorted(uploaded_findings, key=_finding_rank)[:3])
     auffaellig_items = problems + blocker_lines
     if auffaellig_items:
-        auffaellig = " | ".join(auffaellig_items[:3])
-        empfehlung = "Die abweichenden bzw. im TMS fehlenden Werte bitte fachlich bestätigen; erst danach TMS-Felder korrigieren oder Dokument als Vorversion markieren."
-        targets = [row.get("target") or row.get("label") for row in comparisons if row.get("status") in {"diff", "missing_tms"}]
+        auffaellig = " | ".join(auffaellig_items[:4])
+        supported_card_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage"}
+        card_targets = [
+            row.get("target") or row.get("label")
+            for row in comparisons
+            if row.get("status") in {"diff", "missing_tms"} and str(row.get("target") or "") in supported_card_targets
+        ]
+        if card_targets:
+            empfehlung = "Ich sehe einen konkreten TMS-Feldwert aus belastbarer Dokument-Evidenz. Bitte die Freigabe-Kachel bestätigen oder ablehnen; vorher wird im TMS nichts geändert."
+            targets = card_targets
+        else:
+            empfehlung = "Ich sehe eine fachliche Abweichung, aber keinen sicheren direkt schreibbaren TMS-Feldwert. Bitte operativ prüfen; Hermes hat nichts geändert."
+            if normalized_doc_type == "offer":
+                empfehlung = "Angebot fachlich gegen TMS/ASR-Angebot prüfen; keine automatische TMS-Korrektur oder Kundenkommunikation ableiten."
+            targets = [row.get("target") or row.get("label") for row in comparisons if row.get("status") in {"diff", "missing_tms"}]
         target_text = ", ".join(str(x) for x in targets[:3] if x)
         naechster_schritt = f"Zu klären/korrigieren: {target_text}." if target_text else "Führenden Wert festlegen; bei TMS-Korrektur anschließend bewusst freigeben."
     else:
         suffix = (" Nicht beurteilbar: " + " | ".join(unknown)) if unknown else ""
-        auffaellig = "Keine TMS-/Dokument-Abweichung aus den lesbaren Feldern erkannt." + suffix
-        empfehlung = "Keine TMS-Korrektur aus diesem Dokument ableiten; nur die nicht lesbaren/nicht angegebenen Felder bei Bedarf manuell nachsehen."
-        naechster_schritt = "Dokumentstand weiter beobachten; erst bei echtem Feldkonflikt oder fehlendem TMS-Wert freigeben."
+        auffaellig = "Keine belastbare Abweichung aus den lesbaren Feldern." + suffix
+        empfehlung = "Keine TMS-Korrektur aus diesem Beleg ableiten. Nur bei Bedarf die nicht lesbaren Felder manuell nachsehen."
+        if normalized_doc_type == "offer":
+            empfehlung = "Keine TMS-Korrektur aus dem Angebot ableiten. Angebotswert/Scope nur fachlich gegen ASR-Angebot und Pricing-Kontext plausibilisieren."
+        naechster_schritt = "Weiter beobachten; erst bei echtem Feldkonflikt oder fehlendem TMS-Wert freigeben."
     if needs_review and not comparisons and not blocker_lines:
         auffaellig = "Dokument ist nicht vollständig automatisch belastbar; manueller Feldabgleich sinnvoll."
 
@@ -532,6 +913,94 @@ def _human_document_message(
     ])
 
 
+def _queue_document_review_cards(
+    *,
+    storage_root: Path | None,
+    order_id: str,
+    intents: list[dict[str, Any]],
+    event: dict[str, Any],
+    max_cards: int = 3,
+) -> list[dict[str, Any]]:
+    """Queue safe document-derived TMS proposals as Teams approval cards.
+
+    This is intentionally still review-first: no TMS write happens here.  The
+    card lets the operator explicitly approve/reject the proposed field update.
+    """
+    if not intents:
+        return []
+    try:
+        from .teams_reply_loop import record_agent_tms_update_intent
+    except Exception:
+        return []
+    root = CaseStore(storage_root).root
+    normalized_order = str(order_id or "").strip().upper()
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    fallback_doc_label = _doc_type_label(metadata.get("document_type") or "Dokument")
+    write_supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date"}
+    activity_id = _activity_id(event)
+    queued_cards: list[dict[str, Any]] = []
+    for intent in intents:
+        if len(queued_cards) >= max_cards:
+            break
+        if not isinstance(intent, dict):
+            continue
+        target = str(intent.get("target") or "").strip()
+        value = str(intent.get("value") or intent.get("document_value") or "").strip()
+        previous = str(intent.get("current_tms_value") or intent.get("previous_value") or "nicht gepflegt").strip()
+        label = str(intent.get("label") or target).strip()
+        guardrails = intent.get("guardrails") if isinstance(intent.get("guardrails"), dict) else {}
+        doc_label = _doc_type_label(guardrails.get("effective_document_type") or fallback_doc_label)
+        context_id = str(intent.get("context_id") or f"{normalized_order}:{activity_id}:document_monitor").strip()
+        text = (
+            f"{label} bei {normalized_order}: Dokumentwert {value}; "
+            f"TMS aktuell {previous}. Quelle: {doc_label}, Activity {activity_id or '-'}; "
+            "keine automatische TMS-Änderung ohne Teams-Freigabe."
+        )
+        queued = record_agent_tms_update_intent(
+            root=root,
+            order_id=normalized_order,
+            target=target,
+            value=value,
+            text=text,
+            operator="Hermes Dokumentmonitor",
+            source_message_id=str(activity_id) if activity_id else None,
+            context_id=context_id,
+            confidence=str(intent.get("confidence") or "document_field_comparison"),
+            source="document_activity_monitor",
+            evidence={
+                "source": doc_label,
+                "summary": text,
+                "previous_value": previous,
+                "document_value": value,
+                "activity_id": activity_id,
+                "guardrails": guardrails,
+            },
+            previous_value=previous,
+            write_supported=target in write_supported_targets,
+        )
+        if queued.get("queued"):
+            queued_cards.append({
+                "order_id": normalized_order,
+                "action_id": queued.get("action_id"),
+                "target": target,
+                "value": value,
+                "previous_value": previous,
+                "operator": "Hermes Dokumentmonitor",
+                "context_id": context_id,
+                "source": "document_activity_monitor",
+                "evidence": {"source": doc_label, "previous_value": previous, "document_value": value, "summary": text},
+                "write_supported": target in write_supported_targets,
+                "question": f"{label}: Dokumentwert {value} ins TMS übernehmen?" if target in write_supported_targets else f"{label}: Dokumentwert {value} fachlich bestätigen?",
+            })
+    return queued_cards
+
+
+def _section_from_message(message: str, label: str) -> str:
+    pattern = rf"(?:^|\n){re.escape(label)}:\s*(.*?)(?=\n(?:Lage|Abgleich|Auffällig|Empfehlung|Nächster Schritt):|\Z)"
+    match = re.search(pattern, message or "", flags=re.S)
+    return match.group(1).strip() if match else ""
+
+
 def _case_root_from_report(report: dict[str, Any], order_id: str) -> Path | None:
     del order_id
     lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
@@ -541,56 +1010,49 @@ def _case_root_from_report(report: dict[str, Any], order_id: str) -> Path | None
     return None
 
 
-def _queue_tms_review_cards_from_comparisons(
+def _build_tms_update_review_intents_from_comparisons(
     *,
     report: dict[str, Any],
     event: dict[str, Any],
     comparisons: list[dict[str, str]],
     findings: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Persist Teams approval items for document-derived TMS field updates.
+    """Build evidence-only TMS update review intents from document comparisons.
 
-    The document monitor may propose concrete TMS updates, but never writes them
-    directly. For fields supported by the existing Teams review/writeback flow,
-    queue one pending item and let the Teams adapter render a Yes/No review card.
-    Unsupported operational fields, such as main-leg ETD, stay as textual review
-    findings until a dedicated writeback tool exists for them.
+    The monitor is deliberately agent-first: deterministic code prepares guarded
+    evidence and never writes TMS fields. If the monitor later turns an intent into
+    a Teams card, the card still requires explicit Hermes/operator approval before
+    any write can happen.
     """
     order_id = str(report.get("order_id") or "").strip().upper()
     if not order_id:
         return []
-    try:
-        from .teams_reply_loop import record_agent_tms_update_intent
-    except Exception:
-        return []
-
-    case_root = _case_root_from_report(report, order_id)
-    if not case_root:
-        return []
-    root = case_root.parent.parent if case_root.name == order_id and case_root.parent.name == "orders" else case_root
-    operator = "Hermes Document Monitor"
     activity_id = _activity_id(event)
     context_id = f"{order_id}:{activity_id}:document_monitor" if activity_id else f"{order_id}:document_monitor"
-    supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference"}
+    supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage"}
+    write_supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date"}
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
     filename = metadata.get("file_name") or metadata.get("filename") or event.get("field_name")
     doc_type = metadata.get("document_type") or ""
     uploaded = _select_uploaded_analysis(report, str(filename))
     if _has_uploaded_document_blocker_finding(findings or [], filename):
         return []
-    cards: list[dict[str, Any]] = []
+    intents: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for row in comparisons:
         if row.get("status") not in {"diff", "missing_tms"}:
             continue
         target = str(row.get("target") or "").strip()
         value = str(row.get("doc") or "").strip()
+        if target in {"estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage"}:
+            value = _normalize_date_value(value)
         if target not in supported_targets or not value or value == "nicht lesbar":
             continue
         effective_doc_type = _effective_trusted_doc_type(doc_type, uploaded, target, value)
         if not is_trusted_source_for_field(effective_doc_type, target):
             continue
         analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+        field_source_checked = target == "mbl_number"
         if target == "mbl_number" and not _field_source_allows_mbl_candidate(analysis, value):
             continue
         if not _is_valid_document_field_evidence(target, value):
@@ -599,29 +1061,32 @@ def _queue_tms_review_cards_from_comparisons(
         if key in seen:
             continue
         seen.add(key)
-        queued = record_agent_tms_update_intent(
-            root=root,
-            order_id=order_id,
-            target=target,
-            value=value,
-            text=f"Dokumentenabgleich: {row.get('label') or target} aus Dokument übernehmen? TMS {row.get('tms')} ↔ Dokument {value}.",
-            operator=operator,
-            source_message_id=str(activity_id or "") or None,
-            context_id=context_id,
-            confidence="document_field_comparison",
-        )
-        if queued.get("queued"):
-            cards.append({
-                "order_id": order_id,
-                "action_id": queued.get("action_id"),
-                "target": target,
-                "value": value,
-                "operator": operator,
-                "context_id": context_id,
-                "source": "document_activity_monitor",
-                "question": f"{row.get('label') or target}: TMS auf Dokumentwert setzen?",
-            })
-    return cards
+        label = row.get("label") or target
+        intents.append({
+            "order_id": order_id,
+            "target": target,
+            "value": value,
+            "current_tms_value": row.get("tms"),
+            "document_value": value,
+            "label": label,
+            "source": "document_activity_monitor",
+            "requires_review": True,
+            "review_status": "agent_review_required",
+            "confidence": "document_field_comparison",
+            "context_id": context_id,
+            "question": f"{label}: TMS nach Agent-/Operator-Prüfung auf Dokumentwert setzen?",
+            "guardrails": {
+                "trusted_source": True,
+                "effective_document_type": effective_doc_type,
+                "valid_field_evidence": True,
+                "write_supported": target in write_supported_targets,
+                "review_only": target not in write_supported_targets,
+                "blocker_finding_present": False,
+                "field_source_checked": field_source_checked,
+                "side_effects_created": False,
+            },
+        })
+    return intents
 
 
 def list_recent_document_uploads(
@@ -651,25 +1116,106 @@ def list_recent_document_uploads(
     return {**(payload if isinstance(payload, dict) else {}), "document_uploads": uploads}
 
 
+def baseline_document_activity_monitor_state(
+    *,
+    storage_root: Path | None = None,
+    admin_user_id: int = DEFAULT_ADMIN_USER_ID,
+    per_page: int = 100,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    """Set the document monitor cursor to the latest current upload without processing backlog."""
+    activity_payload = list_recent_document_uploads(
+        admin_user_id=admin_user_id,
+        per_page=per_page,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    uploads = activity_payload.get("document_uploads") or []
+    upload_ids = [_activity_id(row) for row in uploads if isinstance(row, dict) and _activity_id(row)]
+    highest_id = max(upload_ids) if upload_ids else 0
+    now = utc_now_iso()
+    state = {
+        "last_seen_activity_id": highest_id,
+        "processed_activity_ids": [],
+        "updated_at": now,
+        "baseline": {
+            "created_at": now,
+            "source": "tms_activity_log",
+            "document_upload_count_seen": len(uploads),
+            "highest_activity_id": highest_id,
+            "date_from": date_from,
+            "date_to": date_to,
+            "policy": "old_backlog_deleted_start_from_current_activity_log",
+        },
+    }
+    state_path = _save_state(state, storage_root)
+    run_payload = {
+        "status": "baselined",
+        "generated_at": now,
+        "dry_run": False,
+        "source": "tms_activity_log",
+        "filter": {"entity_type": "document", "action": "upload", "date_from": date_from, "date_to": date_to},
+        "baselined_activity_id": highest_id,
+        "last_seen_activity_id_before": None,
+        "last_seen_activity_id_after": highest_id,
+        "candidates": len(uploads),
+        "selected": 0,
+        "processed_count": 0,
+        "error_count": 0,
+        "processed": [],
+        "errors": [],
+        "notifications": [],
+        "state_path": str(state_path),
+    }
+    latest_path = _save_latest_run(run_payload, storage_root)
+    run_payload["latest_run_path"] = str(latest_path)
+    return run_payload
+
+
 def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
-    reconciliation = report.get("reconciliation") if isinstance(report.get("reconciliation"), dict) else {}
-    lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
-    registry = report.get("registry_summary") if isinstance(report.get("registry_summary"), dict) else {}
-    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
-    filename = metadata.get("file_name") or metadata.get("filename") or event.get("field_name") or "Dokument"
+    raw_reconciliation = report.get("reconciliation")
+    reconciliation: dict[str, Any] = raw_reconciliation if isinstance(raw_reconciliation, dict) else {}
+    raw_lifecycle = report.get("lifecycle")
+    lifecycle: dict[str, Any] = raw_lifecycle if isinstance(raw_lifecycle, dict) else {}
+    raw_registry = report.get("registry_summary")
+    registry: dict[str, Any] = raw_registry if isinstance(raw_registry, dict) else {}
+    raw_metadata = event.get("metadata")
+    metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+    filename = _infer_uploaded_filename(report, event)
     doc_type = metadata.get("document_type") or "unbekannt"
+    uploaded_for_label = _select_uploaded_analysis(report, str(filename))
+    effective_doc_type_for_label = _uploaded_analysis_doc_type(doc_type, uploaded_for_label)
+    if effective_doc_type_for_label and effective_doc_type_for_label != "unknown":
+        doc_type = effective_doc_type_for_label
     risk = str(reconciliation.get("risk") or "low").strip().lower()
     needs_review = bool(reconciliation.get("needs_human_review"))
-    findings = reconciliation.get("findings") if isinstance(reconciliation.get("findings"), list) else []
+    raw_findings = reconciliation.get("findings")
+    findings: list[Any] = raw_findings if isinstance(raw_findings, list) else []
     priority = "high" if risk in {"high", "critical"} or _has_blocker_finding(findings) else ("medium" if needs_review or findings else "low")
     context = report.get("tms_context") if isinstance(report.get("tms_context"), dict) else {}
     comparisons = _build_document_field_comparison(report, str(filename))
+    evidence_lines = _build_document_evidence_lines(report, str(filename))
     if any(row.get("status") in {"diff", "missing_tms"} for row in comparisons):
         needs_review = True
         if priority == "low":
             priority = "medium"
-    tms_review_cards = _queue_tms_review_cards_from_comparisons(report=report, event=event, comparisons=comparisons, findings=findings)
-    message = _human_document_message(
+    document_review_intents = _build_tms_update_review_intents_from_comparisons(report=report, event=event, comparisons=comparisons, findings=findings)
+    agent_evidence_packet = _build_document_agent_evidence_packet(
+        report=report,
+        event=event,
+        filename=str(filename),
+        doc_type=doc_type,
+        context=context,
+        findings=findings,
+        needs_review=needs_review,
+        priority=priority,
+        comparisons=comparisons,
+        evidence_lines=evidence_lines,
+        document_review_intents=document_review_intents,
+    )
+    agent_review = _run_document_agent_review(agent_evidence_packet)
+    fallback_message = _human_document_message(
         order_id=report.get("order_id"),
         filename=filename,
         doc_type=doc_type,
@@ -677,10 +1223,37 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         findings=findings,
         needs_review=needs_review,
         comparisons=comparisons,
+        evidence_lines=evidence_lines,
         uploaded_by=event.get("changed_by_name") or event.get("changed_by"),
         uploaded_at=event.get("changed_at"),
     )
-    pending_review = 1 if needs_review else 0
+    if agent_review:
+        message = _message_from_agent_review(report.get("order_id"), agent_review)
+        priority = _priority_max(priority, agent_review.get("priority"))
+        needs_review = bool(needs_review or document_review_intents or agent_review.get("needs_review"))
+    else:
+        message = fallback_message
+    pending_review = 1 if (needs_review or document_review_intents) else 0
+    review_count = len(document_review_intents)
+    side_effects = {"tms_updates": 0, "queued_tms_actions": 0, "customer_notifications": 0}
+    document_message_sections = {
+        "lage": _section_from_message(message, "Lage"),
+        "abgleich": _section_from_message(message, "Abgleich"),
+        "auffaellig": _section_from_message(message, "Auffällig"),
+        "empfehlung": _section_from_message(message, "Empfehlung"),
+        "naechster_schritt": _section_from_message(message, "Nächster Schritt"),
+    }
+    document_decision = "Agent Review erforderlich" if pending_review else "Keine Aktion nötig"
+    if agent_review and agent_review.get("decision"):
+        decision_labels = {
+            "no_action": "Agentische Bewertung: keine Aktion nötig",
+            "observe": "Agentische Bewertung: weiter beobachten",
+            "manual_review": "Agentische Bewertung: fachlich prüfen",
+            "queue_review_card": "Agentische Bewertung: TMS-Freigabe prüfen",
+        }
+        document_decision = decision_labels.get(str(agent_review.get("decision")), "Agentische Bewertung übernommen")
+    if document_review_intents:
+        document_decision = "TMS-Korrektur nur nach Agent-/Operator-Freigabe prüfen"
     return {
         "status": "document_uploaded_checked",
         "order_id": report.get("order_id"),
@@ -705,7 +1278,26 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         "document_activity_document_type": str(doc_type),
         "document_registry_summary": registry,
         "document_field_comparison": comparisons,
-        "teams_tms_review_cards": tms_review_cards,
+        "document_message_sections": document_message_sections,
+        "document_agent_review": agent_review or {"mode": "guardrailed_fallback", "reason": "external_agent_review_not_configured_or_invalid"},
+        "document_agent_evidence_packet": agent_evidence_packet,
+        "document_agent_fallback_message": fallback_message,
+        "document_decision": document_decision,
+        "document_review_intents": document_review_intents,
+        "agent_review_required": bool(pending_review),
+        "review_contract": "deterministic_evidence_only_agent_or_operator_must_decide",
+        "evidence_summary": {
+            "tms_snapshot_path": lifecycle.get("tms_snapshot_path"),
+            "document_registry_path": lifecycle.get("document_registry_path"),
+            "history_sync_count": lifecycle.get("history_sync_count", 0),
+            "history_sync_error": lifecycle.get("history_sync_error"),
+            "last_email_at": lifecycle.get("last_email_at"),
+            "field_comparison_count": len(comparisons),
+            "document_evidence_count": len(evidence_lines),
+            "review_intent_count": review_count,
+        },
+        "side_effects": side_effects,
+        "teams_tms_review_cards": [],
         "document_reconciliation": reconciliation,
         "tms_context": context,
     }
@@ -724,7 +1316,16 @@ def run_document_activity_monitor(
     notify_ops_webhook: bool = True,
     refresh_history: bool = True,
     analyze_documents: bool = True,
+    baseline_now: bool = False,
 ) -> dict[str, Any]:
+    if baseline_now:
+        return baseline_document_activity_monitor_state(
+            storage_root=storage_root,
+            admin_user_id=admin_user_id,
+            per_page=per_page,
+            date_from=date_from,
+            date_to=date_to,
+        )
     state = _load_state(storage_root)
     last_seen = int(state.get("last_seen_activity_id") or 0)
     processed_ids = {int(x) for x in state.get("processed_activity_ids", []) if str(x).isdigit()}
@@ -769,6 +1370,21 @@ def run_document_activity_monitor(
                 trigger_event=event,
             )
             processor_result = _processor_result_from_report(report, event)
+            review_cards = _queue_document_review_cards(
+                storage_root=storage_root,
+                order_id=order_id,
+                intents=processor_result.get("document_review_intents") if isinstance(processor_result.get("document_review_intents"), list) else [],
+                event=event,
+            )
+            if review_cards:
+                processor_result["teams_tms_review_cards"] = review_cards
+                side_effects = processor_result.get("side_effects") if isinstance(processor_result.get("side_effects"), dict) else {}
+                side_effects["queued_tms_actions"] = len(review_cards)
+                processor_result["side_effects"] = side_effects
+                pending = processor_result.get("pending_action_summary") if isinstance(processor_result.get("pending_action_summary"), dict) else {}
+                pending["review"] = max(int(pending.get("review", 0) or 0), len(review_cards))
+                processor_result["pending_action_summary"] = pending
+                processor_result["document_decision"] = "TMS-Freigabe-Kachel erstellt; wartet auf Bestätigung/Ablehnung"
             notification_result: dict[str, Any] | None = None
             if notify_ops_webhook:
                 notification_result = send_manual_ops_notification(
@@ -797,9 +1413,17 @@ def run_document_activity_monitor(
             errors.append({"activity_id": event_id, "order_id": order_id, "error": str(exc)})
 
     if not dry_run:
-        successful_ids = {_activity_id(row) for row in selected} - {int(err.get("activity_id") or 0) for err in errors}
+        failed_ids = {int(err.get("activity_id") or 0) for err in errors}
+        successful_ids = {_activity_id(row) for row in selected} - failed_ids
         processed_ids.update(successful_ids)
-        state["last_seen_activity_id"] = max(highest_seen, last_seen)
+        cursor = last_seen
+        for row in selected:
+            event_id = _activity_id(row)
+            if event_id in failed_ids:
+                break
+            if event_id in successful_ids:
+                cursor = max(cursor, event_id)
+        state["last_seen_activity_id"] = cursor
         state["processed_activity_ids"] = sorted(processed_ids)[-500:]
         state["updated_at"] = utc_now_iso()
         state_path = _save_state(state, storage_root)
@@ -839,6 +1463,7 @@ def main() -> None:
     parser.add_argument("--no-notify", action="store_true")
     parser.add_argument("--no-history", action="store_true")
     parser.add_argument("--skip-analysis", action="store_true")
+    parser.add_argument("--baseline-now", action="store_true", help="Set cursor to current latest document upload and do not process old backlog.")
     args = parser.parse_args()
     result = run_document_activity_monitor(
         max_events=args.max_events,
@@ -850,6 +1475,7 @@ def main() -> None:
         notify_ops_webhook=not args.no_notify,
         refresh_history=not args.no_history,
         analyze_documents=not args.skip_analysis,
+        baseline_now=args.baseline_now,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

@@ -36,12 +36,26 @@ def _render_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- {row.get('severity', 'low')}: {row.get('type')} — {row.get('filename') or '-'} — {row.get('summary') or ''}")
     else:
         lines.append("- Keine present-document/TMS-Mirroring-Auffälligkeiten erkannt.")
+    raw_review_intents = report.get("document_review_intents")
+    review_intents: list[Any] = raw_review_intents if isinstance(raw_review_intents, list) else []
+    lines.extend([
+        "",
+        "## Agent Review",
+        f"- Review-Modus: {report.get('review_mode') or 'agent_first'}",
+        f"- Side-Effect-Policy: {report.get('side_effect_policy') or 'keine automatische TMS-/Kundenaktion'}",
+        f"- Review-Intents: {len(review_intents)}",
+    ])
+    for intent in review_intents[:5]:
+        if isinstance(intent, dict):
+            label = intent.get("label") or intent.get("target") or "Feld"
+            lines.append(f"- {label}: TMS {intent.get('current_tms_value') or '-'} ↔ Dokument {intent.get('document_value') or intent.get('value') or '-'}")
     lines.extend([
         "",
         "## Nicht gemacht",
         "- Keine Kundenmail gesendet.",
         "- Keine TMS-Statusänderung vorgenommen.",
         "- Keine Dokumente hochgeladen.",
+        "- Keine TMS-Review-Karte ohne Agent-/Operator-Entscheidung erzeugt.",
     ])
     return "\n".join(lines) + "\n"
 
@@ -108,7 +122,20 @@ def run_document_monitoring(
         "case_root": str(case_root),
         "mode": reconciliation.get("mode"),
         "tms_status": tms_snapshot.get("status") or (detail or {}).get("status"),
+        "review_mode": "agent_first",
+        "side_effect_policy": "deterministic_evidence_only_no_tms_write_or_customer_contact_without_explicit_review",
         "tms_context": _shipment_context(tms_snapshot),
+        "evidence": {
+            "trigger_event_present": bool(trigger_event),
+            "tms_snapshot_path": lifecycle.get("tms_snapshot_path"),
+            "document_registry_path": lifecycle.get("document_registry_path"),
+            "mail_history": {
+                "history_sync_count": lifecycle.get("history_sync_count", 0),
+                "history_sync_error": lifecycle.get("history_sync_error"),
+                "last_email_at": lifecycle.get("last_email_at"),
+            },
+            "source_contract": "TMS/Mail/Dokumente werden synchronisiert; Hermes/Operator entscheidet über Folgeschritte.",
+        },
         "lifecycle": {k: lifecycle.get(k) for k in ["initialized", "history_sync_count", "history_sync_error", "last_email_at", "tms_snapshot_path", "document_registry_path"]},
         "registry_summary": {
             "received_documents": len(registry.get("received_documents", []) or []),
