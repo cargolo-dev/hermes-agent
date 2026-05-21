@@ -420,6 +420,78 @@ def test_mcp_bridge_passes_large_backend_payload_via_stdin():
     assert captured["kwargs"]["text"] is True
 
 
+def test_mcp_bridge_snapshot_bundle_defaults_to_compact_snapshot():
+    calls: list[dict[str, object]] = []
+
+    class RecordingProvider(MCPBridgeTMSProvider):
+        def _call_backend(self, method_name: str, **kwargs):
+            calls.append({"tool_name": method_name, **kwargs})
+            return {"status": "ok", "shipment": {"shipment_number": "AN-12614", "status": "in_transit"}}
+
+    provider = RecordingProvider(python_bin="/python", package_root="/pkg", timeout=12)
+
+    snapshot = provider.snapshot_bundle("AN-12614")
+
+    assert snapshot.shipment_number == "AN-12614"
+    assert calls == [
+        {
+            "tool_name": "get_asr_shipment_snapshot",
+            "an": "AN-12614",
+            "include_stats": True,
+            "include_billing": True,
+            "include_raw": False,
+        }
+    ]
+
+
+def test_mcp_bridge_snapshot_bundle_can_request_raw_for_verification():
+    calls: list[dict[str, object]] = []
+
+    class RecordingProvider(MCPBridgeTMSProvider):
+        def _call_backend(self, method_name: str, **kwargs):
+            calls.append({"tool_name": method_name, **kwargs})
+            return {
+                "status": "ok",
+                "shipment": {"shipment_number": "AN-12614", "status": "in_transit"},
+                "raw": {"shipment_detail": {"mbl_number": "ZIHWBK260510LH052-Q", "container_number": "CICU9982440"}},
+            }
+
+    provider = RecordingProvider(python_bin="/python", package_root="/pkg", timeout=12)
+
+    snapshot = provider.snapshot_bundle("AN-12614", include_raw=True)
+
+    assert snapshot.detail["freight_details"] == {
+        "container_number": "CICU9982440",
+        "mbl_number": "ZIHWBK260510LH052-Q",
+    }
+    assert calls[0]["include_raw"] is True
+    assert "raw" not in snapshot.model_dump(mode="json")
+
+
+def test_mcp_bridge_snapshot_merges_raw_freight_details_into_empty_existing_values():
+    provider = MCPBridgeTMSProvider(python_bin="/python", package_root="/pkg", timeout=12)
+
+    snapshot = provider._normalize_snapshot(
+        "AN-12614",
+        {
+            "status": "ok",
+            "shipment": {
+                "shipment_number": "AN-12614",
+                "status": "in_transit",
+                "freight_details": {"mbl_number": "", "container_number": "", "hbl_number": "HBL-KEEP"},
+            },
+            "raw": {"shipment_detail": {"bl_number": "ZIHWBK260510LH052-Q", "container_number": "CICU9982440"}},
+        },
+    )
+
+    assert snapshot.detail["freight_details"] == {
+        "mbl_number": "",
+        "container_number": "CICU9982440",
+        "hbl_number": "HBL-KEEP",
+        "bl_number": "ZIHWBK260510LH052-Q",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tests: Processor with TMS integration
 # ---------------------------------------------------------------------------

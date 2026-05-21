@@ -10,7 +10,11 @@ import pytest
 
 from plugins.cargolo_ops.document_monitoring import run_document_monitoring
 from plugins.cargolo_ops.document_reconciliation import reconcile_documents
-from plugins.cargolo_ops.document_activity_monitor import _processor_result_from_report, run_document_activity_monitor
+from plugins.cargolo_ops.document_activity_monitor import (
+    _processor_result_from_report,
+    _queue_document_review_cards,
+    run_document_activity_monitor,
+)
 from plugins.cargolo_ops.document_schema import normalize_mode
 
 
@@ -872,6 +876,123 @@ def test_processor_result_queues_trusted_packing_list_valid_container_card(tmp_p
     )
 
     assert [(intent["target"], intent["value"]) for intent in result["document_review_intents"]] == [("container_number", "XHCU2996441")]
+
+
+def test_telex_release_with_explicit_container_queues_mbl_and_container_review_cards(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_CMD", raising=False)
+
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="telex-release.pdf",
+        event_doc_type="telex_release",
+        analysis_doc_type="telex_release",
+        extracted_fields={
+            "mbl_number": "ZIHWBK260510LH052-Q",
+            "container_number": "CICU9982440",
+        },
+        field_sources={
+            "mbl_number": {
+                "value": "ZIHWBK260510LH052-Q",
+                "label": "Master B/L No.",
+                "source": "telex release",
+                "raw_context": "Master B/L No. ZIHWBK260510LH052-Q",
+            },
+            "container_number": {
+                "value": "CICU9982440",
+                "label": "Container No.",
+                "source": "telex release",
+                "raw_context": "Container No. CICU9982440",
+            },
+        },
+        freight_details={
+            "pol_code": "Zhengzhou",
+            "pod_code": "DEHAM",
+            "mbl_number": "",
+            "container_number": "",
+        },
+    )
+
+    intents = result["document_review_intents"]
+    assert [(intent["target"], intent["value"]) for intent in intents] == [
+        ("mbl_number", "ZIHWBK260510LH052-Q"),
+        ("container_number", "CICU9982440"),
+    ]
+    assert all(intent["guardrails"]["write_supported"] is True for intent in intents)
+    assert all(intent["guardrails"]["side_effects_created"] is False for intent in intents)
+    assert {intent["target"]: intent["guardrails"]["field_source_checked"] for intent in intents} == {
+        "mbl_number": True,
+        "container_number": True,
+    }
+
+    cards = _queue_document_review_cards(
+        storage_root=tmp_path,
+        order_id="AN-11790",
+        intents=intents,
+        event={
+            "id": 9001,
+            "changed_at": "2026-05-11T10:00:00Z",
+            "metadata": {"file_name": "telex-release.pdf", "document_type": "telex_release"},
+        },
+    )
+
+    assert [(card["target"], card["value"], card["write_supported"]) for card in cards] == [
+        ("mbl_number", "ZIHWBK260510LH052-Q", True),
+        ("container_number", "CICU9982440", True),
+    ]
+
+    pending_path = tmp_path / "orders" / "AN-11790" / "teams" / "pending_tms_actions.jsonl"
+    queue = [json.loads(line) for line in pending_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [(row["target"], row["value"], row["status"], row["write_policy"], row["write_supported"]) for row in queue] == [
+        ("mbl_number", "ZIHWBK260510LH052-Q", "pending_review", "no_auto_write_without_review", True),
+        ("container_number", "CICU9982440", "pending_review", "no_auto_write_without_review", True),
+    ]
+    assert not (tmp_path / "orders" / "AN-11790" / "teams" / "applied_tms_actions.jsonl").exists()
+
+
+def test_telex_release_container_requires_explicit_container_provenance(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="telex-release-reference.pdf",
+        event_doc_type="telex_release",
+        analysis_doc_type="telex_release",
+        extracted_fields={
+            "mbl_number": "ZIHWBK260510LH052-Q",
+            "container_number": "CICU9982440",
+        },
+        field_sources={
+            "mbl_number": {
+                "value": "ZIHWBK260510LH052-Q",
+                "label": "Master B/L No.",
+                "source": "telex release",
+                "raw_context": "Master B/L No. ZIHWBK260510LH052-Q",
+            },
+            "container_number": {
+                "value": "CICU9982440",
+                "label": "Customer Reference",
+                "source": "reference block",
+                "raw_context": "Customer Reference CICU9982440",
+            },
+        },
+        freight_details={"mbl_number": "", "container_number": ""},
+    )
+
+    assert [(intent["target"], intent["value"]) for intent in result["document_review_intents"]] == [
+        ("mbl_number", "ZIHWBK260510LH052-Q")
+    ]
+
+
+def test_telex_release_container_without_field_source_is_not_queued(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="telex-release-no-source.pdf",
+        event_doc_type="telex_release",
+        analysis_doc_type="telex_release",
+        extracted_fields={"container_number": "CICU9982440"},
+        field_sources={},
+        freight_details={"mbl_number": "", "container_number": ""},
+    )
+
+    assert result["document_review_intents"] == []
 
 
 def test_processor_result_blocks_master_bl_cards_when_uploaded_file_has_blocker_finding(tmp_path):

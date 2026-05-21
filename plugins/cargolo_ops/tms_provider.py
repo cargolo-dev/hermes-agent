@@ -61,7 +61,7 @@ def _load_cargolo_tms_mcp_defaults() -> dict[str, str]:
 
 
 class TMSReadProvider(Protocol):
-    def snapshot_bundle(self, an: str, customer_hint: str | None = None) -> TMSSnapshot: ...
+    def snapshot_bundle(self, an: str, customer_hint: str | None = None, *, include_raw: bool = False) -> TMSSnapshot: ...
     def shipments_list(self, transport_category: str = "asr", **kwargs: Any) -> list[dict[str, Any]]: ...
     def document_requirements(self, an: str) -> dict[str, Any]: ...
     def get_document_download_url(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -84,7 +84,7 @@ class DirectTMSProvider:
     def __init__(self, client: CargoloTMSClient):
         self.client = client
 
-    def snapshot_bundle(self, an: str, customer_hint: str | None = None) -> TMSSnapshot:
+    def snapshot_bundle(self, an: str, customer_hint: str | None = None, *, include_raw: bool = False) -> TMSSnapshot:
         return self.client.snapshot_bundle(an, customer_hint)
 
     def shipments_list(self, transport_category: str = "asr", **kwargs: Any) -> list[dict[str, Any]]:
@@ -264,10 +264,39 @@ class MCPBridgeTMSProvider:
             warnings = [*warnings, f"{payload.get('code')}: {payload.get('message')}"]
         payload_status = str(payload.get("status") or "")
         effective_status = str(shipment.get("status") or payload_status or ("error" if warnings else "unknown"))
+        raw_value = payload.get("raw")
+        raw = raw_value if isinstance(raw_value, dict) else {}
+        raw_detail_value = raw.get("shipment_detail")
+        raw_detail = raw_detail_value if isinstance(raw_detail_value, dict) else {}
         detail = {
             **shipment,
             "documents": shipment.get("documents", []),
         }
+        if raw_detail:
+            freight_keys = (
+                "container_number",
+                "container_type",
+                "seal_number",
+                "hbl_number",
+                "mbl_number",
+                "bl_number",
+                "hawb_number",
+                "hawb_number_2",
+                "hawb_number_3",
+                "mawb_number",
+                "pol_code",
+                "pod_code",
+                "incoterms_location",
+            )
+            raw_freight_details = {key: raw_detail.get(key) for key in freight_keys if raw_detail.get(key) not in (None, "")}
+            existing_value = detail.get("freight_details")
+            existing_freight = existing_value if isinstance(existing_value, dict) else {}
+            freight_details = {
+                **existing_freight,
+                **{key: value for key, value in raw_freight_details.items() if existing_freight.get(key) in (None, "")},
+            }
+            if freight_details:
+                detail["freight_details"] = freight_details
         return TMSSnapshot(
             order_id=an,
             shipment_uuid=shipment.get("shipment_uuid"),
@@ -291,13 +320,13 @@ class MCPBridgeTMSProvider:
             remote_payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
         )
 
-    def snapshot_bundle(self, an: str, customer_hint: str | None = None) -> TMSSnapshot:
+    def snapshot_bundle(self, an: str, customer_hint: str | None = None, *, include_raw: bool = False) -> TMSSnapshot:
         payload = self._call_backend(
             "get_asr_shipment_snapshot",
             an=an,
             include_stats=True,
             include_billing=True,
-            include_raw=False,
+            include_raw=include_raw,
         )
         return self._normalize_snapshot(an, payload, customer_hint)
 

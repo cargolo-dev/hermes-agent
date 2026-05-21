@@ -836,19 +836,67 @@ def _default_tms_apply(action: dict[str, Any], context: dict[str, Any]) -> dict[
 
 
 def _extract_snapshot_value(snapshot: dict[str, Any], target: str) -> Any:
-    shipment = snapshot.get("shipment") if isinstance(snapshot.get("shipment"), dict) else snapshot
+    def _dict(value: Any) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    def _candidate_nodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        nodes: list[dict[str, Any]] = []
+        seen: set[int] = set()
+
+        def add(node: Any) -> None:
+            if not isinstance(node, dict):
+                return
+            marker = id(node)
+            if marker in seen:
+                return
+            seen.add(marker)
+            nodes.append(node)
+            for key in ("shipment", "detail", "raw", "payload", "result", "structuredContent", "shipment_detail"):
+                child = node.get(key)
+                if isinstance(child, dict):
+                    add(child)
+            shipment = node.get("shipment")
+            if isinstance(shipment, dict):
+                for key in ("detail", "raw", "payload"):
+                    child = shipment.get(key)
+                    if isinstance(child, dict):
+                        add(child)
+
+        add(payload)
+        return nodes
+
+    candidates = _candidate_nodes(snapshot)
     if target == "customs_reference":
-        customs = shipment.get("customs") if isinstance(shipment.get("customs"), dict) else {}
-        return customs.get("customs_reference") or shipment.get("customs_reference")
+        for node in candidates:
+            customs = _dict(node.get("customs"))
+            value = customs.get("customs_reference") or node.get("customs_reference")
+            if value not in (None, ""):
+                return value
+        return None
     if target == "customs_status":
-        customs = shipment.get("customs") if isinstance(shipment.get("customs"), dict) else {}
-        return customs.get("customs_status") or shipment.get("customs_status")
+        for node in candidates:
+            customs = _dict(node.get("customs"))
+            value = customs.get("customs_status") or node.get("customs_status")
+            if value not in (None, ""):
+                return value
+        return None
     if target in {"hbl_number", "mbl_number", "hawb_number", "container_number"}:
-        freight = shipment.get("freight_details") if isinstance(shipment.get("freight_details"), dict) else {}
-        return freight.get(target) or shipment.get(target)
+        for node in candidates:
+            freight = _dict(node.get("freight_details"))
+            if target == "mbl_number":
+                value = freight.get("mbl_number") or freight.get("bl_number") or node.get("mbl_number") or node.get("bl_number")
+            else:
+                value = freight.get(target) or node.get(target)
+            if value not in (None, ""):
+                return value
+        return None
     if target in {"pickup_date", "estimated_delivery_date", "actual_delivery_date"}:
-        dates = shipment.get("dates") if isinstance(shipment.get("dates"), dict) else {}
-        return dates.get(target) or shipment.get(target)
+        for node in candidates:
+            dates = _dict(node.get("dates"))
+            value = dates.get(target) or node.get(target)
+            if value not in (None, ""):
+                return value
+        return None
     return None
 
 
@@ -864,7 +912,10 @@ def _default_tms_verify(order_id: str, target: str) -> Any:
         raw_snapshot = snapshot_reader(order_id)
         snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
     else:
-        snapshot_obj = provider.snapshot_bundle(order_id)
+        try:
+            snapshot_obj = provider.snapshot_bundle(order_id, include_raw=True)
+        except TypeError:
+            snapshot_obj = provider.snapshot_bundle(order_id)
         if hasattr(snapshot_obj, "detail") and isinstance(snapshot_obj.detail, dict):
             snapshot = {"shipment": snapshot_obj.detail}
         else:

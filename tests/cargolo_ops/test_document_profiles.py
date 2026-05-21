@@ -81,6 +81,13 @@ def test_master_bl_trusts_transport_fields_but_commercial_invoice_does_not_trust
     assert is_trusted_source_for_field("commercial_invoice", "mbl_number") is False
 
 
+def test_telex_release_trusts_b_l_and_single_container_review_fields():
+    expected_trusted = {"mbl_number", "hbl_number", "container_number"}
+    assert expected_trusted.issubset(set(trusted_update_fields("telex_release")))
+    for field in expected_trusted:
+        assert is_trusted_source_for_field("telex_release", field) is True
+
+
 def test_commercial_invoice_has_blocker_checks_for_business_critical_invoice_fields():
     checks = get_document_profile("commercial_invoice").checks
     blocker_codes = {check["code"] for check in checks if check.get("severity") == "blocker"}

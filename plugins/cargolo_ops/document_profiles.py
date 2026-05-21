@@ -129,7 +129,7 @@ DOCUMENT_PROFILES: dict[str, DocumentProfile] = {
         "telex_release",
         aliases=("telex", "telex release", "surrender_notice"),
         relevant_fields=("document_number", "date", "issuer", "recipient", "mbl_number", "hbl_number", "container_number", "vessel", "voyage"),
-        trusted_tms_update_fields=("mbl_number", "hbl_number"),
+        trusted_tms_update_fields=("mbl_number", "hbl_number", "container_number"),
     ),
     "release_order": DocumentProfile(
         "release_order",

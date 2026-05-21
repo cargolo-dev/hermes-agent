@@ -7,6 +7,7 @@ from pathlib import Path
 
 from plugins.cargolo_ops.teams_reply_loop import (
     _default_tms_verify,
+    _extract_snapshot_value,
     build_card_context,
     handle_teams_message,
     process_teams_tms_card_action,
@@ -36,6 +37,105 @@ def test_default_tms_verify_reads_snapshot_bundle_detail(monkeypatch) -> None:
     assert _default_tms_verify("AN-12218", "container_number") == "CIMU1670214"
 
 
+def test_default_tms_verify_reads_provider_snapshot_detail_shape(monkeypatch) -> None:
+    class FakeProvider:
+        def snapshot(self, an: str) -> dict:
+            assert an == "AN-12614"
+            return {
+                "status": "ok",
+                "detail": {
+                    "freight_details": {
+                        "mbl_number": "ZIHWBK260510LH052-Q",
+                        "container_number": "CICU9982440",
+                    }
+                },
+            }
+
+    from plugins.cargolo_ops import tms_provider
+
+    monkeypatch.setattr(tms_provider, "build_tms_provider_from_env", lambda: FakeProvider())
+
+    assert _default_tms_verify("AN-12614", "mbl_number") == "ZIHWBK260510LH052-Q"
+    assert _default_tms_verify("AN-12614", "container_number") == "CICU9982440"
+
+
+def test_default_tms_verify_reads_nested_raw_detail_shape(monkeypatch) -> None:
+    class FakeSnapshot:
+        def model_dump(self, mode: str = "json") -> dict:
+            assert mode == "json"
+            return {
+                "status": "ok",
+                "raw": {
+                    "detail": {
+                        "freight_details": {
+                            "mbl_number": "ZIHWBK260510LH052-Q",
+                            "container_number": "CICU9982440",
+                        }
+                    }
+                },
+            }
+
+    class FakeProvider:
+        def snapshot_bundle(self, an: str, customer_hint: str | None = None) -> FakeSnapshot:
+            assert an == "AN-12614"
+            return FakeSnapshot()
+
+    from plugins.cargolo_ops import tms_provider
+
+    monkeypatch.setattr(tms_provider, "build_tms_provider_from_env", lambda: FakeProvider())
+
+    assert _default_tms_verify("AN-12614", "mbl_number") == "ZIHWBK260510LH052-Q"
+    assert _default_tms_verify("AN-12614", "container_number") == "CICU9982440"
+
+
+def test_extract_snapshot_value_treats_bl_number_as_mbl_alias() -> None:
+    snapshot = {
+        "raw": {
+            "shipment_detail": {
+                "freight_details": {"bl_number": "ZIHWBK260510LH052-Q"},
+                "container_number": "CICU9982440",
+            }
+        }
+    }
+
+    assert _extract_snapshot_value(snapshot, "mbl_number") == "ZIHWBK260510LH052-Q"
+    assert _extract_snapshot_value(snapshot, "container_number") == "CICU9982440"
+
+
+def test_default_tms_verify_requests_raw_snapshot_for_bundle_providers(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeSnapshot:
+        detail = {"freight_details": {"bl_number": "ZIHWBK260510LH052-Q"}}
+
+    class FakeProvider:
+        def snapshot_bundle(self, an: str, customer_hint: str | None = None, *, include_raw: bool = False) -> FakeSnapshot:
+            captured["an"] = an
+            captured["include_raw"] = include_raw
+            return FakeSnapshot()
+
+    from plugins.cargolo_ops import tms_provider
+
+    monkeypatch.setattr(tms_provider, "build_tms_provider_from_env", lambda: FakeProvider())
+
+    assert _default_tms_verify("AN-12614", "mbl_number") == "ZIHWBK260510LH052-Q"
+    assert captured == {"an": "AN-12614", "include_raw": True}
+
+
+def test_default_tms_verify_supports_legacy_bundle_signature(monkeypatch) -> None:
+    class FakeSnapshot:
+        detail = {"freight_details": {"container_number": "CICU9982440"}}
+
+    class FakeProvider:
+        def snapshot_bundle(self, an: str, customer_hint: str | None = None) -> FakeSnapshot:
+            assert an == "AN-12614"
+            return FakeSnapshot()
+
+    from plugins.cargolo_ops import tms_provider
+
+    monkeypatch.setattr(tms_provider, "build_tms_provider_from_env", lambda: FakeProvider())
+
+    assert _default_tms_verify("AN-12614", "container_number") == "CICU9982440"
 
 
 def test_default_tms_verify_reads_customs_status_from_snapshot_bundle_detail(monkeypatch) -> None:

@@ -660,6 +660,37 @@ def _field_source_allows_mbl_candidate(analysis: dict[str, Any], value: Any) -> 
     return has_bl_context and not has_wrong_context
 
 
+def _container_candidate_field_name(fields: dict[str, Any], value: Any) -> str:
+    value_norm = _norm(value)
+    for key in ("container_number", "container_no", "cntr_number", "container"):
+        candidate = _clean(fields.get(key))
+        if _is_valid_container_candidate(candidate) and _norm(candidate) == value_norm:
+            return key
+    return ""
+
+
+def _field_source_allows_container_candidate(analysis: dict[str, Any], value: Any) -> bool:
+    field_sources = analysis.get("field_sources") if isinstance(analysis.get("field_sources"), dict) else {}
+    if not field_sources:
+        return False
+    raw_fields = analysis.get("extracted_fields")
+    fields: dict[str, Any] = raw_fields if isinstance(raw_fields, dict) else {}
+    candidate_key = _container_candidate_field_name(fields, value) or "container_number"
+    source_meta = field_sources.get(candidate_key)
+    if not isinstance(source_meta, dict):
+        return False
+    provenance = " ".join(
+        _clean(source_meta.get(part))
+        for part in ("label", "source", "raw_context")
+        if _clean(source_meta.get(part))
+    )
+    if not provenance:
+        return False
+    has_container_context = bool(re.search(r"\b(?:container|cntr|cont\.?\s*no\.?|container\s*no\.?)\b", provenance, re.IGNORECASE))
+    has_wrong_context = bool(re.search(r"\b(?:booking|invoice|customer|reference|date|vessel|voyage)\b", provenance, re.IGNORECASE))
+    return has_container_context and not has_wrong_context
+
+
 def _contains_reference(haystack: dict[str, Any], value: Any) -> bool:
     needle = _norm(value)
     if not needle:
@@ -1380,10 +1411,15 @@ def _build_tms_update_review_intents_from_comparisons(
         effective_doc_type = _effective_trusted_doc_type(doc_type, uploaded, target, value)
         if not is_trusted_source_for_field(effective_doc_type, target):
             continue
-        analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+        raw_analysis = uploaded.get("analysis")
+        analysis: dict[str, Any] = raw_analysis if isinstance(raw_analysis, dict) else {}
         field_source_checked = target == "mbl_number"
         if target == "mbl_number" and not _field_source_allows_mbl_candidate(analysis, value):
             continue
+        if target == "container_number" and effective_doc_type == "telex_release":
+            field_source_checked = True
+            if not _field_source_allows_container_candidate(analysis, value):
+                continue
         if not _is_valid_document_field_evidence(target, value):
             continue
         key = (target, value)
