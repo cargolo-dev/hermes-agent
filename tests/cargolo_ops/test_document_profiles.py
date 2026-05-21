@@ -25,6 +25,7 @@ EXPECTED_PROFILE_KEYS = {
     "release_order",
     "customs_instruction",
     "export_accompanying_document",
+    "booking_confirmation",
     "shipment_advice",
     "terminal_receipt",
     "outgoing_invoice",
