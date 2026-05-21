@@ -286,6 +286,8 @@ def record_agent_tms_update_intent(
     evidence: dict[str, Any] | None = None,
     previous_value: str | None = None,
     write_supported: bool | None = None,
+    action_type: str | None = None,
+    tool_args: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist an LLM/agent-decided Teams TMS update intent as pending review.
 
@@ -352,6 +354,10 @@ def record_agent_tms_update_intent(
         "write_policy": "no_auto_write_without_review",
         "write_supported": bool(write_supported) if write_supported is not None else bool(normalized_target in _SHORT_TO_FULL_TARGET),
     }
+    if action_type:
+        row["action_type"] = str(action_type).strip()
+    if isinstance(tool_args, dict) and tool_args:
+        row["tool_args"] = dict(tool_args)
     _append_jsonl(teams_dir / "pending_tms_actions.jsonl", row)
     _append_jsonl(teams_dir / "case_learning.jsonl", {
         "timestamp": now,
@@ -394,8 +400,9 @@ _SHORT_TO_FULL_TARGET: dict[str, str] = {
     "estimated_delivery_date": "shipment.dates.estimated_delivery_date",
     "actual_delivery_date": "shipment.dates.actual_delivery_date",
 }
-_REVIEW_ONLY_TARGETS = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code", "etd_main_carriage", "atd_main_carriage"}
-_SUPPORTED_INTENT_TARGETS = set(_SHORT_TO_FULL_TARGET) | _REVIEW_ONLY_TARGETS
+_CARGO_WRITE_TARGETS = {"cargo_weight_kg", "cargo_pieces"}
+_REVIEW_ONLY_TARGETS = {"seal_number", "hs_code", "etd_main_carriage", "atd_main_carriage"}
+_SUPPORTED_INTENT_TARGETS = set(_SHORT_TO_FULL_TARGET) | _REVIEW_ONLY_TARGETS | _CARGO_WRITE_TARGETS
 
 
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:
@@ -897,6 +904,33 @@ def _extract_snapshot_value(snapshot: dict[str, Any], target: str) -> Any:
             if value not in (None, ""):
                 return value
         return None
+    if target in _CARGO_WRITE_TARGETS:
+        key = "quantity" if target == "cargo_pieces" else "weight_kg"
+        fallback_keys = ("total_pieces", "total_packages") if target == "cargo_pieces" else ("total_weight_kg", "weight_kg")
+        for node in candidates:
+            cargo_rows = node.get("cargo")
+            if isinstance(cargo_rows, list):
+                numbers: list[float] = []
+                for cargo in cargo_rows:
+                    if not isinstance(cargo, dict):
+                        continue
+                    raw_value = cargo.get(key)
+                    if target == "cargo_weight_kg":
+                        raw_value = cargo.get("total_weight_kg") or raw_value
+                    try:
+                        if raw_value not in (None, ""):
+                            numbers.append(float(str(raw_value).replace(",", ".")))
+                    except Exception:
+                        continue
+                if numbers:
+                    total = sum(numbers)
+                    return str(int(total)) if abs(total - round(total)) < 0.0001 else f"{total:.3f}".rstrip("0").rstrip(".")
+            totals = _dict(node.get("totals"))
+            for fallback_key in fallback_keys:
+                value = totals.get(fallback_key) or node.get(fallback_key)
+                if value not in (None, ""):
+                    return value
+        return None
     return None
 
 
@@ -945,7 +979,8 @@ def _apply_approved_pending_tms_action(
         "approved_by": event.get("operator"),
         "approval_message_id": event.get("message_id"),
     }
-    if not full_target or value in (None, ""):
+    pending_action_type = str(pending_action.get("action_type") or "").strip()
+    if (not full_target and not pending_action_type) or value in (None, ""):
         rows[pending_index] = {**pending_action, **base_update, "status": "approval_blocked", "block_reason": "unsupported_or_missing_target_value"}
         _write_jsonl(pending_path, rows)
         return {"type": "tms_update_approval_blocked", "target": short_target, "value": value, "status": "approval_blocked"}
@@ -986,12 +1021,24 @@ def _apply_approved_pending_tms_action(
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
-    writeback_action = {
-        "action_type": "field_update",
-        "target": full_target,
-        "suggested_value": value,
-        "source": "teams_reply_explicit_approval",
-    }
+    action_type = pending_action_type
+    raw_tool_args = pending_action.get("tool_args")
+    tool_args: dict[str, Any] = dict(raw_tool_args) if isinstance(raw_tool_args, dict) else {}
+    if action_type:
+        writeback_action = {
+            "action_type": action_type,
+            "target": short_target,
+            "suggested_value": value,
+            "tool_args": dict(tool_args),
+            "source": "teams_reply_explicit_approval",
+        }
+    else:
+        writeback_action = {
+            "action_type": "field_update",
+            "target": full_target,
+            "suggested_value": value,
+            "source": "teams_reply_explicit_approval",
+        }
 
     def _update_claimed_action(update: dict[str, Any]) -> dict[str, Any]:
         """Merge a status update into the claimed action under the queue lock.

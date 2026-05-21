@@ -457,6 +457,8 @@ def _number_from_value(value: Any) -> float | None:
             token = token.replace(",", "")
     elif "," in token:
         token = token.replace(",", ".")
+    elif "." in token and re.fullmatch(r"\d{1,3}(?:\.\d{3})+", token):
+        token = token.replace(".", "")
     try:
         return float(token)
     except Exception:
@@ -1180,8 +1182,8 @@ def _build_document_agent_evidence_packet(
         "guardrails": {
             "writes_allowed": False,
             "customer_messages_allowed": False,
-            "safe_writeback_targets": ["mbl_number", "hbl_number", "hawb_number", "container_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date"],
-            "review_only_targets": ["etd_main_carriage", "atd_main_carriage", "cargo_weight_kg", "cargo_pieces"],
+            "safe_writeback_targets": ["mbl_number", "hbl_number", "hawb_number", "container_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date", "cargo_weight_kg", "cargo_pieces"],
+            "review_only_targets": ["etd_main_carriage", "atd_main_carriage"],
             "agent_may_raise_priority": True,
             "agent_may_not_hide_safe_review_intents": True,
             "agent_may_not_downgrade_blockers": True,
@@ -1428,7 +1430,7 @@ def _human_document_message(
     auffaellig_items = problems + blocker_lines
     if auffaellig_items:
         auffaellig = " | ".join(auffaellig_items[:4])
-        supported_card_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage"}
+        supported_card_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage", "cargo_weight_kg", "cargo_pieces"}
         card_targets = [
             row.get("target") or row.get("label")
             for row in comparisons
@@ -1521,6 +1523,60 @@ def _duplicate_review_card_summary(card: dict[str, Any], existing: dict[str, Any
     }
 
 
+_CARGO_WRITE_TARGETS = {"cargo_weight_kg", "cargo_pieces"}
+_DIRECT_WRITE_SUPPORTED_TARGETS = {
+    "mbl_number",
+    "container_number",
+    "hbl_number",
+    "hawb_number",
+    "customs_reference",
+    "estimated_delivery_date",
+    "actual_delivery_date",
+} | _CARGO_WRITE_TARGETS
+
+
+def _cargo_item_writeback_args_from_report(report: dict[str, Any], target: str, value: Any) -> dict[str, Any]:
+    """Return direct cargo-item write args when a single concrete TMS cargo row is addressable.
+
+    Package/weight deltas are only directly writeable when the snapshot exposes one
+    cargo row with a stable item id. Multi-row cargo stays review-only because an
+    aggregate document value cannot be safely distributed across multiple TMS rows.
+    """
+    if target not in _CARGO_WRITE_TARGETS:
+        return {}
+    lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
+    snapshot = _load_json(lifecycle.get("tms_snapshot_path"))
+    detail = snapshot.get("detail") if isinstance(snapshot.get("detail"), dict) else snapshot
+    detail = detail if isinstance(detail, dict) else {}
+    cargo_rows = _cargo_rows_from_detail(detail if isinstance(detail, dict) else {})
+    if len(cargo_rows) != 1:
+        return {}
+    row = cargo_rows[0]
+    item_id = str(row.get("id") or row.get("cargo_item_id") or "").strip()
+    if not item_id:
+        return {}
+    number = _number_from_value(value)
+    if number is None or number <= 0:
+        return {}
+    args: dict[str, Any] = {"cargo_item_id": item_id}
+    if target == "cargo_pieces":
+        args["quantity"] = int(round(number))
+    else:
+        formatted = int(round(number)) if abs(number - round(number)) < 0.0001 else number
+        args["weight_kg"] = formatted
+        args["total_weight_kg"] = formatted
+    return args
+
+
+def _writeback_metadata_for_intent(report: dict[str, Any], target: str, value: Any) -> tuple[bool, str | None, dict[str, Any] | None]:
+    if target in _CARGO_WRITE_TARGETS:
+        args = _cargo_item_writeback_args_from_report(report, target, value)
+        if args:
+            return True, "cargo_item_update", args
+        return False, None, None
+    return target in _DIRECT_WRITE_SUPPORTED_TARGETS, None, None
+
+
 def _queue_document_review_card_results(
     *,
     storage_root: Path | None,
@@ -1546,7 +1602,6 @@ def _queue_document_review_card_results(
     normalized_order = str(order_id or "").strip().upper()
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
     fallback_doc_label = _doc_type_label(metadata.get("document_type") or "Dokument")
-    write_supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date"}
     activity_id = _activity_id(event)
     for intent in intents:
         if not isinstance(intent, dict):
@@ -1566,7 +1621,23 @@ def _queue_document_review_card_results(
         explicit_write_supported = guardrails.get("write_supported")
         if explicit_write_supported is None and "write_supported" in intent:
             explicit_write_supported = intent.get("write_supported")
-        write_supported = target in write_supported_targets and explicit_write_supported is not False
+        derived_write_supported, action_type, tool_args = _writeback_metadata_for_intent({"lifecycle": intent.get("lifecycle") or {}}, target, value)
+        if not derived_write_supported:
+            derived_write_supported, action_type, tool_args = _writeback_metadata_for_intent({"lifecycle": event.get("lifecycle") or {}}, target, value)
+        # The full report is not passed into this helper, so document-derived cargo
+        # intents may carry precomputed writeback metadata from the builder.
+        if isinstance(intent.get("tool_args"), dict) and intent.get("action_type"):
+            requested_action_type = str(intent.get("action_type") or "").strip()
+            requested_tool_args = dict(intent.get("tool_args") or {})
+            if (
+                target in _CARGO_WRITE_TARGETS
+                and requested_action_type == "cargo_item_update"
+                and str(requested_tool_args.get("cargo_item_id") or "").strip()
+            ):
+                derived_write_supported = True
+                action_type = requested_action_type
+                tool_args = requested_tool_args
+        write_supported = bool(derived_write_supported) and explicit_write_supported is not False
         card = {
             "order_id": normalized_order,
             "action_id": None,
@@ -1578,6 +1649,8 @@ def _queue_document_review_card_results(
             "source": "document_activity_monitor",
             "evidence": {"source": doc_label, "previous_value": previous, "document_value": value, "summary": text},
             "write_supported": write_supported,
+            "action_type": action_type if write_supported else None,
+            "tool_args": tool_args if write_supported else None,
             "question": f"{label}: Dokumentwert {value} ins TMS übernehmen?" if write_supported else f"{label}: Dokumentwert {value} fachlich bestätigen?",
         }
         existing_duplicate = _existing_pending_review_card(root, normalized_order, target, value)
@@ -1607,6 +1680,8 @@ def _queue_document_review_card_results(
             },
             previous_value=previous,
             write_supported=write_supported,
+            action_type=action_type if write_supported else None,
+            tool_args=tool_args if write_supported else None,
         )
         if queued.get("queued"):
             card["action_id"] = queued.get("action_id")
@@ -1778,7 +1853,6 @@ def _build_tms_update_review_intents_from_comparisons(
         "cargo_weight_kg",
         "cargo_pieces",
     }
-    write_supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date"}
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
     filename = metadata.get("file_name") or metadata.get("filename") or event.get("field_name")
     doc_type = metadata.get("document_type") or ""
@@ -1815,6 +1889,7 @@ def _build_tms_update_review_intents_from_comparisons(
             continue
         seen.add(key)
         label = row.get("label") or target
+        write_supported, action_type, tool_args = _writeback_metadata_for_intent(report, target, value)
         intents.append({
             "order_id": order_id,
             "target": target,
@@ -1828,12 +1903,13 @@ def _build_tms_update_review_intents_from_comparisons(
             "confidence": "document_field_comparison",
             "context_id": context_id,
             "question": f"{label}: TMS nach Agent-/Operator-Prüfung auf Dokumentwert setzen?",
+            **({"action_type": action_type, "tool_args": tool_args} if write_supported and action_type and tool_args else {}),
             "guardrails": {
                 "trusted_source": True,
                 "effective_document_type": effective_doc_type,
                 "valid_field_evidence": True,
-                "write_supported": target in write_supported_targets,
-                "review_only": target not in write_supported_targets,
+                "write_supported": write_supported,
+                "review_only": not write_supported,
                 "blocker_finding_present": False,
                 "field_source_checked": field_source_checked,
                 "side_effects_created": False,
@@ -2176,7 +2252,7 @@ def run_document_activity_monitor(
                 pending["review_cards_created"] = len(review_cards)
                 pending["review_cards_duplicate"] = len(duplicate_review_cards)
                 processor_result["pending_action_summary"] = pending
-                processor_result["document_decision"] = "TMS-Freigabe-Kachel erstellt; wartet auf Bestätigung/Ablehnung"
+                processor_result["document_decision"] = "Review-Kachel erstellt; wartet auf fachliche Bestätigung/Ablehnung"
             if duplicate_review_cards:
                 processor_result["duplicate_tms_review_cards"] = duplicate_review_cards
                 pending_raw = processor_result.get("pending_action_summary")

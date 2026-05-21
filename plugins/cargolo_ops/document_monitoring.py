@@ -72,12 +72,38 @@ def _shipment_context(tms_snapshot: dict[str, Any]) -> dict[str, Any]:
         detail = {}
     origin = detail.get("origin") if isinstance(detail.get("origin"), dict) else {}
     destination = detail.get("destination") if isinstance(detail.get("destination"), dict) else {}
-    totals = tms_snapshot.get("totals") if isinstance(tms_snapshot.get("totals"), dict) else {}
-    cargo_rows = detail.get("cargo") if isinstance(detail.get("cargo"), list) else []
+    raw_totals = tms_snapshot.get("totals") if isinstance(tms_snapshot, dict) else None
+    totals: dict[str, Any] = raw_totals if isinstance(raw_totals, dict) else {}
+    raw_cargo_rows = detail.get("cargo")
+    cargo_rows = [row for row in raw_cargo_rows if isinstance(row, dict)] if isinstance(raw_cargo_rows, list) else []
     cargo_description = ""
+    cargo_pieces = None
+    cargo_weight = None
+    cargo_volume = None
+
+    def number_or_none(value: Any) -> float | None:
+        try:
+            if value in (None, ""):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    def sum_numeric(values: list[Any]) -> float | Any | None:
+        numbers = [number for number in (number_or_none(value) for value in values) if number is not None]
+        if numbers:
+            return sum(numbers)
+        return values[0] if len(values) == 1 else None
+
     if cargo_rows:
-        first_cargo = next((row for row in cargo_rows if isinstance(row, dict)), {})
+        first_cargo = cargo_rows[0]
         cargo_description = str(first_cargo.get("description") or first_cargo.get("goods_description") or "").strip()
+        quantities = [row.get("quantity") for row in cargo_rows if row.get("quantity") not in (None, "")]
+        weights = [row.get("weight_kg") for row in cargo_rows if row.get("weight_kg") not in (None, "")]
+        volumes = [row.get("volume_m3") for row in cargo_rows if row.get("volume_m3") not in (None, "")]
+        cargo_pieces = sum_numeric(quantities)
+        cargo_weight = sum_numeric(weights)
+        cargo_volume = sum_numeric(volumes)
     customer = detail.get("customer") if isinstance(detail.get("customer"), dict) else {}
     customer_name = (
         customer.get("company_name")
@@ -102,9 +128,9 @@ def _shipment_context(tms_snapshot: dict[str, Any]) -> dict[str, Any]:
         "destination_city": destination.get("city") or detail.get("destination_city"),
         "destination_country": destination.get("country") or destination.get("country_code") or detail.get("destination_country"),
         "incoterms": detail.get("incoterms") or detail.get("incoterm"),
-        "pieces": totals.get("total_pieces") or detail.get("pieces") or detail.get("total_pieces"),
-        "weight_kg": totals.get("total_weight_kg") or detail.get("weight_kg") or detail.get("total_weight_kg"),
-        "volume_m3": totals.get("total_volume_m3") or detail.get("volume_m3") or detail.get("total_volume_m3"),
+        "pieces": totals.get("total_pieces") or detail.get("pieces") or detail.get("total_pieces") or cargo_pieces,
+        "weight_kg": totals.get("total_weight_kg") or detail.get("weight_kg") or detail.get("total_weight_kg") or cargo_weight,
+        "volume_m3": totals.get("total_volume_m3") or detail.get("volume_m3") or detail.get("total_volume_m3") or cargo_volume,
         "cargo_description": cargo_description or detail.get("cargo_description"),
     }
 

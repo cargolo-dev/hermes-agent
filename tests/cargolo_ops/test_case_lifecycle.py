@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from plugins.cargolo_ops.case_lifecycle import mirror_tms_documents, sync_case_lifecycle
+from plugins.cargolo_ops.case_lifecycle import (
+    mirror_tms_documents,
+    sync_case_lifecycle,
+    _enrich_tms_snapshot_with_cached_detail,
+)
 from plugins.cargolo_ops.models import TMSSnapshot
 from plugins.cargolo_ops.storage import CaseStore
 
@@ -24,6 +28,55 @@ def test_case_store_creates_canonical_lifecycle_directories(tmp_path):
     ]:
         assert (case_root / rel).is_dir(), rel
     assert (case_root / "documents" / "registry.json").exists()
+
+
+def test_enrich_tms_snapshot_uses_cached_cargo_after_partial_read(tmp_path):
+    case_root = CaseStore(tmp_path).ensure_case("AN-12258")
+    cached_detail = {
+        "shipment_number": "AN-12258",
+        "status": "in_transit",
+        "cargo": [{"quantity": 2, "weight_kg": 910, "volume_m3": 4.4}],
+    }
+    (case_root / "tms" / "shipment_detail.json").write_text(json.dumps(cached_detail), encoding="utf-8")
+
+    enriched = _enrich_tms_snapshot_with_cached_detail(
+        case_root=case_root,
+        tms_snapshot={"status": "error", "detail": {"documents": []}, "warnings": ["snapshot_failed"]},
+    )
+
+    assert enriched["detail"]["cargo"][0]["weight_kg"] == 910
+    assert enriched["status"] == "in_transit"
+    assert "used_cached_tms_shipment_detail_after_partial_snapshot" in enriched["warnings"]
+
+
+def test_enrich_tms_snapshot_replaces_empty_current_cargo_with_cached_cargo(tmp_path):
+    case_root = CaseStore(tmp_path).ensure_case("AN-12258")
+    cached_detail = {
+        "shipment_number": "AN-12258",
+        "status": "in_transit",
+        "cargo": [{"quantity": 2, "weight_kg": 910, "volume_m3": 4.4}],
+    }
+    (case_root / "tms" / "shipment_detail.json").write_text(json.dumps(cached_detail), encoding="utf-8")
+
+    enriched = _enrich_tms_snapshot_with_cached_detail(
+        case_root=case_root,
+        tms_snapshot={"status": "error", "detail": {"cargo": [], "documents": []}},
+    )
+
+    assert enriched["detail"]["cargo"] == cached_detail["cargo"]
+
+
+def test_enrich_tms_snapshot_does_not_treat_empty_cargo_row_as_operational(tmp_path):
+    case_root = CaseStore(tmp_path).ensure_case("AN-12258")
+    cached_detail = {"shipment_number": "AN-12258", "cargo": [{"quantity": 2, "weight_kg": 910}]}
+    (case_root / "tms" / "shipment_detail.json").write_text(json.dumps(cached_detail), encoding="utf-8")
+
+    enriched = _enrich_tms_snapshot_with_cached_detail(
+        case_root=case_root,
+        tms_snapshot={"status": "error", "detail": {"cargo": [{}]}},
+    )
+
+    assert enriched["detail"]["cargo"] == cached_detail["cargo"]
 
 
 def test_sync_case_lifecycle_skips_unknown_tms_case_without_folder_or_mail_history(tmp_path):

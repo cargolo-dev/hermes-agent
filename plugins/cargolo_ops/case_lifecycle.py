@@ -164,6 +164,68 @@ def _persist_tms_evidence_sidecars(
     store.append_tms_sync_log(order_id, sync_log)
 
 
+def _detail_has_operational_cargo(detail: Any) -> bool:
+    if not isinstance(detail, dict):
+        return False
+    cargo = detail.get("cargo")
+    cargo_keys = ("quantity", "pieces", "weight_kg", "total_weight_kg", "volume_m3", "total_volume_m3", "description", "goods_description")
+    if isinstance(cargo, list):
+        for row in cargo:
+            if isinstance(row, dict) and any(row.get(key) not in (None, "", [], {}) for key in cargo_keys):
+                return True
+    return any(detail.get(key) not in (None, "", [], {}) for key in ("pieces", "total_pieces", "weight_kg", "total_weight_kg", "volume_m3", "total_volume_m3"))
+
+
+def _enrich_tms_snapshot_with_cached_detail(*, case_root: Path, tms_snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Keep document monitoring from treating transient TMS read errors as empty TMS data.
+
+    The live MCP snapshot can occasionally return an error/partial shell while the
+    sidecar `tms/shipment_detail.json` from the last successful read still contains
+    the operational cargo rows. For read-only reconciliation it is safer to use
+    that cached detail with an explicit warning than to say fields are "not
+    gepflegt" and create misleading review cards.
+    """
+    if not isinstance(tms_snapshot, dict):
+        return tms_snapshot
+    raw_detail = tms_snapshot.get("detail")
+    detail: dict[str, Any] = raw_detail if isinstance(raw_detail, dict) else {}
+    if _detail_has_operational_cargo(detail):
+        return tms_snapshot
+    cached_path = case_root / "tms" / "shipment_detail.json"
+    if not cached_path.exists():
+        return tms_snapshot
+    try:
+        cached_detail = json.loads(cached_path.read_text(encoding="utf-8"))
+    except Exception:
+        return tms_snapshot
+    if not _detail_has_operational_cargo(cached_detail):
+        return tms_snapshot
+    merged_detail = {
+        **(cached_detail if isinstance(cached_detail, dict) else {}),
+        **(detail if isinstance(detail, dict) else {}),
+    }
+    # Preserve fresh document rows from the current read, but fill operational
+    # cargo/route fields from the previous successful detail if the current read
+    # was only an error shell.
+    for key in ("cargo", "origin", "destination", "parties", "transport_legs", "freight_details"):
+        current_value = detail.get(key)
+        if key == "cargo":
+            current_is_empty = not _detail_has_operational_cargo({"cargo": current_value})
+        else:
+            current_is_empty = current_value in (None, "", [], {})
+        if current_is_empty and isinstance(cached_detail, dict) and key in cached_detail:
+            merged_detail[key] = cached_detail[key]
+    enriched = {**tms_snapshot, "detail": merged_detail}
+    if str(enriched.get("status") or "").strip().lower() in {"", "error", "unknown"} and isinstance(cached_detail, dict):
+        enriched["status"] = cached_detail.get("status") or enriched.get("status")
+    warnings = [str(item) for item in enriched.get("warnings", []) if item] if isinstance(enriched.get("warnings"), list) else []
+    warning = "used_cached_tms_shipment_detail_after_partial_snapshot"
+    if warning not in warnings:
+        warnings.append(warning)
+    enriched["warnings"] = warnings
+    return enriched
+
+
 def _download_tms_document(url: str, target: Path, *, headers: dict[str, str] | None = None) -> tuple[bool, str | None]:
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -335,6 +397,7 @@ def sync_case_lifecycle(
 
     case_existed = store.order_path(order_id).exists()
     case_root = store.ensure_case(order_id)
+    tms_snapshot = _enrich_tms_snapshot_with_cached_detail(case_root=case_root, tms_snapshot=tms_snapshot)
     state = store.load_case_state(order_id)
     prior_registry = store.load_document_registry(order_id)
     _persist_tms_evidence_sidecars(

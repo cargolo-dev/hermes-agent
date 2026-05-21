@@ -487,6 +487,51 @@ def test_explicit_approval_applies_pending_tms_action_and_verifies(tmp_path: Pat
     assert any(row["action"] == "teams_tms_update_applied" for row in audit)
 
 
+def test_explicit_approval_applies_cargo_item_update_directly(tmp_path: Path) -> None:
+    root = tmp_path / "cargolo_asr"
+    (root / "orders" / "AN-12354" / "teams").mkdir(parents=True)
+    pending_path = root / "orders" / "AN-12354" / "teams" / "pending_tms_actions.jsonl"
+    pending_path.write_text(
+        json.dumps({
+            "timestamp": "2026-05-21T07:14:00Z",
+            "status": "pending_review",
+            "order_id": "AN-12354",
+            "context_id": "AN-12354:document_monitor",
+            "target": "cargo_weight_kg",
+            "value": "2464",
+            "action_type": "cargo_item_update",
+            "tool_args": {"cargo_item_id": "cargo-12354", "weight_kg": 2464, "total_weight_kg": 2464},
+            "write_supported": True,
+            "write_policy": "no_auto_write_without_review",
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    calls: list[tuple[dict, dict]] = []
+
+    def fake_apply(action: dict, context: dict) -> dict:
+        calls.append((action, context))
+        return {"status": "applied", "executed_tool": "cargolo_tms_update_cargo_item"}
+
+    result = handle_teams_message(
+        root=root,
+        text="AN-12354 freigegeben, bitte 2464 jetzt ins TMS schreiben",
+        chat_id="teams-chat",
+        user_name="Operator",
+        message_id="reply-approve-cargo",
+        enable_tms_writeback=True,
+        apply_tms_update=fake_apply,
+        verify_tms_value=lambda order_id, target: "2464",
+    )
+
+    assert result["derived_action"]["type"] == "tms_update_applied"
+    assert calls[0][0] == {
+        "action_type": "cargo_item_update",
+        "target": "cargo_weight_kg",
+        "suggested_value": "2464",
+        "tool_args": {"cargo_item_id": "cargo-12354", "weight_kg": 2464, "total_weight_kg": 2464},
+        "source": "teams_reply_explicit_approval",
+    }
+
 
 
 def test_parallel_card_approvals_claim_pending_action_once(tmp_path: Path) -> None:
@@ -1004,6 +1049,54 @@ def test_teams_button_approve_applies_and_verifies_pending_action(tmp_path: Path
     assert queue[-1]["status"] == "applied"
     assert queue[-1]["approved_by"] == "Dominik"
     assert queue[-1]["verified_value"] == "26DE99999"
+
+
+def test_teams_button_approve_applies_cargo_item_update_action(tmp_path: Path) -> None:
+    from plugins.cargolo_ops.teams_reply_loop import record_agent_tms_update_intent, process_teams_tms_card_action
+
+    root = tmp_path / "cargolo_asr"
+    queued = record_agent_tms_update_intent(
+        root=root,
+        order_id="AN-12354",
+        target="cargo_pieces",
+        value="112",
+        text="Packstücke aus Angebot übernehmen",
+        operator="Hermes Agent",
+        context_id="AN-12354:card",
+        write_supported=True,
+        action_type="cargo_item_update",
+        tool_args={"cargo_item_id": "cargo-12354", "quantity": 112},
+    )
+    applied = []
+
+    def fake_apply(action, context):
+        applied.append((action, context))
+        return {"status": "applied", "executed_tool": "cargolo_tms_update_cargo_item"}
+
+    result = process_teams_tms_card_action(
+        root=root,
+        data={
+            "hermes_action": "cargolo_asr_tms_approve",
+            "order_id": "AN-12354",
+            "action_id": queued["action_id"],
+            "target": "cargo_pieces",
+            "value": "112",
+        },
+        user_id="u-1",
+        user_name="Dominik",
+        enable_tms_writeback=True,
+        apply_tms_update=fake_apply,
+        verify_tms_value=lambda order_id, target: "112",
+    )
+
+    assert result["status"] == "applied"
+    assert applied[0][0] == {
+        "action_type": "cargo_item_update",
+        "target": "cargo_pieces",
+        "suggested_value": "112",
+        "tool_args": {"cargo_item_id": "cargo-12354", "quantity": 112},
+        "source": "teams_reply_explicit_approval",
+    }
 
 
 def test_teams_button_approve_blocks_when_writeback_disabled(tmp_path: Path) -> None:

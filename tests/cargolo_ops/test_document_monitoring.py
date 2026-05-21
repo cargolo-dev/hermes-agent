@@ -14,6 +14,7 @@ from plugins.cargolo_ops.document_activity_monitor import (
     _processor_result_from_report,
     _queue_document_review_card_results,
     _queue_document_review_cards,
+    _writeback_metadata_for_intent,
     run_document_activity_monitor,
 )
 from plugins.cargolo_ops.document_schema import normalize_mode
@@ -263,6 +264,23 @@ def test_shipment_context_includes_customer_reference_for_document_cards():
     context = _shipment_context({"detail": {"customer_reference": "AA2500432", "network": "rail", "status": "in_transit"}})
 
     assert context["customer_reference"] == "AA2500432"
+
+
+def test_shipment_context_uses_cargo_rows_for_piece_weight_volume_totals():
+    context = _shipment_context({
+        "detail": {
+            "network": "rail",
+            "status": "in_transit",
+            "cargo": [
+                {"quantity": 2, "weight_kg": 910, "volume_m3": 4.4, "goods_description": "Displays"},
+            ],
+        }
+    })
+
+    assert context["pieces"] == 2
+    assert context["weight_kg"] == 910
+    assert context["volume_m3"] == 4.4
+    assert context["cargo_description"] == "Displays"
 
 
 def test_reconciliation_does_not_turn_missing_docs_alone_into_risk():
@@ -696,7 +714,7 @@ def test_processor_result_prefers_populated_tms_totals_over_cargo_rows(tmp_path)
     assert "Gewicht weicht ab: TMS (totals) 900 kg, Dokument 852" in message
 
 
-def test_weight_and_piece_discrepancies_create_review_only_cards(tmp_path):
+def test_weight_and_piece_discrepancies_create_direct_write_cards_when_cargo_row_is_addressable(tmp_path):
     filename = "angebot.pdf"
     analysis_path = tmp_path / "angebot_analysis.json"
     registry_path = tmp_path / "registry.json"
@@ -721,6 +739,7 @@ def test_weight_and_piece_discrepancies_create_review_only_cards(tmp_path):
             {
                 "detail": {
                     "totals": {"total_pieces": 111, "total_weight_kg": 22},
+                    "cargo": [{"id": "cargo-12354", "quantity": 111, "weight_kg": 22, "total_weight_kg": 22}],
                     "freight_details": {},
                     "transport_legs": [],
                 }
@@ -748,8 +767,8 @@ def test_weight_and_piece_discrepancies_create_review_only_cards(tmp_path):
     assert comparisons["Packstücke"]["status"] == "diff"
     assert comparisons["Gewicht"]["status"] == "diff"
     assert [(intent["target"], intent["value"], intent["guardrails"]["write_supported"], intent["guardrails"]["review_only"]) for intent in result["document_review_intents"]] == [
-        ("cargo_pieces", "112", False, True),
-        ("cargo_weight_kg", "2.464 kg", False, True),
+        ("cargo_pieces", "112", True, False),
+        ("cargo_weight_kg", "2.464 kg", True, False),
     ]
 
     cards = _queue_document_review_cards(
@@ -759,17 +778,46 @@ def test_weight_and_piece_discrepancies_create_review_only_cards(tmp_path):
         event={"id": 1895, "changed_at": "2026-05-21T07:14:00Z", "metadata": {"file_name": filename, "document_type": "offer"}},
     )
 
-    assert [(card["target"], card["value"], card["write_supported"]) for card in cards] == [
-        ("cargo_pieces", "112", False),
-        ("cargo_weight_kg", "2.464 kg", False),
+    assert [(card["target"], card["value"], card["write_supported"], card.get("action_type")) for card in cards] == [
+        ("cargo_pieces", "112", True, "cargo_item_update"),
+        ("cargo_weight_kg", "2.464 kg", True, "cargo_item_update"),
     ]
     pending_path = tmp_path / "orders" / "AN-12354" / "teams" / "pending_tms_actions.jsonl"
     queue = [json.loads(line) for line in pending_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert [(row["target"], row["value"], row["status"], row["write_policy"], row["write_supported"]) for row in queue] == [
-        ("cargo_pieces", "112", "pending_review", "no_auto_write_without_review", False),
-        ("cargo_weight_kg", "2.464 kg", "pending_review", "no_auto_write_without_review", False),
+    assert [(row["target"], row["value"], row["status"], row["write_policy"], row["write_supported"], row.get("action_type")) for row in queue] == [
+        ("cargo_pieces", "112", "pending_review", "no_auto_write_without_review", True, "cargo_item_update"),
+        ("cargo_weight_kg", "2.464 kg", "pending_review", "no_auto_write_without_review", True, "cargo_item_update"),
     ]
+    assert queue[0]["tool_args"] == {"cargo_item_id": "cargo-12354", "quantity": 112}
+    assert queue[1]["tool_args"] == {"cargo_item_id": "cargo-12354", "weight_kg": 2464, "total_weight_kg": 2464}
     assert not (tmp_path / "orders" / "AN-12354" / "teams" / "applied_tms_actions.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("cargo_rows", "expected"),
+    [
+        ([{"quantity": 111, "weight_kg": 22}], False),
+        ([{"id": "cargo-a", "quantity": 50, "weight_kg": 10}, {"id": "cargo-b", "quantity": 61, "weight_kg": 12}], False),
+        ([{"id": "cargo-a", "quantity": 111, "weight_kg": 22}], True),
+    ],
+)
+def test_cargo_writeback_metadata_requires_single_addressable_cargo_row(tmp_path, cargo_rows, expected):
+    snapshot_path = tmp_path / "snapshot.json"
+    snapshot_path.write_text(
+        json.dumps({"detail": {"cargo": cargo_rows, "totals": {"total_pieces": 111, "total_weight_kg": 22}}}),
+        encoding="utf-8",
+    )
+    report = {"lifecycle": {"tms_snapshot_path": str(snapshot_path)}}
+
+    write_supported, action_type, tool_args = _writeback_metadata_for_intent(report, "cargo_pieces", "112")
+
+    assert write_supported is expected
+    if expected:
+        assert action_type == "cargo_item_update"
+        assert tool_args == {"cargo_item_id": "cargo-a", "quantity": 112}
+    else:
+        assert action_type is None
+        assert tool_args is None
 
 
 def test_processor_result_rejects_generic_or_stale_external_review_for_unreadable_upload():

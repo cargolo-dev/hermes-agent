@@ -170,6 +170,38 @@ def test_apply_pending_tms_action_maps_transport_leg_update(monkeypatch):
     ]
 
 
+def test_apply_pending_tms_action_maps_cargo_item_update(monkeypatch):
+    provider = _FakeWriteProvider()
+    monkeypatch.setattr(
+        "plugins.cargolo_ops.writeback_actions.build_tms_write_provider_from_env",
+        lambda: provider,
+    )
+
+    result = apply_pending_tms_action(
+        {
+            "action_type": "cargo_item_update",
+            "target": "cargo_weight_kg",
+            "tool_args": {"cargo_item_id": "cargo-12354", "weight_kg": 2464, "total_weight_kg": 2464},
+        },
+        {"order_id": "AN-12354"},
+        admin_user_id=106,
+    )
+
+    assert result["status"] == "applied"
+    assert provider.calls == [
+        (
+            "update_cargo_item",
+            {
+                "an": "AN-12354",
+                "admin_user_id": 106,
+                "cargo_item_id": "cargo-12354",
+                "weight_kg": 2464,
+                "total_weight_kg": 2464,
+            },
+        )
+    ]
+
+
 def test_build_tms_pending_updates_adds_status_and_document_upload_actions(tmp_path):
     source = tmp_path / "invoice.txt"
     source.write_text("invoice", encoding="utf-8")
