@@ -2392,6 +2392,11 @@ def test_cross_document_current_value_matching_tms_stays_case_context_without_ca
     )
 
     assert any(row["type"] == "cross_document_piece_mismatch" for row in result["document_cross_document_comparison"])
+    assert "Dokumentkonflikt Gewicht:" in result["message"]
+    assert "2391.4 kg" in result["message"] and "2464 kg" in result["message"]
+    assert "Dokumentkonflikt Packstücke:" in result["message"]
+    assert "110" in result["message"] and "112" in result["message"]
+    assert result["document_agent_evidence_packet"]["deterministic_evidence"]["cross_document_conflict_lines"]
     assert [(intent["target"], intent["value"], intent["source"]) for intent in result["document_review_intents"]] == [
         ("cargo_weight_kg", "2464 kg", "document_activity_monitor"),
     ]

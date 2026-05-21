@@ -141,6 +141,56 @@ def _finding_text(row: Any) -> str:
     return f"{filename}: {summary}" if filename else summary
 
 
+def _short_document_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "Dokument"
+    text = Path(text).name
+    return text[:42] + "…" if len(text) > 43 else text
+
+
+def _format_cross_document_value(target: str, value: Any) -> str:
+    number = _number_from_value(value)
+    if number is None:
+        return str(value or "").strip()
+    formatted = _format_number(number)
+    if target == "cargo_weight_kg":
+        return f"{formatted} kg"
+    return formatted
+
+
+def _cross_document_conflict_lines(rows: list[dict[str, Any]] | None, *, limit: int = 2) -> list[str]:
+    """Return compact operator-facing document-vs-document value groups."""
+    lines: list[str] = []
+    for row in rows or []:
+        if not isinstance(row, dict) or row.get("status") != "conflict":
+            continue
+        target = str(row.get("target") or "").strip()
+        if target not in {"cargo_weight_kg", "cargo_pieces"}:
+            continue
+        raw_docs = row.get("documents")
+        docs: list[Any] = raw_docs if isinstance(raw_docs, list) else []
+        groups: dict[str, list[str]] = {}
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            value = _format_cross_document_value(target, doc.get("normalized") if doc.get("normalized") is not None else doc.get("raw"))
+            if not value:
+                continue
+            groups.setdefault(value, []).append(_short_document_name(doc.get("filename")))
+        if len(groups) < 2:
+            continue
+        parts = []
+        for value, names in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))[:4]:
+            suffix = f" +{len(names) - 2}" if len(names) > 2 else ""
+            parts.append(f"{value} ({', '.join(names[:2])}{suffix})")
+        label = str(row.get("label") or ("Gewicht" if target == "cargo_weight_kg" else "Packstücke"))
+        lines.append(f"Dokumentkonflikt {label}: " + " vs. ".join(parts))
+        if len(lines) >= limit:
+            break
+    return lines
+
+
 def _route_hint(context: dict[str, Any]) -> str:
     parts = []
     for city_key, country_key in (("origin_city", "origin_country"), ("destination_city", "destination_country")):
@@ -1121,6 +1171,7 @@ def _build_document_agent_evidence_packet(
     comparisons: list[dict[str, str]],
     evidence_lines: list[str],
     document_review_intents: list[dict[str, Any]],
+    cross_document_conflict_lines: list[str] | None = None,
     case_risk: str = "low",
     case_needs_review: bool = False,
     current_upload_review: dict[str, Any] | None = None,
@@ -1185,6 +1236,7 @@ def _build_document_agent_evidence_packet(
             "readable_evidence_lines": evidence_lines,
             "findings": findings,
             "safe_tms_review_intents": document_review_intents,
+            "cross_document_conflict_lines": cross_document_conflict_lines or [],
             "cross_document_comparisons": cross_document_comparisons or [],
         },
         "guardrails": {
@@ -1346,6 +1398,21 @@ def _message_from_agent_review(order_id: Any, review: dict[str, Any]) -> str:
     ])
 
 
+def _ensure_cross_document_conflicts_visible(message: str, lines: list[str]) -> str:
+    if not lines:
+        return message
+    missing = [line for line in lines if line and _norm(line.split(":", 1)[0]) not in _norm(message)]
+    if not missing:
+        return message
+    addition = " | ".join(missing[:2])
+    parts = message.splitlines()
+    for index, line in enumerate(parts):
+        if line.startswith("Auffällig:"):
+            parts[index] = line.rstrip() + " | " + addition
+            return "\n".join(parts)
+    return message.rstrip() + "\nAuffällig: " + addition
+
+
 def _human_document_message(
     *,
     order_id: Any,
@@ -1356,6 +1423,7 @@ def _human_document_message(
     needs_review: bool,
     comparisons: list[dict[str, str]] | None = None,
     evidence_lines: list[str] | None = None,
+    cross_document_conflict_lines: list[str] | None = None,
     uploaded_by: Any = None,
     uploaded_at: Any = None,
 ) -> str:
@@ -1436,6 +1504,13 @@ def _human_document_message(
                 break
         blocker_lines.extend(review_topic_lines)
     auffaellig_items = problems + blocker_lines
+    cross_document_conflict_lines = cross_document_conflict_lines or []
+    if cross_document_conflict_lines:
+        existing_text = " ".join(auffaellig_items).lower()
+        for line in cross_document_conflict_lines:
+            key_bits = [bit for bit in ("dokumentkonflikt gewicht" if "Gewicht" in line else "dokumentkonflikt packstücke", line.split(":", 1)[0].lower()) if bit]
+            if not any(bit and bit in existing_text for bit in key_bits):
+                auffaellig_items.append(line)
     if auffaellig_items:
         auffaellig = " | ".join(auffaellig_items[:4])
         supported_card_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage", "pol", "pod", "cargo_weight_kg", "cargo_pieces"}
@@ -2050,6 +2125,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
     comparisons = _build_document_field_comparison(report, str(filename))
     raw_cross_document = reconciliation.get("cross_document_comparisons")
     cross_document_comparisons = raw_cross_document if isinstance(raw_cross_document, list) else []
+    cross_document_conflict_lines = _cross_document_conflict_lines(cross_document_comparisons)
     evidence_lines = _build_document_evidence_lines(report, str(filename))
     document_review_intents = _build_tms_update_review_intents_from_comparisons(report=report, event=event, comparisons=comparisons, findings=findings)
     document_review_intents.extend(_build_cross_document_review_intents(
@@ -2081,6 +2157,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         comparisons=comparisons,
         evidence_lines=evidence_lines,
         document_review_intents=document_review_intents,
+        cross_document_conflict_lines=cross_document_conflict_lines,
         case_risk=case_risk,
         case_needs_review=case_needs_review,
         current_upload_review=current_upload_review,
@@ -2100,6 +2177,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         needs_review=needs_review,
         comparisons=comparisons,
         evidence_lines=evidence_lines,
+        cross_document_conflict_lines=cross_document_conflict_lines,
         uploaded_by=event.get("changed_by_name") or event.get("changed_by"),
         uploaded_at=event.get("changed_at"),
     )
@@ -2109,6 +2187,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         needs_review = bool(needs_review or document_review_intents or agent_review.get("needs_review"))
     else:
         message = fallback_message
+    message = _ensure_cross_document_conflicts_visible(message, cross_document_conflict_lines)
     pending_review = 1 if (needs_review or document_review_intents) else 0
     review_count = len(document_review_intents)
     side_effects = {"tms_updates": 0, "queued_tms_actions": 0, "customer_notifications": 0}
