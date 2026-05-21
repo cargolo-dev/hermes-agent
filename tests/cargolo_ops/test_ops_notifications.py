@@ -264,7 +264,7 @@ def test_document_activity_notification_mentions_created_and_existing_review_car
         },
     )
 
-    assert "TMS-Freigabe-Kachel" in body["message_text"]
+    assert "Review-Kachel" in body["message_text"]
     assert "Zusätzlich existiert bereits eine offene Review-Kachel" in body["message_text"]
     assert "container_number XHCU2996441" in body["message_text"]
     assert "Vorher wurde nichts im TMS geändert" in body["message_text"]

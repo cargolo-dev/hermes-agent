@@ -522,7 +522,8 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
                         duplicate_bits.append(f"{target} {value}".strip())
                 duplicate_text = ", ".join(bit for bit in duplicate_bits if bit)
                 duplicate_suffix = f" Zusätzlich existiert bereits eine offene Review-Kachel{f' ({duplicate_text})' if duplicate_text else ''}."
-            naechster = f"Bitte die separate TMS-Freigabe-Kachel bestätigen oder ablehnen ({card_count} offen).{duplicate_suffix} Vorher wurde nichts im TMS geändert."
+            label = "Review-Kachel" if card_count == 1 else "Review-Kacheln"
+            naechster = f"Bitte die separate(n) {label} bestätigen oder ablehnen ({card_count} offen).{duplicate_suffix} Vorher wurde nichts im TMS geändert."
         elif duplicate_count:
             duplicate_bits = []
             for card in duplicate_cards[:2]:
@@ -544,7 +545,8 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
     review_card_count = len(result.get("teams_tms_review_cards") if isinstance(result.get("teams_tms_review_cards"), list) else [])
     subline_bits = [order_id, doc_type]
     if review_card_count:
-        subline_bits.append(f"{review_card_count} TMS-Freigabe{'n' if review_card_count != 1 else ''} wartet")
+        label = "Review-Kachel offen" if review_card_count == 1 else "Review-Kacheln offen"
+        subline_bits.append(f"{review_card_count} {label}")
     else:
         subline_bits.append("TMS unverändert")
 
