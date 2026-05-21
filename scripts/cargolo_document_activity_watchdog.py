@@ -187,6 +187,10 @@ def main() -> int:
         "HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_CMD",
         str(REPO_ROOT / "venv-py312" / "bin" / "python") + " " + str(REPO_ROOT / "scripts" / "cargolo_document_agent_review.py"),
     )
+    # Cron kills no_agent scripts at 300s. Keep the optional LLM review
+    # comfortably below that budget and process only one fresh upload per tick;
+    # older events stay retryable through the activity cursor.
+    os.environ.setdefault("HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_TIMEOUT", "45")
     # The TMS activity log can be slow without a bounded time window. The
     # monitor also keeps an activity-ID cursor, so a short rolling window is
     # enough for the frequent watchdog while preventing unbounded scans.
@@ -194,7 +198,7 @@ def main() -> int:
     latest_path = Path.home() / ".hermes" / "cargolo_asr" / "runtime" / "document_activity_monitor_watchdog_latest.json"
     latest_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        result = run_document_activity_monitor(max_events=5, per_page=50, baseline_now=baseline_now, date_from=date_from)
+        result = run_document_activity_monitor(max_events=1, per_page=25, baseline_now=baseline_now, date_from=date_from)
         latest_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         text = _format_report(result)
         if text:

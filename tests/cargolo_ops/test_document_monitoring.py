@@ -245,6 +245,138 @@ def test_document_agent_packet_carries_employee_quality_rubric():
     assert packet["guardrails"]["writes_allowed"] is False
 
 
+def test_processor_result_uses_tms_cargo_items_and_soft_currency_uncertainty(tmp_path):
+    filename = "GZ20260421 Packing List and Invoice_German.xlsx"
+    analysis_path = tmp_path / "invoice_analysis.json"
+    registry_path = tmp_path / "registry.json"
+    snapshot_path = tmp_path / "tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": filename,
+                "doc_type": "commercial_invoice",
+                "suggested_registry_types": ["commercial_invoice", "packing_list"],
+                "extracted_fields": {
+                    "invoice_number": "GZ20260421",
+                    "amount": "13915",
+                    "currency": "USD",
+                    "pieces": "52",
+                    "packaging_type": "CTNS",
+                    "gross_weight": "852",
+                    "goods_value": "13915",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps({"analyzed_documents": [{"filename": filename, "analysis_path": str(analysis_path), "analysis_doc_type": "commercial_invoice"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "totals": {"total_weight_kg": None},
+                    "cargo": [{"quantity": 52, "weight_kg": 851, "total_weight_kg": 44252}],
+                    "freight_details": {},
+                    "transport_legs": [],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("plugins.cargolo_ops.document_activity_monitor._run_document_agent_review", return_value=None):
+        result = _processor_result_from_report(
+            {
+                "order_id": "AN-12405",
+                "tms_context": {"status": "in_transit", "network": "rail", "pieces": None, "weight_kg": None},
+                "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+                "registry_summary": {},
+                "reconciliation": {
+                    "risk": "medium",
+                    "needs_human_review": True,
+                    "findings": [
+                        {"type": "document_open_question", "severity": "low", "filename": filename, "summary": "Währung (Currency) nicht explizit genannt, aber im Kontext China-Export meist USD"}
+                    ],
+                },
+            },
+            {"id": 1893, "changed_at": 1779261294989, "changed_by_name": "Hendrik Lüdeking", "metadata": {"file_name": filename, "document_type": "commercial_invoice"}},
+        )
+
+    comparisons = {row["label"]: row for row in result["document_field_comparison"]}
+    assert comparisons["Packstücke"]["status"] == "match"
+    assert comparisons["Packstücke"]["source"] == "cargo_items.quantity"
+    assert comparisons["Gewicht"]["status"] == "near_match"
+    assert comparisons["Gewicht"]["source"] == "cargo_items.weight_kg"
+    assert "total_weight_kg wirkt rechnerisch auffällig" in comparisons["Gewicht"]["note"]
+    message = result["message"]
+    assert "Packstücke passt" in message
+    assert "Gewicht nahezu passend" in message
+    assert "fehlt im TMS" not in message
+    assert "USD extrahiert" in result["document_reconciliation"]["findings"][0]["summary"]
+
+
+def test_processor_result_prefers_populated_tms_totals_over_cargo_rows(tmp_path):
+    filename = "invoice.pdf"
+    analysis_path = tmp_path / "invoice_analysis.json"
+    registry_path = tmp_path / "registry.json"
+    snapshot_path = tmp_path / "tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": filename,
+                "doc_type": "commercial_invoice",
+                "extracted_fields": {"pieces": "52", "gross_weight": "852"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps({"analyzed_documents": [{"filename": filename, "analysis_path": str(analysis_path), "analysis_doc_type": "commercial_invoice"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "totals": {"total_pieces": 50, "total_weight_kg": 900},
+                    "cargo": [{"quantity": 52, "weight_kg": 851, "total_weight_kg": 44252}],
+                    "freight_details": {},
+                    "transport_legs": [],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("plugins.cargolo_ops.document_activity_monitor._run_document_agent_review", return_value=None):
+        result = _processor_result_from_report(
+            {
+                "order_id": "AN-TOTALS",
+                "tms_context": {"status": "in_transit", "network": "rail"},
+                "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+                "registry_summary": {},
+                "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+            },
+            {"id": 1894, "changed_at": "2026-05-20T07:14:00Z", "metadata": {"file_name": filename, "document_type": "commercial_invoice"}},
+        )
+
+    comparisons = {row["label"]: row for row in result["document_field_comparison"]}
+    assert comparisons["Packstücke"]["source"] == "totals"
+    assert comparisons["Packstücke"]["status"] == "diff"
+    assert comparisons["Gewicht"]["source"] == "totals"
+    assert comparisons["Gewicht"]["status"] == "diff"
+    message = result["message"]
+    assert "Packstücke weicht ab: TMS (totals) 50, Dokument 52" in message
+    assert "Gewicht weicht ab: TMS (totals) 900 kg, Dokument 852" in message
+
+
 def test_processor_result_rejects_generic_or_stale_external_review_for_unreadable_upload():
     generic_review = {
         "mode": "external_agent",

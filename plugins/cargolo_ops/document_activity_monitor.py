@@ -285,6 +285,105 @@ def _same_location(tms_value: Any, doc_value: Any) -> bool:
     return tms_alias in doc or doc in tms_alias or tms in doc
 
 
+def _number_from_value(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.search(r"[-+]?\d[\d .,'’]*", text)
+    if not match:
+        return None
+    token = match.group(0).replace("'", "").replace("’", "").replace(" ", "")
+    if "," in token and "." in token:
+        if token.rfind(",") > token.rfind("."):
+            token = token.replace(".", "").replace(",", ".")
+        else:
+            token = token.replace(",", "")
+    elif "," in token:
+        token = token.replace(",", ".")
+    try:
+        return float(token)
+    except Exception:
+        return None
+
+
+def _format_number(value: float | int | None) -> str:
+    if value is None:
+        return ""
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.3f}".rstrip("0").rstrip(".")
+
+
+def _cargo_rows_from_detail(detail: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = detail.get("cargo") if isinstance(detail.get("cargo"), list) else []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _cargo_sum_value(rows: list[dict[str, Any]], key: str) -> float | None:
+    values: list[float] = []
+    for row in rows:
+        number = _number_from_value(row.get(key))
+        if number is not None:
+            values.append(number)
+    if not values:
+        return None
+    return sum(values)
+
+
+def _cargo_unit_value(rows: list[dict[str, Any]], key: str) -> float | None:
+    values = [_number_from_value(row.get(key)) for row in rows]
+    values = [value for value in values if value is not None]
+    if len(values) == 1:
+        return values[0]
+    return None
+
+
+def _tms_cargo_reference(detail: dict[str, Any], totals: dict[str, Any], target: str) -> tuple[str, str]:
+    """Return a TMS cargo value plus source label for document comparison.
+
+    Top-level TMS totals are the authoritative comparison source when they are
+    populated.  Cargo item rows are a fallback for snapshots where totals are
+    empty, so the monitor does not incorrectly say "missing in TMS" although
+    operational cargo rows are filled.  Avoid cargo-row total_weight_kg for the
+    displayed gross weight because some rows store quantity*weight there (as in
+    AN-12405); use it only as an inconsistency note elsewhere.
+    """
+    rows = _cargo_rows_from_detail(detail)
+    if target == "pieces":
+        total_value = _number_from_value(totals.get("pieces") or totals.get("total_pieces"))
+        if total_value is not None:
+            return _format_number(total_value), "totals"
+        cargo_value = _cargo_sum_value(rows, "quantity")
+        if cargo_value is not None:
+            return _format_number(cargo_value), "cargo_items.quantity"
+        return "", ""
+    if target == "weight":
+        total_weight = _number_from_value(totals.get("total_weight_kg") or totals.get("weight_kg"))
+        if total_weight is not None:
+            return f"{_format_number(total_weight)} kg", "totals"
+        cargo_weight = _cargo_unit_value(rows, "weight_kg")
+        if cargo_weight is None:
+            cargo_weight = _cargo_sum_value(rows, "weight_kg")
+        if cargo_weight is not None:
+            return f"{_format_number(cargo_weight)} kg", "cargo_items.weight_kg"
+        return "", ""
+    return "", ""
+
+
+def _numeric_comparison_status(tms: Any, doc: Any, *, tolerance: float = 0.0) -> str | None:
+    tms_number = _number_from_value(tms)
+    doc_number = _number_from_value(doc)
+    if tms_number is None or doc_number is None:
+        return None
+    diff = abs(tms_number - doc_number)
+    if diff == 0:
+        return "match"
+    if tolerance and diff <= tolerance:
+        return "near_match"
+    return "diff"
+
+
 def _is_date_like_mbl_candidate(value: Any) -> bool:
     text = str(value or "").strip()
     if not text:
@@ -369,6 +468,26 @@ def _has_blocker_finding(findings: list[Any]) -> bool:
         if severity == "blocker" or "blocker" in finding_type:
             return True
     return False
+
+
+def _normalize_uploaded_findings(findings: list[Any], uploaded: dict[str, Any], filename: str) -> list[Any]:
+    analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+    fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    currency = _clean(fields.get("currency"))
+    if not currency:
+        return findings
+    uploaded_norm = str(filename or "").strip().lower()
+    normalized: list[Any] = []
+    for row in findings:
+        if not isinstance(row, dict):
+            normalized.append(row)
+            continue
+        row_filename = str(row.get("filename") or "").strip().lower()
+        summary = str(row.get("summary") or "")
+        if row_filename == uploaded_norm and re.search(r"währung|currency", summary, re.IGNORECASE):
+            row = {**row, "summary": f"Währung {currency} extrahiert, aber Quelle/Explizitheit unsicher – für Zollwert prüfen."}
+        normalized.append(row)
+    return normalized
 
 
 def _effective_trusted_doc_type(event_doc_type: Any, uploaded: dict[str, Any], target: str, value: Any) -> str:
@@ -603,14 +722,37 @@ def _build_document_field_comparison(report: dict[str, Any], filename: str) -> l
     add("Container", freight.get("container_number"), container_doc, target="container_number", field="container_number")
     if vessel_doc or main_leg.get("carrier") or main_leg.get("vessel_name"):
         add("Schiff", main_leg.get("vessel_name") or main_leg.get("carrier"), vessel_doc, target="Vessel/Hauptlauf", field="vessel")
-    weight_doc = _clean(fields.get("weight_kg") or fields.get("total_weight_kg") or fields.get("gross_weight_kg"))
+    pieces_doc = _clean(fields.get("pieces") or fields.get("quantity") or fields.get("total_pieces"))
+    if pieces_doc:
+        pieces_tms, pieces_source = _tms_cargo_reference(detail, totals, "pieces")
+        status = _numeric_comparison_status(pieces_tms, pieces_doc)
+        add("Packstücke", pieces_tms, pieces_doc, match=(status == "match") if status else None, target="Packstücke", field="pieces")
+        if comparisons and comparisons[-1].get("label") == "Packstücke" and pieces_source:
+            comparisons[-1]["source"] = pieces_source
+    weight_doc = _clean(fields.get("weight_kg") or fields.get("total_weight_kg") or fields.get("gross_weight_kg") or fields.get("gross_weight"))
     if weight_doc:
-        add("Gewicht", totals.get("total_weight_kg"), weight_doc, target="Gewicht", field="gross_weight")
+        weight_tms, weight_source = _tms_cargo_reference(detail, totals, "weight")
+        status = _numeric_comparison_status(weight_tms, weight_doc, tolerance=1.0)
+        add("Gewicht", weight_tms, weight_doc, match=(status == "match") if status in {"match", "diff"} else None, target="Gewicht", field="gross_weight")
+        if comparisons and comparisons[-1].get("label") == "Gewicht":
+            if status == "near_match":
+                comparisons[-1]["status"] = "near_match"
+            if weight_source:
+                comparisons[-1]["source"] = weight_source
+            cargo_rows = _cargo_rows_from_detail(detail)
+            total_weight_values = [
+                _number_from_value(row.get("total_weight_kg"))
+                for row in cargo_rows
+                if _number_from_value(row.get("total_weight_kg")) is not None
+            ]
+            unit_weight = _number_from_value(weight_tms)
+            if len(cargo_rows) == 1 and total_weight_values and unit_weight is not None and total_weight_values[0] > unit_weight * 5:
+                comparisons[-1]["note"] = f"TMS-Cargo total_weight_kg wirkt rechnerisch auffällig ({_format_number(total_weight_values[0])} kg)"
     return comparisons
 
 
 def _comparison_lines(comparisons: list[dict[str, str]], statuses: set[str], limit: int = 3) -> list[str]:
-    labels = {"match": "passt", "diff": "abweicht", "missing_tms": "fehlt im TMS", "missing_doc": "nicht auf dem Dokument"}
+    labels = {"match": "passt", "near_match": "nahezu passend", "diff": "abweicht", "missing_tms": "fehlt im TMS", "missing_doc": "nicht auf dem Dokument"}
     lines = []
     for row in comparisons:
         if row.get("status") not in statuses:
@@ -619,15 +761,19 @@ def _comparison_lines(comparisons: list[dict[str, str]], statuses: set[str], lim
         label = row.get("label") or "Feld"
         tms = row.get("tms") or "nicht gepflegt"
         doc = row.get("doc") or "nicht lesbar"
+        note = f"; {row.get('note')}" if row.get("note") else ""
+        source = f" ({row.get('source')})" if row.get("source") and status in {"match", "near_match", "diff"} else ""
         if status == "match":
-            lines.append(f"{label} passt: TMS {tms} = Dokument {doc}")
+            lines.append(f"{label} passt: TMS{source} {tms} = Dokument {doc}{note}")
+        elif status == "near_match":
+            lines.append(f"{label} nahezu passend: TMS{source} {tms}, Dokument {doc}; bitte Rundung/Quelle prüfen{note}")
         elif status == "missing_tms":
             target = f" ({row.get('target')})" if row.get("target") else ""
             lines.append(f"{label} fehlt im TMS{target}: Dokument {doc}")
         elif status == "missing_doc":
             lines.append(f"{label} nicht beurteilbar: TMS {tms}, im Dokument nicht lesbar/angegeben")
         else:
-            lines.append(f"{label} weicht ab: TMS {tms}, Dokument {doc}")
+            lines.append(f"{label} weicht ab: TMS{source} {tms}, Dokument {doc}{note}")
         if len(lines) >= limit:
             break
     return lines
@@ -894,7 +1040,7 @@ def _human_document_message(
         lage += " Kontext: " + " · ".join(context_bits[:3]) + "."
 
     comparisons = comparisons or []
-    matching = _comparison_lines(comparisons, {"match"}, limit=4)
+    matching = _comparison_lines(comparisons, {"match", "near_match"}, limit=4)
     problems = _comparison_lines(comparisons, {"diff", "missing_tms"}, limit=4)
     unknown = _comparison_lines(comparisons, {"missing_doc"}, limit=2)
 
@@ -918,12 +1064,32 @@ def _human_document_message(
         and _finding_rank(row)[0] <= 0
     ]
     blocker_lines = [_finding_text(row) for row in sorted(blocker_findings, key=_finding_rank)[:2]]
+    uploaded_findings = [
+        row for row in findings
+        if isinstance(row, dict) and str(row.get("filename") or "").strip().lower() == uploaded_norm
+    ]
+    review_topic_lines: list[str] = []
     if not comparisons:
-        uploaded_findings = [
-            row for row in findings
-            if isinstance(row, dict) and str(row.get("filename") or "").strip().lower() == uploaded_norm
-        ]
         blocker_lines.extend(_finding_text(row) for row in sorted(uploaded_findings, key=_finding_rank)[:3])
+    elif not problems:
+        # Keep the card focused on the new upload, but do not suppress concrete
+        # non-write review topics such as uncertain customs value currency just
+        # because pieces/weight matched.
+        review_topics = [
+            row for row in uploaded_findings
+            if _finding_rank(row)[0] <= 3
+            and re.search(r"währung|currency|warenwert|goods value|zollwert|customs value", str(row.get("summary") or ""), re.IGNORECASE)
+        ]
+        seen_topic_lines: set[str] = set()
+        for row in sorted(review_topics, key=_finding_rank):
+            line = _finding_text(row)
+            key = _norm(line)
+            if key and key not in seen_topic_lines:
+                seen_topic_lines.add(key)
+                review_topic_lines.append(line)
+            if len(review_topic_lines) >= 2:
+                break
+        blocker_lines.extend(review_topic_lines)
     auffaellig_items = problems + blocker_lines
     if auffaellig_items:
         auffaellig = " | ".join(auffaellig_items[:4])
@@ -937,12 +1103,19 @@ def _human_document_message(
             empfehlung = "Ich sehe einen konkreten TMS-Feldwert aus belastbarer Dokument-Evidenz. Bitte die Freigabe-Kachel bestätigen oder ablehnen; vorher wird im TMS nichts geändert."
             targets = card_targets
         else:
-            empfehlung = "Ich sehe eine fachliche Abweichung, aber keinen sicheren direkt schreibbaren TMS-Feldwert. Bitte operativ prüfen; Hermes hat nichts geändert."
-            if normalized_doc_type == "offer":
-                empfehlung = "Angebot fachlich gegen TMS/ASR-Angebot prüfen; keine automatische TMS-Korrektur oder Kundenkommunikation ableiten."
-            targets = [row.get("target") or row.get("label") for row in comparisons if row.get("status") in {"diff", "missing_tms"}]
+            if review_topic_lines and not problems:
+                empfehlung = "Währung/Warenwert fachlich für Zollwert prüfen; Hermes hat keine TMS-Änderung und keinen Kundenkontakt ausgelöst."
+                targets = []
+            else:
+                empfehlung = "Ich sehe eine fachliche Abweichung, aber keinen sicheren direkt schreibbaren TMS-Feldwert. Bitte operativ prüfen; Hermes hat nichts geändert."
+                if normalized_doc_type == "offer":
+                    empfehlung = "Angebot fachlich gegen TMS/ASR-Angebot prüfen; keine automatische TMS-Korrektur oder Kundenkommunikation ableiten."
+                targets = [row.get("target") or row.get("label") for row in comparisons if row.get("status") in {"diff", "missing_tms"}]
         target_text = ", ".join(str(x) for x in targets[:3] if x)
-        naechster_schritt = f"Zu klären/korrigieren: {target_text}." if target_text else "Führenden Wert festlegen; bei TMS-Korrektur anschließend bewusst freigeben."
+        if review_topic_lines and not problems and not target_text:
+            naechster_schritt = "Zollwert/Währung bei der Zollprüfung bestätigen; keine automatische TMS-Korrektur nötig."
+        else:
+            naechster_schritt = f"Zu klären/korrigieren: {target_text}." if target_text else "Führenden Wert festlegen; bei TMS-Korrektur anschließend bewusst freigeben."
     else:
         suffix = (" Nicht beurteilbar: " + " | ".join(unknown)) if unknown else ""
         auffaellig = "Keine belastbare Abweichung aus den lesbaren Feldern." + suffix
@@ -1241,6 +1414,9 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
     needs_review = bool(reconciliation.get("needs_human_review"))
     raw_findings = reconciliation.get("findings")
     findings: list[Any] = raw_findings if isinstance(raw_findings, list) else []
+    findings = _normalize_uploaded_findings(findings, uploaded_for_label, str(filename))
+    if findings is not raw_findings:
+        reconciliation = {**reconciliation, "findings": findings}
     priority = "high" if risk in {"high", "critical"} or _has_blocker_finding(findings) else ("medium" if needs_review or findings else "low")
     context = report.get("tms_context") if isinstance(report.get("tms_context"), dict) else {}
     comparisons = _build_document_field_comparison(report, str(filename))
