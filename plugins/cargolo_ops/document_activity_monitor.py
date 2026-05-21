@@ -142,11 +142,17 @@ def _finding_text(row: Any) -> str:
 
 
 def _short_document_name(value: Any) -> str:
-    text = str(value or "").strip()
+    text = " ".join(str(value or "").replace("\u00a0", " ").split()).strip()
     if not text:
         return "Dokument"
     text = Path(text).name
-    return text[:42] + "…" if len(text) > 43 else text
+    lowered = text.lower()
+    if "invoice" in lowered or "rechnung" in lowered:
+        container_match = re.search(r"\b[A-Z]{4}\d{7}\b", text, flags=re.IGNORECASE)
+        if container_match:
+            return f"Rechnung {container_match.group(0).upper()}"
+        return "Rechnung"
+    return text[:34] + "…" if len(text) > 35 else text
 
 
 def _format_cross_document_value(target: str, value: Any) -> str:
@@ -859,6 +865,21 @@ def _field_source_allows_container_candidate(analysis: dict[str, Any], value: An
     has_container_context = bool(re.search(r"\b(?:container|cntr|cont\.?\s*no\.?|container\s*no\.?)\b", provenance, re.IGNORECASE))
     has_wrong_context = bool(re.search(r"\b(?:booking|invoice|customer|reference|date|vessel|voyage)\b", provenance, re.IGNORECASE))
     return has_container_context and not has_wrong_context
+
+
+def _billing_source_allows_review_intent(order_id: str, target: str, analysis: dict[str, Any], value: Any) -> bool:
+    if target not in {"container_number", "cargo_pieces"}:
+        return False
+    fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    refs = analysis.get("references") if isinstance(analysis.get("references"), list) else []
+    order_norm = _norm(order_id)
+    if order_norm:
+        evidence_blob = json.dumps({"fields": fields, "references": refs}, ensure_ascii=False)
+        if order_norm not in _norm(evidence_blob):
+            return False
+    if target == "container_number":
+        return _field_source_allows_container_candidate(analysis, value)
+    return _number_from_value(value) is not None
 
 
 def _contains_reference(haystack: dict[str, Any], value: Any) -> bool:
@@ -1976,14 +1997,19 @@ def _build_tms_update_review_intents_from_comparisons(
         if target not in supported_targets or not value or value == "nicht lesbar":
             continue
         effective_doc_type = _effective_trusted_doc_type(doc_type, uploaded, target, value)
-        if not is_trusted_source_for_field(effective_doc_type, target):
-            continue
         raw_analysis = uploaded.get("analysis")
         analysis: dict[str, Any] = raw_analysis if isinstance(raw_analysis, dict) else {}
+        trusted_source = is_trusted_source_for_field(effective_doc_type, target)
+        billing_review_only = False
+        if not trusted_source and effective_doc_type == "billing" and _billing_source_allows_review_intent(order_id, target, analysis, value):
+            trusted_source = True
+            billing_review_only = target in {"cargo_pieces"}
+        if not trusted_source:
+            continue
         field_source_checked = target == "mbl_number"
         if target == "mbl_number" and not _field_source_allows_mbl_candidate(analysis, value):
             continue
-        if target == "container_number" and effective_doc_type == "telex_release":
+        if target == "container_number" and effective_doc_type in {"billing", "telex_release"}:
             field_source_checked = True
             if not _field_source_allows_container_candidate(analysis, value):
                 continue
@@ -1995,6 +2021,8 @@ def _build_tms_update_review_intents_from_comparisons(
         seen.add(key)
         label = row.get("label") or target
         write_supported, action_type, tool_args = _writeback_metadata_for_intent(report, target, value)
+        if billing_review_only:
+            write_supported, action_type, tool_args = False, None, None
         intents.append({
             "order_id": order_id,
             "target": target,

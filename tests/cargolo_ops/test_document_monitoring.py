@@ -32,6 +32,7 @@ def _processor_result_for_uploaded_fields(
     findings=None,
     freight_details=None,
     transport_legs=None,
+    cargo_rows=None,
 ):
     analysis_path = tmp_path / f"{filename}.analysis.json"
     registry_path = tmp_path / f"{filename}.registry.json"
@@ -66,6 +67,7 @@ def _processor_result_for_uploaded_fields(
             {
                 "detail": {
                     "freight_details": freight_details or {"pol_code": "CNNGB", "pod_code": "DEHAM", "mbl_number": "", "container_number": ""},
+                    "cargo": cargo_rows if cargo_rows is not None else [],
                     "transport_legs": transport_legs if transport_legs is not None else [],
                 }
             },
@@ -1069,6 +1071,50 @@ def test_processor_result_queues_eta_ata_date_cards_from_shipment_advice(tmp_pat
     assert [(intent["target"], intent["value"], intent["guardrails"]["write_supported"]) for intent in result["document_review_intents"]] == [
         ("estimated_delivery_date", "2026-06-20", True),
         ("actual_delivery_date", "2026-06-21", True),
+    ]
+
+
+def test_processor_result_queues_billing_container_and_review_only_pieces_cards(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="agent-invoice.pdf",
+        event_doc_type="internal_other",
+        analysis_doc_type="billing",
+        extracted_fields={
+            "document_type": "INVOICE",
+            "tms_reference": "AN-11790",
+            "container_number": "PSXU5916391",
+            "pieces": "1",
+            "amount": "10800.00",
+            "currency": "USD",
+        },
+        field_sources={
+            "container_number": {
+                "value": "PSXU5916391",
+                "label": "Container",
+                "source": "document text",
+                "confidence": "high",
+                "raw_context": "PSXU5916391",
+            }
+        },
+        freight_details={"container_number": ""},
+        cargo_rows=[{"id": "cargo-1", "quantity": 2, "weight_kg": 0}],
+    )
+
+    assert [(intent["target"], intent["value"], intent["guardrails"]["write_supported"]) for intent in result["document_review_intents"]] == [
+        ("container_number", "PSXU5916391", True),
+        ("cargo_pieces", "1", False),
+    ]
+    queued = _queue_document_review_cards(
+        storage_root=tmp_path,
+        order_id="AN-11790",
+        intents=result["document_review_intents"],
+        event={"id": 9100, "metadata": {"document_type": "internal_other"}},
+        max_cards=3,
+    )
+    assert [(card["target"], card["value"], card["write_supported"]) for card in queued] == [
+        ("container_number", "PSXU5916391", True),
+        ("cargo_pieces", "1", False),
     ]
 
 
