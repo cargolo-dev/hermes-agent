@@ -141,9 +141,11 @@ def test_shared_channel_routes_when_mentioned_and_strips_mention(tmp_path: Path)
     assert result["should_send_to_teams"] is False
 
 
-def test_dedicated_channel_tms_write_request_remains_guarded_without_external_action(tmp_path: Path) -> None:
+def test_dedicated_channel_tms_write_request_prepares_review_card_without_external_action(tmp_path: Path) -> None:
+    root = tmp_path / "cargolo_asr"
+
     result = handle_teams_employee_message(
-        root=tmp_path / "cargolo_asr",
+        root=root,
         text="Setze MRN 26DE99999 in AN-11755 im TMS",
         channel_id="cargolo-hermes",
         message_id="teams-msg-4",
@@ -151,10 +153,14 @@ def test_dedicated_channel_tms_write_request_remains_guarded_without_external_ac
     )
 
     assert result["handled"] is True
-    assert result["classification"] == "guarded_action_required"
-    assert "Nicht geschrieben" in result["response_text"]
-    assert "kein TMS-Write" in result["response_text"]
+    assert result["classification"] == "tms_review_card_prepared"
+    assert "Review-Karte vorbereitet" in result["response_text"]
+    assert "Noch kein TMS-Write" in result["response_text"]
+    assert result["teams_tms_review_cards"][0]["target"] == "customs_reference"
+    assert result["teams_tms_review_cards"][0]["write_supported"] is False
     assert result["should_send_to_teams"] is False
     assert result["should_write_tms"] is False
     assert result["should_send_customer_message"] is False
-    assert not (tmp_path / "cargolo_asr" / "orders" / "AN-11755" / "employee" / "review_required.json").exists()
+    rows = _read_jsonl(root / "orders" / "AN-11755" / "teams" / "pending_tms_actions.jsonl")
+    assert rows[-1]["write_supported"] is False
+    assert not (root / "orders" / "AN-11755" / "employee" / "review_required.json").exists()

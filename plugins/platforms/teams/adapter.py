@@ -792,14 +792,35 @@ class TeamsAdapter(BasePlatformAdapter):
         ops_result: dict[str, Any],
         card_delay_seconds: float = 0.0,
     ) -> None:
-        """Send optional CARGOLO TMS review cards from an ops/router result."""
+        """Send optional CARGOLO review cards from an ops/router result."""
+        async def _maybe_delay() -> None:
+            if card_delay_seconds > 0:
+                await asyncio.sleep(card_delay_seconds)
+
         for pending_action in ops_result.get("teams_tms_review_cards") or []:
             if isinstance(pending_action, dict):
-                if card_delay_seconds > 0:
-                    await asyncio.sleep(card_delay_seconds)
+                await _maybe_delay()
                 await self.send_cargolo_asr_tms_review_card(
                     conv_id,
                     pending_action,
+                    reply_to=str(msg_id) if msg_id else None,
+                )
+        for pending_action in ops_result.get("teams_upload_review_cards") or []:
+            if isinstance(pending_action, dict):
+                await _maybe_delay()
+                await self.send_cargolo_asr_internal_review_card(
+                    conv_id,
+                    pending_action,
+                    review_kind="upload",
+                    reply_to=str(msg_id) if msg_id else None,
+                )
+        for pending_action in ops_result.get("teams_internal_review_cards") or []:
+            if isinstance(pending_action, dict):
+                await _maybe_delay()
+                await self.send_cargolo_asr_internal_review_card(
+                    conv_id,
+                    pending_action,
+                    review_kind="internal",
                     reply_to=str(msg_id) if msg_id else None,
                 )
 
@@ -982,7 +1003,43 @@ class TeamsAdapter(BasePlatformAdapter):
             from hermes_constants import get_hermes_home
             from plugins.cargolo_ops.teams_ops_router import route_teams_ops_message, should_use_case_assist_speed_layer
 
+            action_review_classifications = {
+                "tms_review_card_prepared",
+                "tms_control_without_card_context",
+                "document_upload_review_prepared",
+                "internal_action_review_prepared",
+                "pending_tms_reviews",
+                "ops_status",
+                "shipment_not_found_in_tms",
+            }
+            lowered_for_action_gate = str(text or "").lower()
             use_speed_layer, speed_order_id = should_use_case_assist_speed_layer(text)
+            explicit_write_or_review = any(token in lowered_for_action_gate for token in ("mrn", "hbl", "mbl", "hawb", "container", "zollreferenz", "customs", "eintragen", "setzen", "setz", "änder", "aender", "schreib"))
+            upload_or_internal_review = (
+                (any(token in lowered_for_action_gate for token in ("lade", "upload", "hochladen")) and any(token in lowered_for_action_gate for token in ("dokument", "doc", "ci", "pl", "datei", "commercial invoice", "packing")))
+                or any(token in lowered_for_action_gate for token in ("markier erledigt", "markiere erledigt", "todo erledigt", "notiz", "interne note", "case-note"))
+            )
+            ops_list_or_health = (not use_speed_layer) and any(token in lowered_for_action_gate for token in ("offene freig", "pending", "review", "status"))
+            should_pre_route_ops = explicit_write_or_review or upload_or_internal_review or ops_list_or_health
+            ops_result: dict[str, Any] = {"handled": False}
+            if should_pre_route_ops:
+                ops_result = route_teams_ops_message(
+                    text=text,
+                    root=get_hermes_home() / "cargolo_asr",
+                    chat_id=str(conv.id),
+                    user_id=str(user_id),
+                    user_name=user_name,
+                    message_id=str(msg_id) if msg_id else None,
+                )
+            if ops_result.get("handled") and str(ops_result.get("classification") or "") in action_review_classifications:
+                await self._send_cargolo_ops_result(
+                    conv_id=str(conv.id),
+                    msg_id=str(msg_id) if msg_id else None,
+                    ops_result=ops_result,
+                    card_delay_seconds=1.0,
+                )
+                return
+
             if use_speed_layer:
                 ack_text = (
                     f"Bin dran – ich prüfe {speed_order_id or 'den Fall'} TMS-first im Hintergrund. "
@@ -1000,14 +1057,6 @@ class TeamsAdapter(BasePlatformAdapter):
                 )
                 return
 
-            ops_result = route_teams_ops_message(
-                text=text,
-                root=get_hermes_home() / "cargolo_asr",
-                chat_id=str(conv.id),
-                user_id=str(user_id),
-                user_name=user_name,
-                message_id=str(msg_id) if msg_id else None,
-            )
             if ops_result.get("handled"):
                 await self._send_cargolo_ops_result(
                     conv_id=str(conv.id),
@@ -1094,12 +1143,17 @@ class TeamsAdapter(BasePlatformAdapter):
                         config=self._build_cargolo_handoff_config(),
                     )
                     if handoff_result.get("handled"):
+                        response_text = str(handoff_result.get("response_text") or "Gespeichert.")
+                        sent_id = None
                         if not handoff_result.get("suppress_initial_response"):
-                            await self.send(
+                            send_result = await self.send(
                                 str(conv.id),
-                                str(handoff_result.get("response_text") or "Gespeichert."),
+                                response_text,
                                 reply_to=str(msg_id) if msg_id else None,
                             )
+                            sent_id = getattr(send_result, "message_id", None)
+                            self._record_cargolo_thread_outbound(chat_id=str(conv.id), text=response_text, message_id=sent_id, reply_to=str(msg_id) if msg_id else None)
+                        await self._send_cargolo_review_cards_from_result(conv_id=str(conv.id), msg_id=str(msg_id) if msg_id else None, result=handoff_result)
                         return
                     if handoff_result.get("allow_generic_chat") and handoff_result.get("agent_prompt"):
                         text = str(handoff_result.get("agent_prompt"))
@@ -1116,10 +1170,10 @@ class TeamsAdapter(BasePlatformAdapter):
                         message_id=str(msg_id) if msg_id else None,
                     )
                     if ops_result.get("handled"):
-                        await self.send(str(conv.id), str(ops_result.get("response_text") or "Gespeichert."), reply_to=str(msg_id) if msg_id else None)
-                        for pending_action in ops_result.get("teams_tms_review_cards") or []:
-                            if isinstance(pending_action, dict):
-                                await self.send_cargolo_asr_tms_review_card(str(conv.id), pending_action, reply_to=str(msg_id) if msg_id else None)
+                        response_text = str(ops_result.get("response_text") or "Gespeichert.")
+                        send_result = await self.send(str(conv.id), response_text, reply_to=str(msg_id) if msg_id else None)
+                        self._record_cargolo_thread_outbound(chat_id=str(conv.id), text=response_text, message_id=getattr(send_result, "message_id", None), reply_to=str(msg_id) if msg_id else None)
+                        await self._send_cargolo_review_cards_from_result(conv_id=str(conv.id), msg_id=str(msg_id) if msg_id else None, result=ops_result)
                         return
                     if ops_result.get("allow_generic_chat") and ops_result.get("agent_prompt"):
                         asr_agent_prompt = str(ops_result.get("agent_prompt"))
@@ -1130,11 +1184,13 @@ class TeamsAdapter(BasePlatformAdapter):
                         )
                         text = asr_agent_prompt
                     elif self._looks_like_cargolo_asr_control_message(text):
-                        await self.send(
+                        response_text = "Ich erkenne eine CARGOLO-ASR/TMS-Anweisung, kann sie aber nicht eindeutig einer Operator-Karte zuordnen. Bitte auf die konkrete ASR-Karte antworten/quote-reply und @Hermes CARGOLO erwähnen; ich lege TMS-Änderungen dann nur als Review-Vorschlag ab."
+                        send_result = await self.send(
                             str(conv.id),
-                            "Ich erkenne eine CARGOLO-ASR/TMS-Anweisung, kann sie aber nicht eindeutig einer Operator-Karte zuordnen. Bitte auf die konkrete ASR-Karte antworten/quote-reply und @Hermes CARGOLO erwähnen; ich lege TMS-Änderungen dann nur als Review-Vorschlag ab.",
+                            response_text,
                             reply_to=str(msg_id) if msg_id else None,
                         )
+                        self._record_cargolo_thread_outbound(chat_id=str(conv.id), text=response_text, message_id=getattr(send_result, "message_id", None), reply_to=str(msg_id) if msg_id else None)
                         return
         except Exception as e:
             logger.warning("[teams] CARGOLO ASR reply loop failed; suppressing generic chat fallback for safety: %s", e)
@@ -1295,6 +1351,33 @@ class TeamsAdapter(BasePlatformAdapter):
             return value
         return None
 
+    def _record_cargolo_thread_outbound(self, *, chat_id: str, text: str, message_id: str | None = None, reply_to: str | None = None) -> None:
+        """Best-effort local Teams thread memory for CARGOLO employee chat."""
+        try:
+            from hermes_constants import get_hermes_home
+            from plugins.cargolo_ops.teams_thread_context import record_outbound_response
+
+            record_outbound_response(
+                root=get_hermes_home() / "cargolo_asr",
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_to_message_id=reply_to,
+                text=text,
+            )
+        except Exception:
+            logger.debug("[teams] CARGOLO thread outbound record failed", exc_info=True)
+
+    async def _send_cargolo_review_cards_from_result(self, *, conv_id: str, msg_id: str | None, result: dict[str, Any]) -> None:
+        for pending_action in result.get("teams_tms_review_cards") or []:
+            if isinstance(pending_action, dict):
+                await self.send_cargolo_asr_tms_review_card(conv_id, pending_action, reply_to=msg_id)
+        for pending_action in result.get("teams_upload_review_cards") or []:
+            if isinstance(pending_action, dict):
+                await self.send_cargolo_asr_internal_review_card(conv_id, pending_action, review_kind="upload", reply_to=msg_id)
+        for pending_action in result.get("teams_internal_review_cards") or []:
+            if isinstance(pending_action, dict):
+                await self.send_cargolo_asr_internal_review_card(conv_id, pending_action, review_kind="internal", reply_to=msg_id)
+
     async def _send_card(self, chat_id: str, card: "AdaptiveCard") -> "Any":
         """Send an AdaptiveCard, using a stored ConversationReference when available."""
         from microsoft_teams.api import MessageActivityInput
@@ -1421,6 +1504,45 @@ class TeamsAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error("[teams] send_cargolo_asr_tms_review_card failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e), retryable=True)
+
+    async def send_cargolo_asr_internal_review_card(
+        self,
+        chat_id: str,
+        pending_action: dict[str, Any],
+        *,
+        review_kind: str = "internal",
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Send a non-write CARGOLO ASR review card for upload/internal action queues."""
+        if not self._app:
+            return SendResult(success=False, error="Teams app not initialized")
+        order_id = str(pending_action.get("order_id") or "AN/BU?")
+        action_type = str(pending_action.get("action_type") or review_kind or "review")
+        operator = str(pending_action.get("operator") or "unbekannt")
+        details = pending_action.get("details") if isinstance(pending_action.get("details"), dict) else {}
+        text = str(details.get("text") or pending_action.get("text") or "").strip()
+        duplicate = bool(pending_action.get("duplicate"))
+        title = "Hermes · Upload-Review" if review_kind == "upload" else "Hermes · Interner Review"
+        status = "Bereits vorgemerkt (Dedupe)" if duplicate else "Neu vorgemerkt"
+        card = (
+            AdaptiveCard()
+            .with_version("1.4")
+            .with_body([
+                TextBlock(text=f"{title} ({order_id})", wrap=True, weight="Bolder"),
+                TextBlock(text=status, wrap=True),
+                TextBlock(text=f"Typ: {action_type}", wrap=True),
+                TextBlock(text=f"Operator: {operator}", wrap=True, isSubtle=True),
+                TextBlock(text=text or "Kein Freitext hinterlegt.", wrap=True),
+                TextBlock(text="Review-only: keine Datei hochgeladen, kein TMS-Write, keine Kundenmail. Bitte operativ prüfen und bei Bedarf manuell ausführen.", wrap=True),
+            ])
+        )
+        try:
+            result = await self._send_card(chat_id, card)
+            message_id = getattr(result, "id", None) if result else None
+            return SendResult(success=True, message_id=message_id)
+        except Exception as e:
+            logger.error("[teams] send_cargolo_asr_internal_review_card failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e), retryable=True)
 
     def _build_cargolo_asr_tms_review_status_card(

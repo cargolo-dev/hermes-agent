@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 from plugins.cargolo_ops.teams_reply_loop import (
@@ -33,6 +35,23 @@ def test_default_tms_verify_reads_snapshot_bundle_detail(monkeypatch) -> None:
 
     assert _default_tms_verify("AN-12218", "container_number") == "CIMU1670214"
 
+
+
+
+def test_default_tms_verify_reads_customs_status_from_snapshot_bundle_detail(monkeypatch) -> None:
+    class FakeSnapshot:
+        detail = {"customs": {"customs_status": "erledigt"}}
+
+    class FakeProvider:
+        def snapshot_bundle(self, an: str, customer_hint: str | None = None) -> FakeSnapshot:
+            assert an == "AN-12218"
+            return FakeSnapshot()
+
+    from plugins.cargolo_ops import tms_provider
+
+    monkeypatch.setattr(tms_provider, "build_tms_provider_from_env", lambda: FakeProvider())
+
+    assert _default_tms_verify("AN-12218", "customs_status") == "erledigt"
 
 def test_record_sent_card_persists_context_and_message_index(tmp_path: Path) -> None:
     root = tmp_path / "cargolo_asr"
@@ -367,6 +386,118 @@ def test_explicit_approval_applies_pending_tms_action_and_verifies(tmp_path: Pat
     audit = _read_jsonl(root / "orders" / "AN-11755" / "audit" / "actions.jsonl")
     assert any(row["action"] == "teams_tms_update_applied" for row in audit)
 
+
+
+
+def test_parallel_card_approvals_claim_pending_action_once(tmp_path: Path) -> None:
+    root = tmp_path / "cargolo_asr"
+    (root / "orders" / "AN-11755" / "teams").mkdir(parents=True)
+    pending_path = root / "orders" / "AN-11755" / "teams" / "pending_tms_actions.jsonl"
+    pending_path.write_text(
+        json.dumps({
+            "timestamp": "2026-05-08T11:58:25Z",
+            "action_id": "act-race",
+            "status": "pending_review",
+            "order_id": "AN-11755",
+            "target": "customs_reference",
+            "value": "26DE99999",
+            "write_supported": True,
+            "write_policy": "no_auto_write_without_review",
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    apply_calls: list[str] = []
+    barrier = threading.Barrier(2)
+
+    def fake_apply(action: dict, context: dict) -> dict:
+        apply_calls.append(context["order_id"])
+        time.sleep(0.05)
+        return {"status": "applied"}
+
+    def approve() -> dict:
+        barrier.wait(timeout=5)
+        return process_teams_tms_card_action(
+            root=root,
+            data={
+                "hermes_action": "cargolo_asr_tms_approve",
+                "order_id": "AN-11755",
+                "action_id": "act-race",
+                "target": "customs_reference",
+                "value": "26DE99999",
+            },
+            user_name="Operator",
+            enable_tms_writeback=True,
+            apply_tms_update=fake_apply,
+            verify_tms_value=lambda order_id, target: "26DE99999",
+        )
+
+    results: list[dict] = []
+    threads = [threading.Thread(target=lambda: results.append(approve())) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(results) == 2
+    assert len(apply_calls) == 1
+    assert sorted(result["status"] for result in results) == ["already_resolved", "applied"]
+    queue = _read_jsonl(pending_path)
+    assert queue[-1]["status"] == "applied"
+
+
+
+def test_approval_final_update_preserves_rows_appended_during_apply(tmp_path: Path) -> None:
+    root = tmp_path / "cargolo_asr"
+    teams_dir = root / "orders" / "AN-11755" / "teams"
+    teams_dir.mkdir(parents=True)
+    pending_path = teams_dir / "pending_tms_actions.jsonl"
+    pending_path.write_text(
+        json.dumps({
+            "timestamp": "2026-05-08T11:58:25Z",
+            "action_id": "act-primary",
+            "status": "pending_review",
+            "order_id": "AN-11755",
+            "target": "customs_reference",
+            "value": "26DE99999",
+            "write_supported": True,
+            "write_policy": "no_auto_write_without_review",
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_apply(action: dict, context: dict) -> dict:
+        with pending_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "timestamp": "2026-05-08T11:59:00Z",
+                "action_id": "act-secondary",
+                "status": "pending_review",
+                "order_id": "AN-11755",
+                "target": "hbl_number",
+                "value": "HBL-2",
+                "write_supported": False,
+            }, ensure_ascii=False) + "\n")
+        return {"status": "applied"}
+
+    result = process_teams_tms_card_action(
+        root=root,
+        data={
+            "hermes_action": "cargolo_asr_tms_approve",
+            "order_id": "AN-11755",
+            "action_id": "act-primary",
+            "target": "customs_reference",
+            "value": "26DE99999",
+        },
+        user_name="Operator",
+        enable_tms_writeback=True,
+        apply_tms_update=fake_apply,
+        verify_tms_value=lambda order_id, target: "26DE99999",
+    )
+
+    assert result["status"] == "applied"
+    rows = _read_jsonl(pending_path)
+    assert {row["action_id"] for row in rows} == {"act-primary", "act-secondary"}
+    assert next(row for row in rows if row["action_id"] == "act-primary")["status"] == "applied"
+    assert next(row for row in rows if row["action_id"] == "act-secondary")["status"] == "pending_review"
 
 def test_explicit_approval_requires_fresh_verification_match(tmp_path: Path) -> None:
     root = tmp_path / "cargolo_asr"

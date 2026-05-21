@@ -34,6 +34,9 @@ _FULL_CASE_RE = re.compile(r"\b(?:gib|geb|zeig|sag|hol|hole)\b.*\b(?:alles|infos
 _WRITE_RE = re.compile(r"\b(schreib(?:e|en)?|setz(?:e|en)?|eintragen|ändern|aendern|update|aktualisier(?:e|en)?)\b", re.IGNORECASE)
 _TMS_FIELD_RE = re.compile(r"\b(TMS|MRN|HBL|MBL|HAWB|Container|Container[-\s]?Nr|Zollreferenz|customs)\b", re.IGNORECASE)
 _MRN_VALUE_RE = re.compile(r"\b([0-9]{2}[A-Z]{2}[A-Z0-9]{3,})\b", re.IGNORECASE)
+_EXPLICIT_TMS_WRITE_RE = re.compile(r"\b(setz(?:e|en)?|trag(?:e|en)?(?:\s+.*\s+ein)?|eintragen|änder(?:e|n)?|aender(?:e|n)?|aktualisier(?:e|en)?|schreib(?:e|en)?\s+.*\b(?:ins|in)\s+TMS|auf\s+[^\n]{2,80}\s+setz(?:e|en)?)\b", re.IGNORECASE)
+_ASSIGNMENT_RE_TEMPLATE = r"\b{field}\s*(?::|=|#|-|auf|ist|setzen|setze|setz)?\s*([A-Z0-9][A-Z0-9./-]{{2,}})\b"
+_REVIEW_STOPWORDS = {"FEHLT", "OFFEN", "NOCH", "NICHT", "UNBEKANNT", "PENDING", "FOLGT", "TBD", "NA", "N/A", "NONE", "NULL", "CLEAR", "CLEARED", "ERLEDIGT"}
 
 
 def default_case_root() -> Path:
@@ -87,7 +90,7 @@ def _pending_action_id_for_row(item: dict[str, Any]) -> str:
 
 
 _SUPPORTED_TMS_REVIEW_TARGETS = {
-    "customs_reference", "hbl_number", "mbl_number", "hawb_number", "container_number",
+    "customs_reference", "customs_status", "hbl_number", "mbl_number", "hawb_number", "container_number",
     "pickup_date", "estimated_delivery_date", "actual_delivery_date",
     # Agentic proposal-layer review-only targets. Approval stays blocked until a
     # dedicated TMS writeback mapping exists; cards are still useful for ops review.
@@ -300,6 +303,163 @@ def _route_correction_followup(
     }
 
 
+def _looks_like_explicit_tms_write(raw: str) -> bool:
+    text = str(raw or "")
+    lowered = text.lower()
+    if not _EXPLICIT_TMS_WRITE_RE.search(text):
+        return False
+    # “Update:” is often a status prefix, not a write command.  Only allow it
+    # when another explicit write verb or assignment-style field/value exists.
+    if re.match(r"^\s*update\s*:", lowered) and not re.search(r"\b(setz|setze|trag|trage|eintragen|änder|aender|aktualisier)\b|[:=]", lowered):
+        return False
+    return True
+
+
+def _candidate_value_ok(value: str, *, require_digit: bool = False) -> bool:
+    normalized = str(value or "").strip().upper().strip(".,;:()[]{}")
+    if not normalized or normalized in _REVIEW_STOPWORDS:
+        return False
+    if normalized.lower() in {"fehlt", "offen", "noch", "nicht", "unbekannt", "pending", "folgt"}:
+        return False
+    if require_digit and not any(ch.isdigit() for ch in normalized):
+        return False
+    return True
+
+
+def _has_negation_before(text: str, keyword: str, *, window: int = 24) -> bool:
+    lowered = text.lower()
+    idx = lowered.find(keyword.lower())
+    if idx < 0:
+        return False
+    prefix = lowered[max(0, idx - window):idx]
+    return bool(re.search(r"\b(nicht|kein|keine|noch\s+nicht|not|un|uncleared)\b", prefix))
+
+
+def _extract_tms_review_candidate(raw: str, order_id: str) -> dict[str, Any] | None:
+    text = str(raw or "")
+    lowered = text.lower()
+    if not _looks_like_explicit_tms_write(text):
+        return None
+    if "mrn" in lowered or "zollreferenz" in lowered or "customs reference" in lowered:
+        match = _MRN_VALUE_RE.search(text)
+        if match and _candidate_value_ok(match.group(1), require_digit=True):
+            return {"target": "customs_reference", "value": match.group(1).upper(), "label": "Zollreferenz/MRN"}
+    if "zollstatus" in lowered or "customs status" in lowered:
+        positive_tokens = ("erledigt", "done", "abgeschlossen", "clear", "cleared")
+        for token in positive_tokens:
+            if token in lowered and not _has_negation_before(text, token):
+                return {"target": "customs_status", "value": "erledigt", "label": "Zollstatus"}
+        return None
+    field_patterns = [
+        ("hbl_number", "HBL", "HBL", True),
+        ("mbl_number", "MBL", "MBL", True),
+        ("hawb_number", "HAWB", "HAWB", True),
+    ]
+    for target, label, field, require_digit in field_patterns:
+        pattern = _ASSIGNMENT_RE_TEMPLATE.format(field=re.escape(field))
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            value = match.group(1).upper().strip(".,;:()[]{}")
+            if _candidate_value_ok(value, require_digit=require_digit):
+                return {"target": target, "value": value, "label": label}
+    container_match = re.search(r"\b([A-Z]{4}\d{7})\b", text, flags=re.IGNORECASE)
+    if container_match and ("container" in lowered or "containern" in lowered):
+        return {"target": "container_number", "value": container_match.group(1).upper(), "label": "Containernummer"}
+    return None
+
+
+def _queue_tms_review_from_freetext(*, root: Path, order_id: str, raw: str, user_name: str | None, message_id: str | None) -> dict[str, Any] | None:
+    candidate = _extract_tms_review_candidate(raw, order_id)
+    if not candidate:
+        return None
+    try:
+        from .teams_reply_loop import record_agent_tms_update_intent
+    except Exception:
+        return None
+    queued = record_agent_tms_update_intent(
+        root=root,
+        order_id=order_id,
+        target=str(candidate["target"]),
+        value=str(candidate["value"]),
+        text=f"Teams-Freitext Review-Vorschlag: {candidate['label']} für {order_id} = {candidate['value']}. Hermes hat nichts ins TMS geschrieben.",
+        operator=user_name or "Teams Operator",
+        source_message_id=message_id,
+        context_id=f"{order_id}:teams_freetext_review",
+        confidence="teams_freetext_explicit_value",
+        source="teams_freetext_review_intent",
+        evidence={"summary": raw, "origin": "teams_freetext"},
+        write_supported=False,
+    )
+    card = {
+        "order_id": order_id,
+        "action_id": queued.get("action_id"),
+        "target": candidate["target"],
+        "value": candidate["value"],
+        "operator": user_name,
+        "context_id": f"{order_id}:teams_freetext_review",
+        "source": "teams_freetext_review_intent",
+        "evidence": raw,
+        "write_supported": False,
+        "question": f"{candidate['label']}: Wert als pending_review fachlich bestätigen?",
+    }
+    return {
+        "handled": True,
+        "classification": "tms_review_card_prepared",
+        "order_id": order_id,
+        "response_text": f"Ich habe für {order_id} eine Review-Karte vorbereitet: {candidate['label']} = {candidate['value']}. Noch kein TMS-Write — bitte Karte bestätigen oder ablehnen.",
+        "teams_tms_review_cards": [card] if queued.get("queued") or queued.get("duplicate") else [],
+        "side_effects": {"queued_tms_actions": 1 if queued.get("queued") else 0, "duplicate": bool(queued.get("duplicate"))},
+        "should_write_tms": False,
+        "should_send_customer_message": False,
+        "should_send_to_teams": False,
+    }
+
+
+def _normalize_review_text(text: str) -> str:
+    return " ".join(str(text or "").strip().lower().split())
+
+
+def _append_internal_action(root: Path, order_id: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    queue_path = root / "orders" / order_id / "teams" / "pending_internal_actions.jsonl"
+    dedupe_payload = {
+        "order_id": order_id,
+        "kind": kind,
+        "text": _normalize_review_text(str(payload.get("text") or "")),
+        "operator": str(payload.get("operator") or ""),
+    }
+    dedupe_key = hashlib.sha256(json.dumps(dedupe_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    for existing in _read_jsonl(queue_path):
+        if str(existing.get("status") or "") != "pending_review":
+            continue
+        if str(existing.get("dedupe_key") or "") == dedupe_key:
+            duplicate = dict(existing)
+            duplicate["duplicate"] = True
+            return duplicate
+    now = utc_now_iso()
+    action_id = hashlib.sha256(f"{dedupe_key}|{now}".encode("utf-8")).hexdigest()[:16]
+    row = {"timestamp": now, "action_id": action_id, "dedupe_key": dedupe_key, "duplicate": False, "status": "pending_review", "order_id": order_id, "action_kind": kind, "action_type": kind, "payload": payload, "details": payload, "operator": payload.get("operator"), "write_policy": "no_auto_write_without_review"}
+    _append_jsonl(queue_path, row)
+    return row
+
+
+def _route_upload_or_internal_review(*, root: Path, raw: str, order_id: str | None, user_name: str | None) -> dict[str, Any] | None:
+    lowered = raw.lower()
+    if not order_id:
+        return None
+    if any(token in lowered for token in ("lade", "upload", "hochladen")) and any(token in lowered for token in ("dokument", "doc", "ci", "pl", "datei", "commercial invoice", "packing")):
+        live_exists = _live_shipment_exists(order_id)
+        if live_exists is False:
+            return _unknown_shipment_response(order_id)
+        row = _append_internal_action(root, order_id, "document_upload_review", {"text": raw, "operator": user_name, "needs_file_resolution": True})
+        return {"handled": True, "classification": "document_upload_review_prepared", "order_id": order_id, "response_text": f"Für {order_id}: Ich habe einen Upload-Review vorgemerkt. Noch kein Dokument hochgeladen; bitte Datei/Typ in der Review-Karte prüfen.", "teams_upload_review_cards": [row], "should_write_tms": False, "should_send_customer_message": False, "should_send_to_teams": False}
+    if any(token in lowered for token in ("markier erledigt", "markiere erledigt", "todo erledigt", "notiz", "interne note", "case-note")):
+        live_exists = _live_shipment_exists(order_id)
+        if live_exists is False:
+            return _unknown_shipment_response(order_id)
+        row = _append_internal_action(root, order_id, "internal_note_or_todo_review", {"text": raw, "operator": user_name})
+        return {"handled": True, "classification": "internal_action_review_prepared", "order_id": order_id, "response_text": f"Für {order_id}: Ich habe eine interne Review-Aktion vorbereitet. Noch keine TMS-Notiz und kein Todo geschrieben; Freigabe/Korrektur erforderlich.", "teams_internal_review_cards": [row], "should_write_tms": False, "should_send_customer_message": False, "should_send_to_teams": False}
+    return None
+
 def _status_response(root: Path) -> str:
     jobs = _load_cron_jobs()
     doc_jobs = [j for j in jobs if "cargolo" in str(j.get("name") or j.get("job_id") or "").lower()]
@@ -447,66 +607,49 @@ def _case_evidence_prompt(
 
 
 def build_case_evidence_agent_handoff(*, root: Path, order_id: str, text: str, user_name: str | None = None) -> dict[str, Any]:
-    """Refresh canonical evidence, then hand the actual answer to Hermes/agent judgement."""
-    live_exists = _live_shipment_exists(order_id)
-    if live_exists is False:
-        return _unknown_shipment_response(order_id)
-
+    """Run the canonical Teams employee runtime for AN/BU evidence questions."""
     try:
-        from .case_lifecycle import sync_case_lifecycle
-    except Exception as exc:  # pragma: no cover - import degradation only
-        lifecycle: dict[str, Any] | None = None
-        lifecycle_error: str | None = f"case_lifecycle_unavailable:{exc}"
-    else:
-        lifecycle = None
-        lifecycle_error = None
-        try:
-            lifecycle = sync_case_lifecycle(
-                order_id,
-                storage_root=root,
-                refresh_history=True,
-                analyze_documents=True,
-            )
-        except Exception as exc:
-            lifecycle_error = str(exc)
+        from .teams_employee_runtime import run_teams_employee_runtime
+    except Exception:
+        # Last-resort compatibility fallback: preserve the TMS-first hard stop even
+        # if the richer runtime cannot be imported during a degraded startup.
+        live_exists = _live_shipment_exists(order_id)
+        if live_exists is False:
+            return _unknown_shipment_response(order_id)
+        return {
+            "handled": False,
+            "allow_generic_chat": True,
+            "classification": "case_evidence_refreshed_agent_handoff",
+            "order_id": order_id,
+            "agent_prompt": _case_evidence_prompt(text=text, root=root, order_id=order_id, lifecycle=None, lifecycle_error="teams_employee_runtime_unavailable", user_name=user_name),
+            "case_path": str(root / "orders" / order_id),
+            "lifecycle": {"status": "error", "error": "teams_employee_runtime_unavailable"},
+            "should_send_to_teams": False,
+            "should_write_tms": False,
+            "should_send_customer_message": False,
+            "teams_tms_review_cards": [],
+        }
 
-    tms_review_cards: list[dict[str, Any]] = []
-    if lifecycle_error is None:
-        try:
-            from .tms_proposal_layer import queue_agentic_tms_review_cards
-
-            tms_review_cards = queue_agentic_tms_review_cards(
-                root=root,
-                order_id=order_id,
-                source="teams_case_evidence_refresh",
-                operator="Hermes Agentic Proposal Layer",
-                context_id=f"{order_id}:teams_case_evidence_refresh",
-                max_cards=3,
-            )
-        except Exception:
-            tms_review_cards = []
-
-    prompt = _case_evidence_prompt(
+    runtime_result = run_teams_employee_runtime(
         text=text,
         root=root,
-        order_id=order_id,
-        lifecycle=lifecycle,
-        lifecycle_error=lifecycle_error,
+        channel_id=None,
         user_name=user_name,
+        is_dedicated_channel=True,
+        tms_exists_func=_live_shipment_exists,
+        order_id_override=order_id,
+        force_full_case_refresh=True,
     )
-    return {
-        "handled": False,
-        "allow_generic_chat": True,
-        "classification": "case_evidence_refreshed_agent_handoff",
-        "order_id": order_id,
-        "agent_prompt": prompt,
-        "case_path": str(root / "orders" / order_id),
-        "lifecycle": lifecycle or {"status": "error", "error": lifecycle_error},
-        "should_send_to_teams": False,
-        "should_write_tms": False,
-        "should_send_customer_message": False,
-        "teams_tms_review_cards": tms_review_cards,
-    }
+    if runtime_result.get("classification") == "case_evidence_runtime_handoff":
+        runtime_result["runtime_classification"] = runtime_result.get("classification")
+        runtime_result["classification"] = "case_evidence_refreshed_agent_handoff"
+        runtime_result["case_path"] = str(root / "orders" / order_id)
+        # Strict read-only case questions must not enqueue local TMS review cards.
+        # Review-card side effects stay limited to explicit correction/freigabe
+        # flows handled elsewhere in this router.
+        runtime_result["teams_tms_review_cards"] = []
+        runtime_result["side_effects"] = {"queued_tms_actions": 0}
+    return runtime_result
 
 
 def _is_case_read_question(raw: str, *, order_id: str | None) -> bool:
@@ -514,6 +657,12 @@ def _is_case_read_question(raw: str, *, order_id: str | None) -> bool:
         return False
     lowered = raw.lower()
     if _CASE_CHECK_RE.search(raw) or _FULL_CASE_RE.search(raw) or "komplett" in lowered or "case" in lowered:
+        return True
+    broad_phrases = (
+        "ziehen lassen", "blockt", "blockiert", "kundenseite", "verzollung", "warum hängt", "warum haengt",
+        "warum steht", "was muss ich heute machen", "was ist heute dran", "die sendung", "der kunde", "die docs",
+    )
+    if any(phrase in lowered for phrase in broad_phrases):
         return True
     return bool(re.search(r"\b(was ist|stand|status|lage|infos?|informationen?|details?|eta|etd|fehlt|sauber|antwort|geantwortet|kunde|kunden|mail|dokument|docs?|tms|sendung|update)\b", raw, re.IGNORECASE))
 
@@ -557,14 +706,26 @@ def route_teams_ops_message(
     - {handled: False, allow_generic_chat: True, agent_prompt: ...} for agent work
     - {handled: False} for unrelated Teams chat
     """
-    del chat_id  # reserved for audit extension
     raw = str(text or "").strip()
     if not raw:
         return {"handled": False}
     case_root = root or default_case_root()
     lowered = raw.lower()
     order_match = _ORDER_RE.search(raw)
-    order_id = order_match.group(0).upper() if order_match else None
+    explicit_order_id = order_match.group(0).upper() if order_match else None
+    order_id = explicit_order_id
+    thread_context: dict[str, Any] = {}
+    if chat_id:
+        try:
+            from .teams_thread_context import load_thread_context, record_inbound_message, resolve_followup_reference
+
+            thread_context = load_thread_context(case_root, chat_id)
+            resolved = resolve_followup_reference(raw, thread_context)
+            if not order_id and resolved.get("resolved") and not resolved.get("wants_write"):
+                order_id = str(resolved.get("order_id") or "").upper() or None
+            record_inbound_message(root=case_root, chat_id=chat_id, message_id=message_id, user_id=user_id, user_name=user_name, text=raw, explicit_order_id=order_id or explicit_order_id)
+        except Exception:
+            thread_context = {}
 
     correction_followup = _route_correction_followup(
         raw=raw,
@@ -594,16 +755,28 @@ def route_teams_ops_message(
     # local deep-dive handoff. `_CASE_CHECK_RE` also contains "aktualisier",
     # so write-like text must be protected first.
     if order_id and _WRITE_RE.search(raw) and _TMS_FIELD_RE.search(raw):
+        live_exists = _live_shipment_exists(order_id)
+        if live_exists is False:
+            return _unknown_shipment_response(order_id)
+        review = _queue_tms_review_from_freetext(root=case_root, order_id=order_id, raw=raw, user_name=user_name, message_id=message_id)
+        if review:
+            return review
         return {
             "handled": True,
             "classification": "tms_control_without_card_context",
             "order_id": order_id,
             "response_text": (
-                "Ich erkenne eine CARGOLO-ASR/TMS-Anweisung, kann sie aber nicht eindeutig einer Operator-Karte zuordnen. "
-                "Bitte auf die konkrete ASR-Karte antworten/quote-reply und @Hermes CARGOLO erwähnen; "
-                "ich lege TMS-Änderungen dann nur als Review-Vorschlag ab."
+                "Ich erkenne eine CARGOLO-ASR/TMS-Anweisung, aber keinen eindeutigen Zielwert. "
+                "Ich schreibe nichts ins TMS; bitte Wert/Feld eindeutig nennen oder auf die konkrete Review-Karte antworten."
             ),
+            "should_write_tms": False,
+            "should_send_customer_message": False,
+            "should_send_to_teams": False,
         }
+
+    action_review = _route_upload_or_internal_review(root=case_root, raw=raw, order_id=order_id, user_name=user_name)
+    if action_review:
+        return action_review
 
     # Case assist: deterministic code only refreshes evidence and enforces TMS-first.
     # The actual business answer falls through to Hermes/agent judgement with a

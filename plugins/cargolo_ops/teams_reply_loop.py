@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -349,7 +350,7 @@ def record_agent_tms_update_intent(
         "operator": operator,
         "text": text,
         "write_policy": "no_auto_write_without_review",
-        "write_supported": bool(normalized_target in _SHORT_TO_FULL_TARGET),
+        "write_supported": bool(write_supported) if write_supported is not None else bool(normalized_target in _SHORT_TO_FULL_TARGET),
     }
     _append_jsonl(teams_dir / "pending_tms_actions.jsonl", row)
     _append_jsonl(teams_dir / "case_learning.jsonl", {
@@ -384,6 +385,7 @@ def record_agent_tms_update_intent(
 
 _SHORT_TO_FULL_TARGET: dict[str, str] = {
     "customs_reference": "shipment.customs.customs_reference",
+    "customs_status": "shipment.customs.customs_status",
     "hbl_number": "shipment.freight_details.hbl_number",
     "mbl_number": "shipment.freight_details.mbl_number",
     "hawb_number": "shipment.freight_details.hawb_number",
@@ -838,6 +840,9 @@ def _extract_snapshot_value(snapshot: dict[str, Any], target: str) -> Any:
     if target == "customs_reference":
         customs = shipment.get("customs") if isinstance(shipment.get("customs"), dict) else {}
         return customs.get("customs_reference") or shipment.get("customs_reference")
+    if target == "customs_status":
+        customs = shipment.get("customs") if isinstance(shipment.get("customs"), dict) else {}
+        return customs.get("customs_status") or shipment.get("customs_status")
     if target in {"hbl_number", "mbl_number", "hawb_number", "container_number"}:
         freight = shipment.get("freight_details") if isinstance(shipment.get("freight_details"), dict) else {}
         return freight.get(target) or shipment.get(target)
@@ -894,34 +899,41 @@ def _apply_approved_pending_tms_action(
         _write_jsonl(pending_path, rows)
         return {"type": "tms_update_approval_blocked", "target": short_target, "value": value, "status": "approval_blocked"}
 
-    # Best-effort two-click guard: claim the pending row before the external
-    # TMS write so a second sequential click sees the action as no longer open.
-    # (The Teams UI is also replaced after the first invoke.)
-    latest_rows = _read_jsonl(pending_path)
-    match_action_id = str(pending_action.get("action_id") or "")
-    latest_index = None
-    latest_action: dict[str, Any] | None = None
-    for idx, row in enumerate(latest_rows):
-        same_action_id = match_action_id and str(row.get("action_id") or "") == match_action_id
-        same_target_value = (
-            str(row.get("order_id") or "").strip().upper() == order_id
-            and str(row.get("target") or "").strip() == short_target
-            and str(row.get("value") or "").strip() == str(value or "").strip()
-        )
-        if same_action_id or same_target_value:
-            latest_index = idx
-            latest_action = row
-            break
-    if latest_index is None or latest_action is None:
-        return {"type": "tms_update_approval_blocked", "target": short_target, "value": value, "status": "already_resolved", "reason": "pending_action_missing"}
-    if str(latest_action.get("status") or "") != "pending_review":
-        return {"type": "tms_update_approval_blocked", "target": short_target, "value": value, "status": "already_resolved", "reason": "pending_action_not_open"}
-    claimed_action = {**latest_action, **base_update, "status": "approved_pending_apply"}
-    latest_rows[latest_index] = claimed_action
-    _write_jsonl(pending_path, latest_rows)
-    rows = latest_rows
-    pending_index = latest_index
-    pending_action = claimed_action
+    # Atomic click guard: claim the pending row while holding a per-queue file
+    # lock before any external TMS write.  This prevents two parallel Teams
+    # button invokes from both observing ``pending_review`` and both applying.
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = pending_path.with_suffix(pending_path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            latest_rows = _read_jsonl(pending_path)
+            match_action_id = str(pending_action.get("action_id") or "")
+            latest_index = None
+            latest_action: dict[str, Any] | None = None
+            for idx, row in enumerate(latest_rows):
+                same_action_id = match_action_id and str(row.get("action_id") or "") == match_action_id
+                same_target_value = (
+                    str(row.get("order_id") or "").strip().upper() == order_id
+                    and str(row.get("target") or "").strip() == short_target
+                    and str(row.get("value") or "").strip() == str(value or "").strip()
+                )
+                if same_action_id or same_target_value:
+                    latest_index = idx
+                    latest_action = row
+                    break
+            if latest_index is None or latest_action is None:
+                return {"type": "tms_update_approval_blocked", "target": short_target, "value": value, "status": "already_resolved", "reason": "pending_action_missing"}
+            if str(latest_action.get("status") or "") != "pending_review":
+                return {"type": "tms_update_approval_blocked", "target": short_target, "value": value, "status": "already_resolved", "reason": "pending_action_not_open"}
+            claimed_action = {**latest_action, **base_update, "status": "approved_pending_apply"}
+            latest_rows[latest_index] = claimed_action
+            _write_jsonl(pending_path, latest_rows)
+            rows = latest_rows
+            pending_index = latest_index
+            pending_action = claimed_action
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
     writeback_action = {
         "action_type": "field_update",
@@ -929,6 +941,38 @@ def _apply_approved_pending_tms_action(
         "suggested_value": value,
         "source": "teams_reply_explicit_approval",
     }
+
+    def _update_claimed_action(update: dict[str, Any]) -> dict[str, Any]:
+        """Merge a status update into the claimed action under the queue lock.
+
+        Re-read while locked so rows appended by other producers between claim
+        and final apply/verify result are preserved.
+        """
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            try:
+                latest_rows = _read_jsonl(pending_path)
+                latest_index = None
+                for idx, row in enumerate(latest_rows):
+                    same_action_id = match_action_id and str(row.get("action_id") or "") == match_action_id
+                    same_target_value = (
+                        str(row.get("order_id") or "").strip().upper() == order_id
+                        and str(row.get("target") or "").strip() == short_target
+                        and str(row.get("value") or "").strip() == str(value or "").strip()
+                    )
+                    if same_action_id or same_target_value:
+                        latest_index = idx
+                        break
+                if latest_index is None:
+                    latest_rows.append({**pending_action, **update})
+                    updated_row = latest_rows[-1]
+                else:
+                    updated_row = {**latest_rows[latest_index], **update}
+                    latest_rows[latest_index] = updated_row
+                _write_jsonl(pending_path, latest_rows)
+                return updated_row
+            finally:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
     context = {"order_id": order_id, "source_message_id": event.get("message_id")}
     apply_fn = apply_tms_update or _default_tms_apply
     verify_fn = verify_tms_value or _default_tms_verify
@@ -936,21 +980,18 @@ def _apply_approved_pending_tms_action(
     try:
         apply_result = apply_fn(writeback_action, context)
     except Exception as exc:
-        rows[pending_index] = {**pending_action, **base_update, "status": "apply_failed", "apply_error": str(exc)}
-        _write_jsonl(pending_path, rows)
+        _update_claimed_action({**base_update, "status": "apply_failed", "apply_error": str(exc)})
         return {"type": "tms_update_apply_failed", "target": short_target, "value": value, "status": "apply_failed", "error": str(exc)}
 
     applied_ok = str(apply_result.get("status") or "").lower() in {"ok", "applied"}
     if not applied_ok:
-        rows[pending_index] = {**pending_action, **base_update, "status": "apply_failed", "apply_result": apply_result}
-        _write_jsonl(pending_path, rows)
+        _update_claimed_action({**base_update, "status": "apply_failed", "apply_result": apply_result})
         return {"type": "tms_update_apply_failed", "target": short_target, "value": value, "status": "apply_failed", "apply_result": apply_result}
 
     try:
         verified_value = verify_fn(order_id, short_target)
     except Exception as exc:
-        rows[pending_index] = {**pending_action, **base_update, "status": "verification_failed", "apply_result": apply_result, "verification_error": str(exc)}
-        _write_jsonl(pending_path, rows)
+        _update_claimed_action({**base_update, "status": "verification_failed", "apply_result": apply_result, "verification_error": str(exc)})
         return {"type": "tms_update_verification_failed", "target": short_target, "value": value, "status": "verification_failed", "error": str(exc)}
 
     verified_match = str(verified_value or "").strip() == str(value or "").strip()
@@ -965,8 +1006,7 @@ def _apply_approved_pending_tms_action(
         "verified_value": verified_value,
         "verification": "fresh_tms_snapshot_matched" if verified_match else "fresh_tms_snapshot_mismatch",
     }
-    rows[pending_index] = updated
-    _write_jsonl(pending_path, rows)
+    updated = _update_claimed_action(updated)
     derived = {
         "type": "tms_update_applied" if verified_match else "tms_update_verification_failed",
         "target": short_target,

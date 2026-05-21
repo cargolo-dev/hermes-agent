@@ -668,6 +668,19 @@ def _build_document_agent_evidence_packet(
         "language": "de",
         "operator_surface": "microsoft_teams_internal_cargolo",
         "task": "Bewerte den neuen TMS-Dokument-Upload wie ein interner ASR-Mitarbeiter. Nutze nur diese Evidenz; rate nicht. Keine TMS-Änderung und keine Kundenkommunikation auslösen.",
+        "focus_rules": {
+            "primary_focus": "new_upload",
+            "stale_findings_must_not_dominate": "Erwähne ältere/andere Dokument-Findings nur, wenn sie laut Evidenz ein aktueller Blocker für genau diesen Upload sind.",
+            "if_uploaded_document_unreadable": "Nicht aus anderen Belegen operative Abweichungen hochziehen; kurz sagen, dass aus diesem Upload keine belastbare neue Aktion folgt.",
+            "separate_actionable_from_observe": "Nur konkrete Feldkonflikte, Blocker oder sichere Review-Intents als Handlung darstellen; reine Inventar-/Kontextinfos als Beobachten einstufen.",
+        },
+        "operator_quality_rubric": {
+            "style": "internal_forwarder_colleague",
+            "max_top_items": 3,
+            "avoid_generic_manual_review": True,
+            "must_include_operational_recommendation": True,
+            "must_state_no_side_effects": True,
+        },
         "order_id": report.get("order_id"),
         "document": {
             "filename": filename,
@@ -799,6 +812,42 @@ def _run_document_agent_review(packet: dict[str, Any]) -> dict[str, Any] | None:
     if completed.returncode != 0:
         return None
     return _parse_document_agent_review(completed.stdout)
+
+
+def _document_agent_review_text(review: dict[str, Any]) -> str:
+    sections = review.get("sections") if isinstance(review.get("sections"), dict) else {}
+    parts = [str(review.get("decision") or ""), str(review.get("priority") or "")]
+    parts.extend(str(sections.get(key) or "") for key in ("lage", "abgleich", "auffaellig", "empfehlung", "naechster_schritt"))
+    return " ".join(parts).lower()
+
+
+def _document_agent_review_is_quality_safe(packet: dict[str, Any], review: dict[str, Any]) -> bool:
+    """Keep the LLM as decision layer, but reject ungrounded stale/generic reviews.
+
+    This is a guardrail, not routing logic: the agent may decide, prioritize and
+    word the employee answer, but it may not invent stale issues or escalate an
+    unreadable/empty upload with generic "manual review" language.
+    """
+    if not isinstance(review, dict):
+        return False
+    text = _document_agent_review_text(review)
+    packet_text = json.dumps(packet, ensure_ascii=False).lower()
+    for token in ("russland", "sanktion", "896 kg", "508 kg", "896", "508"):
+        if token in text and token not in packet_text:
+            return False
+    raw_evidence = packet.get("deterministic_evidence")
+    evidence: dict[str, Any] = raw_evidence if isinstance(raw_evidence, dict) else {}
+    no_actionable_evidence = not any(
+        evidence.get(key)
+        for key in ("field_comparisons", "readable_evidence_lines", "findings", "safe_tms_review_intents")
+    )
+    generic_manual_review = (
+        str(review.get("decision") or "").strip().lower() == "manual_review"
+        or bool(review.get("needs_review"))
+    ) and any(token in text for token in ("manuell prüfen", "manuell pruefen", "fachlich/manuell", "gegenprüfen", "gegenpruefen"))
+    if no_actionable_evidence and generic_manual_review:
+        return False
+    return True
 
 
 def _message_from_agent_review(order_id: Any, review: dict[str, Any]) -> str:
@@ -1215,6 +1264,10 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         document_review_intents=document_review_intents,
     )
     agent_review = _run_document_agent_review(agent_evidence_packet)
+    rejected_agent_review: dict[str, Any] | None = None
+    if agent_review and not _document_agent_review_is_quality_safe(agent_evidence_packet, agent_review):
+        rejected_agent_review = {"mode": "external_agent_rejected", "reason": "ungrounded_stale_or_generic_review", "raw": agent_review}
+        agent_review = None
     fallback_message = _human_document_message(
         order_id=report.get("order_id"),
         filename=filename,
@@ -1279,7 +1332,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         "document_registry_summary": registry,
         "document_field_comparison": comparisons,
         "document_message_sections": document_message_sections,
-        "document_agent_review": agent_review or {"mode": "guardrailed_fallback", "reason": "external_agent_review_not_configured_or_invalid"},
+        "document_agent_review": agent_review or {"mode": "guardrailed_fallback", "reason": "external_agent_review_not_configured_or_invalid", "rejected_agent_review": rejected_agent_review},
         "document_agent_evidence_packet": agent_evidence_packet,
         "document_agent_fallback_message": fallback_message,
         "document_decision": document_decision,

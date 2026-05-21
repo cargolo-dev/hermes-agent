@@ -4,8 +4,11 @@ from plugins.cargolo_ops.employee_agent import (
     BoundaryAction,
     ContextNeed,
     EmployeeRequest,
+    EmployeeIntent,
+    RequestedSource,
     ResponseMode,
     SpecialistPlan,
+    Urgency,
     handle_employee_request,
 )
 
@@ -99,6 +102,70 @@ def test_case_question_builds_dynamic_context_plan_without_being_stiff() -> None
     assert [task["agent"] for task in response.specialist_plan.tasks] == ["case_context", "mail_history", "tms_snapshot"]
     assert all(task["mode"] == "read_only" for task in response.specialist_plan.tasks)
     assert response.should_send_to_teams is False
+
+
+def test_employee_agent_golden_case_matrix_for_agentic_routing() -> None:
+    cases = [
+        {
+            "text": "Was ist mit AN-11755?",
+            "mode": ResponseMode.CASE_ASSIST,
+            "action": BoundaryAction.NONE,
+            "needs": [ContextNeed.CASE_FOLDER],
+        },
+        {
+            "text": "Hat der Kunde zu AN-11755 geantwortet?",
+            "mode": ResponseMode.CASE_ASSIST,
+            "action": BoundaryAction.NONE,
+            "needs": [ContextNeed.CASE_FOLDER, ContextNeed.MAIL_HISTORY],
+        },
+        {
+            "text": "Fehlt noch was bei AN-11755 an Dokumenten?",
+            "mode": ResponseMode.CASE_ASSIST,
+            "action": BoundaryAction.NONE,
+            "needs": [ContextNeed.CASE_FOLDER, ContextNeed.DOCUMENTS],
+        },
+        {
+            "text": "Schreib dem Kunden zu AN-11755, dass wir die CI noch brauchen.",
+            "mode": ResponseMode.DRAFT_ONLY,
+            "action": BoundaryAction.CUSTOMER_MESSAGE_DRAFT,
+            "needs": [ContextNeed.CASE_FOLDER, ContextNeed.MAIL_HISTORY, ContextNeed.DOCUMENTS],
+        },
+        {
+            "text": "Setz MRN 26DE99999 und Zollstatus erledigt in AN-11755",
+            "mode": ResponseMode.GUARDED_ACTION_REQUIRED,
+            "action": BoundaryAction.TMS_WRITE,
+            "needs": [],
+        },
+        {
+            "text": "Welche Freigaben sind bei AN-11755 offen?",
+            "mode": ResponseMode.CASE_ASSIST,
+            "action": BoundaryAction.NONE,
+            "needs": [ContextNeed.CASE_FOLDER, ContextNeed.TMS_SNAPSHOT, ContextNeed.TEAMS_THREAD],
+        },
+    ]
+
+    for case in cases:
+        response = handle_employee_request(EmployeeRequest(text=case["text"], channel="teams"))
+
+        assert response.mode is case["mode"], case["text"]
+        assert response.boundary_action is case["action"], case["text"]
+        assert response.order_id == "AN-11755", case["text"]
+        assert response.context_needs == case["needs"], case["text"]
+        assert response.should_send_to_teams is False, case["text"]
+        assert response.should_write_tms is False, case["text"]
+        assert response.should_send_customer_message is False, case["text"]
+
+
+def test_unknown_an_stays_read_only_without_side_effects() -> None:
+    response = handle_employee_request(EmployeeRequest(text="Was ist mit AN-999999?", channel="teams"))
+
+    assert response.mode is ResponseMode.CASE_ASSIST
+    assert response.order_id == "AN-999999"
+    assert response.boundary_action is BoundaryAction.NONE
+    assert response.context_needs == [ContextNeed.CASE_FOLDER]
+    assert response.specialist_plan.tasks[0]["mode"] == "read_only"
+    assert response.should_send_to_teams is False
+    assert response.should_write_tms is False
 
 
 def test_teams_thread_read_request_is_case_assist_not_send_guard() -> None:
@@ -219,3 +286,62 @@ def test_agent_first_response_can_be_serialized_for_audit_without_side_effects()
     assert row["should_write_tms"] is False
     assert row["should_send_customer_message"] is False
     assert row["specialist_plan"]["tasks"]
+
+
+def test_structured_intent_free_form_ops_phrases() -> None:
+    cases = [
+        (
+            "Kann ich AN-11755 ziehen lassen?",
+            EmployeeIntent.RELEASE_READINESS_CHECK,
+            {RequestedSource.TMS_SNAPSHOT, RequestedSource.EMAIL_INDEX, RequestedSource.DOCUMENT_REGISTRY, RequestedSource.DOCUMENT_ANALYSIS, RequestedSource.BILLING_CONTEXT},
+        ),
+        (
+            "AN-11755 blockt da was?",
+            EmployeeIntent.BLOCKER_CHECK,
+            {RequestedSource.TMS_SNAPSHOT, RequestedSource.EMAIL_INDEX, RequestedSource.DOCUMENT_REGISTRY, RequestedSource.DOCUMENT_ANALYSIS, RequestedSource.TEAMS_THREAD_CONTEXT},
+        ),
+        (
+            "Sind wir bei AN-11755 auf Kundenseite noch offen?",
+            EmployeeIntent.CUSTOMER_OPEN_ITEMS_CHECK,
+            {RequestedSource.EMAIL_INDEX, RequestedSource.TMS_SNAPSHOT},
+        ),
+        (
+            "Haben wir bei AN-11755 alles für Verzollung?",
+            EmployeeIntent.CUSTOMS_READINESS_CHECK,
+            {RequestedSource.TMS_SNAPSHOT, RequestedSource.EMAIL_INDEX, RequestedSource.DOCUMENT_REGISTRY, RequestedSource.DOCUMENT_ANALYSIS},
+        ),
+        (
+            "Warum hängt der bei AN-11755?",
+            EmployeeIntent.DELAY_REASON_CHECK,
+            {RequestedSource.TMS_SNAPSHOT, RequestedSource.EMAIL_INDEX, RequestedSource.DOCUMENT_REGISTRY, RequestedSource.TEAMS_THREAD_CONTEXT},
+        ),
+    ]
+    for text, intent, sources in cases:
+        response = handle_employee_request(EmployeeRequest(text=text, channel="teams"))
+        assert response.mode is ResponseMode.CASE_ASSIST, text
+        assert response.structured_intent is not None, text
+        assert response.structured_intent.intent is intent, text
+        assert response.structured_intent.wants_write is False, text
+        assert response.structured_intent.needs_internal_recommendation is True, text
+        assert sources.issubset(set(response.structured_intent.requested_sources)), text
+        assert response.should_write_tms is False
+
+
+def test_structured_intent_todays_work_without_order_is_read_only() -> None:
+    response = handle_employee_request(EmployeeRequest(text="Was muss ich heute machen?", channel="teams"))
+
+    assert response.mode is ResponseMode.FREE_CHAT
+    assert response.structured_intent is not None
+    assert response.structured_intent.intent is EmployeeIntent.TODAYS_WORK
+    assert response.structured_intent.urgency is Urgency.TODAY
+    assert response.structured_intent.wants_write is False
+
+
+def test_structured_tms_write_guard_still_precedes_case_intent() -> None:
+    response = handle_employee_request(EmployeeRequest(text="Setz MRN 26DE99999 in AN-11755", channel="teams"))
+
+    assert response.mode is ResponseMode.GUARDED_ACTION_REQUIRED
+    assert response.structured_intent is not None
+    assert response.structured_intent.intent is EmployeeIntent.TMS_WRITE_REQUEST
+    assert response.structured_intent.wants_write is True
+    assert response.should_write_tms is False

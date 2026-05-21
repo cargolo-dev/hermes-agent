@@ -224,6 +224,61 @@ def test_processor_result_uses_human_document_message_without_risk_dump():
     assert result["document_agent_evidence_packet"]["contract"] == "agent_first_document_review_v1"
 
 
+def test_document_agent_packet_carries_employee_quality_rubric():
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-12140",
+            "tms_context": {"status": "in_transit", "network": "rail"},
+            "lifecycle": {},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+        },
+        {"id": 8801, "changed_at": "2026-05-20T07:03:00Z", "metadata": {"file_name": "Invoice.png", "document_type": "commercial_invoice"}},
+    )
+
+    packet = result["document_agent_evidence_packet"]
+    assert packet["contract"] == "agent_first_document_review_v1"
+    assert packet["focus_rules"]["primary_focus"] == "new_upload"
+    assert "stale_findings_must_not_dominate" in packet["focus_rules"]
+    assert packet["operator_quality_rubric"]["style"] == "internal_forwarder_colleague"
+    assert packet["operator_quality_rubric"]["avoid_generic_manual_review"] is True
+    assert packet["guardrails"]["writes_allowed"] is False
+
+
+def test_processor_result_rejects_generic_or_stale_external_review_for_unreadable_upload():
+    generic_review = {
+        "mode": "external_agent",
+        "sections": {
+            "lage": "Der neue Upload ist eine archivierte E-Mail, aus der keine lesbaren Sendungsdaten extrahiert wurden.",
+            "abgleich": "POL, POD, ETD und ETA können nicht abgeglichen werden; zusätzlich liegen aus vorhandenen Dokumenten Abweichungen bei Gewicht 896 kg statt 508 kg vor.",
+            "auffaellig": "Auffällig sind die erforderliche Sanktionsprüfung wegen Russland-Transit sowie Gewichts- und Packstückabweichungen.",
+            "empfehlung": "Bitte fachlich/manuell prüfen, bevor Daten operativ übernommen werden.",
+            "naechster_schritt": "Im TMS und in den vorliegenden Dokumenten Gewicht, Packstücke, Route/Russland-Transit und Terminangaben gegenprüfen.",
+        },
+        "decision": "manual_review",
+        "priority": "medium",
+        "needs_review": True,
+    }
+    with patch("plugins.cargolo_ops.document_activity_monitor._run_document_agent_review", return_value=generic_review):
+        result = _processor_result_from_report(
+            {
+                "order_id": "AN-13329",
+                "tms_context": {"status": "confirmed", "network": "rail"},
+                "lifecycle": {},
+                "registry_summary": {},
+                "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+            },
+            {"id": 8802, "changed_at": "2026-05-20T07:11:00Z", "metadata": {"file_name": "archived-email.eml", "document_type": "email"}},
+        )
+
+    assert result["document_agent_review"]["mode"] == "guardrailed_fallback"
+    assert result["analysis_priority"] == "low"
+    assert result["agent_review_required"] is False
+    assert "Russland" not in result["message"]
+    assert "896 kg" not in result["message"]
+    assert "fachlich/manuell prüfen" not in result["message"]
+
+
 def test_processor_result_uses_external_agent_review_when_available():
     agent_review = {
         "mode": "external_agent",

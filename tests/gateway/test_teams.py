@@ -937,8 +937,7 @@ class TestTeamsMessageHandling:
         assert event.text.startswith("Rolle: Du bist Hermes CARGOLO in Microsoft Teams")
         assert "Teams-Nachricht: erzähl mal einen witz" in event.text
         assert len(handoff_calls) == 1
-        assert len(route_calls) == 1
-        assert route_calls[0]["text"] == "erzähl mal einen witz"
+        assert len(route_calls) == 0
 
     @pytest.mark.asyncio
     async def test_cargolo_employee_dedicated_pending_command_uses_ops_router_before_handoff(self, monkeypatch):
@@ -1338,8 +1337,130 @@ class TestTeamsMessageHandling:
 
         adapter.handle_message.assert_not_awaited()
         mock_app.send.assert_awaited_once()
-        assert "nicht eindeutig" in mock_app.send.call_args[0][1]
+        assert "Review-Karte vorbereitet" in mock_app.send.call_args[0][1]
+        assert "Noch kein TMS-Write" in mock_app.send.call_args[0][1]
 
+
+
+    @pytest.mark.asyncio
+    async def test_cargolo_employee_handoff_tms_request_prepares_review_card_and_thread_context(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        class FakeTmsProvider:
+            def shipments_list(self, **kwargs):
+                return [{"shipment_number": "AN-11755"}]
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.build_tms_provider_from_env", lambda: FakeTmsProvider())
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids="19:abc@thread.v2",
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "guard-ack"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+        adapter.send_cargolo_asr_tms_review_card = AsyncMock()
+
+        activity = self._make_activity(
+            text="Bitte TMS MRN 26DE99999 eintragen für AN-11755",
+            activity_id="msg-employee-guard",
+            conversation_id="19:abc@thread.v2",
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert "Review-Karte vorbereitet" in mock_app.send.call_args[0][1]
+        assert "Noch kein TMS-Write" in mock_app.send.call_args[0][1]
+        adapter.send_cargolo_asr_tms_review_card.assert_awaited_once()
+        card = adapter.send_cargolo_asr_tms_review_card.call_args[0][1]
+        assert card["target"] == "customs_reference"
+        assert card["write_supported"] is False
+        context_path = tmp_path / "cargolo_asr" / "orders" / "AN-11755" / "teams" / "thread_context.json"
+        assert context_path.exists()
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+        assert "Review-Karte vorbereitet" in context["last_hermes_response"]["text"]
+
+
+
+    @pytest.mark.asyncio
+    async def test_dedicated_case_question_acks_before_full_ops_router(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        def forbidden_route(*args, **kwargs):
+            raise AssertionError("full ops router must not run before speed-layer ack for normal case questions")
+
+        monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.route_teams_ops_message", forbidden_route)
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids="19:abc@thread.v2",
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "case-ack"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+        started = []
+        adapter._start_cargolo_case_assist_speed_layer = lambda **kwargs: started.append(kwargs)
+
+        activity = self._make_activity(
+            text="Was ist mit AN-11755 los?",
+            activity_id="msg-case-speed",
+            conversation_id="19:abc@thread.v2",
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert "Bin dran" in mock_app.send.call_args[0][1]
+        assert started and started[0]["order_id"] == "AN-11755"
+
+    @pytest.mark.asyncio
+    async def test_cargolo_employee_handoff_upload_review_sends_review_card(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("plugins.cargolo_ops.teams_ops_router.build_tms_provider_from_env", lambda: None)
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id",
+            client_secret="x",
+            tenant_id="tenant",
+            cargolo_employee_handoff_enabled=True,
+            cargolo_employee_dedicated_channel_ids="19:abc@thread.v2",
+        ))
+        mock_result = MagicMock()
+        mock_result.id = "upload-ack"
+        mock_app = MagicMock()
+        mock_app.id = "bot-id"
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        adapter.handle_message = AsyncMock()
+        adapter.send_cargolo_asr_internal_review_card = AsyncMock()
+
+        activity = self._make_activity(
+            text="Lade die CI für AN-11755 ins TMS hoch",
+            activity_id="msg-upload-review",
+            conversation_id="19:abc@thread.v2",
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter.handle_message.assert_not_awaited()
+        mock_app.send.assert_awaited_once()
+        assert "Upload-Review" in mock_app.send.call_args[0][1]
+        assert "Noch kein Dokument hochgeladen" in mock_app.send.call_args[0][1]
+        adapter.send_cargolo_asr_internal_review_card.assert_awaited_once()
+        call = adapter.send_cargolo_asr_internal_review_card.call_args
+        assert call.kwargs["review_kind"] == "upload"
+        assert call.args[1]["action_type"] == "document_upload_review"
 
     @pytest.mark.asyncio
     async def test_cargolo_context_note_flows_to_generic_agent_prompt(self, monkeypatch):

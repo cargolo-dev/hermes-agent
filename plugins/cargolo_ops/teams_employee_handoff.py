@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .employee_agent import EmployeeRequest, ResponseMode, handle_employee_request
 from .employee_runtime import run_employee_runtime
-from .teams_ops_router import build_case_evidence_agent_handoff
+from .teams_ops_router import build_case_evidence_agent_handoff, route_teams_ops_message
 from .models import utc_now_iso
 
 
@@ -100,6 +100,65 @@ def handle_teams_employee_message(
     else:
         return {"handled": False, "reason": "mention_required", "requires_mention": True}
 
+
+    # Deterministic non-card action flows (upload/internal/TMS review queues) must
+    # win over generic case-assist classification.  They are still review-only and
+    # never perform TMS/customer side effects.
+    early_ops_review: dict[str, object] = {"handled": False}
+    early_action_text = request_text.lower()
+    if (
+        any(token in early_action_text for token in ("tms", "mrn", "hbl", "mbl", "hawb", "zollreferenz", "offene freig", "pending", "review", "status"))
+        or (any(token in early_action_text for token in ("lade", "upload", "hochladen")) and any(token in early_action_text for token in ("dokument", "doc", "ci", "pl", "datei", "commercial invoice", "packing")))
+        or any(token in early_action_text for token in ("markier erledigt", "markiere erledigt", "todo erledigt", "notiz", "interne note", "case-note"))
+    ):
+        early_ops_review = route_teams_ops_message(
+            text=request_text,
+            root=root,
+            chat_id=channel_id,
+            user_id=user_id,
+            user_name=user_name,
+            message_id=message_id,
+        )
+    early_classification = str(early_ops_review.get("classification") or "")
+    if early_ops_review.get("handled") and early_classification in {
+        "tms_review_card_prepared",
+        "tms_control_without_card_context",
+        "document_upload_review_prepared",
+        "internal_action_review_prepared",
+        "pending_tms_reviews",
+        "ops_status",
+        "shipment_not_found_in_tms",
+    }:
+        row = {
+            "timestamp": utc_now_iso(),
+            "handoff_mode": handoff_mode,
+            "requires_mention": requires_mention,
+            "channel_id": channel_id,
+            "message_id": message_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "request_text": request_text,
+            "order_id": early_ops_review.get("order_id"),
+            "runtime": {},
+            "handled": True,
+            "reason": None,
+            "classification": early_classification,
+            "passthrough_text": None,
+            "allow_generic_chat": False,
+            "agent_prompt": None,
+            "response_text": early_ops_review.get("response_text"),
+            "teams_tms_review_cards": early_ops_review.get("teams_tms_review_cards") or [],
+            "teams_upload_review_cards": early_ops_review.get("teams_upload_review_cards") or [],
+            "teams_internal_review_cards": early_ops_review.get("teams_internal_review_cards") or [],
+            "side_effects": early_ops_review.get("side_effects") or {},
+            "should_send_to_teams": bool(early_ops_review.get("should_send_to_teams", False)),
+            "should_write_tms": False,
+            "should_send_customer_message": False,
+        }
+        if handoff_config.audit_enabled:
+            _append_jsonl(root / "runtime" / "teams_employee_handoff.jsonl", row)
+        return row
+
     employee_request = EmployeeRequest(
         text=request_text,
         channel="teams",
@@ -122,6 +181,37 @@ def handle_teams_employee_message(
         "runtime": response.to_audit_row(),
     }
 
+    if mode_value in {ResponseMode.GUARDED_ACTION_REQUIRED.value, ResponseMode.DRAFT_ONLY.value}:
+        ops_review = route_teams_ops_message(
+            text=request_text,
+            root=root,
+            chat_id=channel_id,
+            user_id=user_id,
+            user_name=user_name,
+            message_id=message_id,
+        )
+        if ops_review.get("handled"):
+            row = {
+                **base_row,
+                "handled": True,
+                "reason": None,
+                "classification": str(ops_review.get("classification") or mode_value),
+                "passthrough_text": None,
+                "allow_generic_chat": False,
+                "agent_prompt": None,
+                "response_text": ops_review.get("response_text"),
+                "teams_tms_review_cards": ops_review.get("teams_tms_review_cards") or [],
+                "teams_upload_review_cards": ops_review.get("teams_upload_review_cards") or [],
+                "teams_internal_review_cards": ops_review.get("teams_internal_review_cards") or [],
+                "side_effects": ops_review.get("side_effects") or {},
+                "should_send_to_teams": bool(ops_review.get("should_send_to_teams", False)),
+                "should_write_tms": False,
+                "should_send_customer_message": False,
+            }
+            if handoff_config.audit_enabled:
+                _append_jsonl(root / "runtime" / "teams_employee_handoff.jsonl", row)
+            return row
+
     if mode_value == ResponseMode.CASE_ASSIST.value and order_id:
         handoff = build_case_evidence_agent_handoff(
             root=root,
@@ -138,6 +228,9 @@ def handle_teams_employee_message(
             "allow_generic_chat": bool(handoff.get("allow_generic_chat")),
             "agent_prompt": handoff.get("agent_prompt"),
             "response_text": handoff.get("response_text") if handoff.get("handled") else None,
+            "teams_tms_review_cards": handoff.get("teams_tms_review_cards") or [],
+            "teams_upload_review_cards": handoff.get("teams_upload_review_cards") or [],
+            "teams_internal_review_cards": handoff.get("teams_internal_review_cards") or [],
             "case_path": handoff.get("case_path"),
             "lifecycle": handoff.get("lifecycle"),
             "should_send_to_teams": bool(handoff.get("should_send_to_teams", False)),
