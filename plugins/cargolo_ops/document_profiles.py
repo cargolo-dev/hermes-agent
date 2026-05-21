@@ -81,6 +81,7 @@ DOCUMENT_PROFILES: dict[str, DocumentProfile] = {
             "currency",
             "amount",
         ),
+        trusted_tms_update_fields=("pieces", "gross_weight", "volume"),
     ),
     "customs_power_of_attorney": DocumentProfile(
         "customs_power_of_attorney",
@@ -222,6 +223,8 @@ def is_trusted_source_for_field(doc_type: Any, field: str) -> bool:
         "actual_delivery_date": "ata",
         "etd_main_carriage": "etd",
         "atd_main_carriage": "atd",
+        "cargo_weight_kg": "gross_weight",
+        "cargo_pieces": "pieces",
     }
     effective_field = field_aliases.get(str(field or ""), str(field or ""))
     if effective_field in profile.trusted_tms_update_fields:

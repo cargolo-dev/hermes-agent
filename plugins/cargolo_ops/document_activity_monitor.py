@@ -179,25 +179,59 @@ def _parse_registry_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _registry_identity_values(row: dict[str, Any]) -> list[Any]:
+    values = [
+        row.get("filename"),
+        row.get("sha256"),
+        row.get("tms_document_id"),
+        row.get("document_uuid"),
+        row.get("document_id"),
+        row.get("local_path"),
+        row.get("stored_path"),
+    ]
+    for path_key in ("local_path", "stored_path"):
+        path_value = str(row.get(path_key) or "").strip()
+        if path_value:
+            values.append(Path(path_value).name)
+    return values
+
+
 def _received_document_lookup(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
     for row in registry.get("received_documents") or []:
         if not isinstance(row, dict):
             continue
-        for key_value in (row.get("filename"), row.get("sha256")):
+        for key_value in _registry_identity_values(row):
             key = _norm(key_value)
             if key:
                 lookup[key] = row
     return lookup
 
 
-def _enrich_analyzed_row(row: dict[str, Any], received_lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _registry_document_lookup(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for collection_name in ("received_documents", "tms_documents", "mirrored_tms_documents"):
+        for row in registry.get(collection_name) or []:
+            if not isinstance(row, dict):
+                continue
+            for key_value in _registry_identity_values(row):
+                key = _norm(key_value)
+                if key:
+                    lookup[key] = row
+    return lookup
+
+
+def _enrich_registry_document_row(row: dict[str, Any], received_lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
     received = received_lookup.get(_norm(row.get("filename"))) or received_lookup.get(_norm(row.get("sha256"))) or {}
     analysis = _load_json(row.get("analysis_path") or received.get("analysis_path"))
     enriched = {**received, **row, "analysis": analysis}
     if not enriched.get("received_at") and received.get("received_at"):
         enriched["received_at"] = received.get("received_at")
     return enriched
+
+
+def _enrich_analyzed_row(row: dict[str, Any], received_lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return _enrich_registry_document_row(row, received_lookup)
 
 
 def _latest_analyzed_mail_attachment(registry: dict[str, Any]) -> dict[str, Any]:
@@ -220,10 +254,35 @@ def _select_uploaded_analysis(report: dict[str, Any], filename: str) -> dict[str
     metadata = metadata if isinstance(metadata, dict) else {}
     uploaded_norm = str(filename or "").strip().lower()
     received_lookup = _received_document_lookup(registry)
-    for row in registry.get("analyzed_documents") or []:
-        if isinstance(row, dict) and str(row.get("filename") or "").strip().lower() == uploaded_norm:
-            return _enrich_analyzed_row(row, received_lookup)
     analyzed = [row for row in registry.get("analyzed_documents") or [] if isinstance(row, dict)]
+    for row in analyzed:
+        if str(row.get("filename") or "").strip().lower() == uploaded_norm:
+            return _enrich_analyzed_row(row, received_lookup)
+
+    # TMS mirror names often differ from the original mail-history attachment
+    # name even when the file content is identical (e.g. CI(4).PDF in TMS vs
+    # CI.PDF in mail history).  Resolve the current upload by stable identity
+    # before declaring its analysis/evidence empty.
+    document_lookup = _registry_document_lookup(registry)
+    target_values: list[Any] = [filename, Path(str(filename)).name if str(filename or "").strip() else ""]
+    target_values.extend([metadata.get(key) for key in ("file_name", "filename", "sha256", "tms_document_id", "document_uuid", "document_id")])
+    target_keys = [_norm(value) for value in target_values if _norm(value)]
+    for key in target_keys:
+        matched_document = document_lookup.get(key)
+        if not matched_document:
+            continue
+        enriched_document = _enrich_registry_document_row(matched_document, received_lookup)
+        if enriched_document.get("analysis"):
+            return enriched_document
+        matched_sha = _norm(matched_document.get("sha256"))
+        matched_filename = _norm(matched_document.get("filename"))
+        for row in analyzed:
+            enriched = _enrich_analyzed_row(row, received_lookup)
+            if matched_sha and _norm(enriched.get("sha256")) == matched_sha:
+                return enriched
+            if matched_filename and _norm(enriched.get("filename")) == matched_filename:
+                return enriched
+
     if _is_archived_email_upload(filename, metadata):
         return _latest_analyzed_mail_attachment(registry)
     if len(analyzed) == 1:
@@ -565,7 +624,7 @@ def _focus_findings_for_upload(findings: list[Any], filename: str) -> list[Any]:
         finding_type = str(row.get("type") or "").strip().lower()
         if row_filename == uploaded_norm or (not row_filename and (severity in {"high", "critical", "blocker"} or "blocker" in finding_type)):
             focused.append(row)
-    return focused if focused else findings
+    return focused
 
 
 def _normalize_uploaded_findings(findings: list[Any], uploaded: dict[str, Any], filename: str) -> list[Any]:
@@ -758,12 +817,13 @@ def _build_document_evidence_lines(report: dict[str, Any], filename: str, limit:
     preferred = (
         ("document_number", "amount", "currency", "customer", "incoterm_named_place", "shipment_number", "pieces", "goods_description", "gross_weight", "volume")
         if doc_type == "offer"
-        else ("invoice_number", "document_number", "amount", "currency", "mrn", "container_number", "shipment_number", "customer_reference", "etd", "eta", "atd", "ata", "gross_weight", "volume")
+        else ("invoice_number", "document_number", "goods_value", "amount", "currency", "mrn", "container_number", "shipment_number", "customer_reference", "etd", "eta", "atd", "ata", "gross_weight", "volume", "incoterm_named_place", "pieces", "goods_description")
     )
     labels = {
         "invoice_number": "Rechnungsnr.",
         "document_number": "Dokumentnr.",
         "amount": "Betrag",
+        "goods_value": "Warenwert",
         "currency": "Währung",
         "mrn": "MRN",
         "container_number": "Container",
@@ -785,9 +845,9 @@ def _build_document_evidence_lines(report: dict[str, Any], filename: str, limit:
         value = _clean(fields.get(key))
         if not value or key not in relevant:
             continue
-        if key == "currency" and _clean(fields.get("amount")):
+        if key == "currency" and (_clean(fields.get("amount")) or _clean(fields.get("goods_value"))):
             continue
-        if key == "amount" and _clean(fields.get("currency")):
+        if key in {"amount", "goods_value"} and _clean(fields.get("currency")):
             value = f"{value} {fields.get('currency')}"
         lines.append(f"{labels.get(key, key)} {value}")
         if len(lines) >= limit:
@@ -864,14 +924,14 @@ def _build_document_field_comparison(report: dict[str, Any], filename: str) -> l
     if pieces_doc:
         pieces_tms, pieces_source = _tms_cargo_reference(detail, totals, "pieces")
         status = _numeric_comparison_status(pieces_tms, pieces_doc)
-        add("Packstücke", pieces_tms, pieces_doc, match=(status == "match") if status else None, target="Packstücke", field="pieces")
+        add("Packstücke", pieces_tms, pieces_doc, match=(status == "match") if status else None, target="cargo_pieces", field="pieces")
         if comparisons and comparisons[-1].get("label") == "Packstücke" and pieces_source:
             comparisons[-1]["source"] = pieces_source
     weight_doc = _clean(fields.get("weight_kg") or fields.get("total_weight_kg") or fields.get("gross_weight_kg") or fields.get("gross_weight"))
     if weight_doc:
         weight_tms, weight_source = _tms_cargo_reference(detail, totals, "weight")
         status = _numeric_comparison_status(weight_tms, weight_doc, tolerance=1.0)
-        add("Gewicht", weight_tms, weight_doc, match=(status == "match") if status in {"match", "diff"} else None, target="Gewicht", field="gross_weight")
+        add("Gewicht", weight_tms, weight_doc, match=(status == "match") if status in {"match", "diff"} else None, target="cargo_weight_kg", field="gross_weight")
         if comparisons and comparisons[-1].get("label") == "Gewicht":
             if status == "near_match":
                 comparisons[-1]["status"] = "near_match"
@@ -927,6 +987,64 @@ def _priority_max(*values: Any) -> str:
     return labels[min(rank, len(labels) - 1)]
 
 
+def _document_finding_requires_operator_review(row: Any) -> bool:
+    """Return True only for findings that are actionable for the current upload.
+
+    The reconciliation report can carry case-level risk from older/other
+    documents.  Document activity notifications must not convert those stale or
+    inventory-style notes into a high-priority manual-review instruction for a
+    newly uploaded document whose concrete fields match TMS.
+    """
+    if not isinstance(row, dict):
+        return False
+    severity = str(row.get("severity") or "").strip().lower()
+    finding_type = str(row.get("type") or "").strip().lower()
+    summary = str(row.get("summary") or "").strip().lower()
+    code = str(row.get("code") or "").strip().lower()
+    if severity in {"blocker", "high", "critical"} or "blocker" in finding_type:
+        return True
+    if finding_type in {"mrn_mismatch", "tms_document_weight_mismatch", "tms_document_piece_mismatch", "document_unreadable", "local_file_missing"}:
+        return True
+    if code in {"proforma_invoice", "zero_value"}:
+        return True
+    # Observations that are useful to show, but should not by themselves create a
+    # generic manual-review task when the new upload otherwise matches TMS.
+    if any(token in summary for token in ("multi-po", "multi po", "mehrere po", "fehlende dokumentnummer", "missing document number", "dokumentnummer fehlt")):
+        return False
+    if finding_type in {"document_flag", "document_open_question"} and severity in {"low", "medium", ""}:
+        return False
+    return bool(row)
+
+
+def _current_upload_review_floor(
+    *,
+    case_risk: Any,
+    case_needs_review: bool,
+    findings: list[Any],
+    comparisons: list[dict[str, str]],
+    document_review_intents: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    actionable_findings = [row for row in findings if _document_finding_requires_operator_review(row)]
+    mismatch_rows = [row for row in comparisons if row.get("status") in {"diff", "missing_tms"}]
+    intents = document_review_intents or []
+    if _has_blocker_finding(actionable_findings) or any(isinstance(row, dict) and str(row.get("severity") or "").lower() in {"high", "critical"} for row in actionable_findings):
+        priority = "high"
+    elif actionable_findings or mismatch_rows or intents:
+        priority = "medium"
+    else:
+        priority = "low"
+    return {
+        "priority": priority,
+        "needs_review": bool(actionable_findings or mismatch_rows or intents),
+        "actionable_finding_count": len(actionable_findings),
+        "mismatch_count": len(mismatch_rows),
+        "review_intent_count": len(intents),
+        "case_risk": str(case_risk or "low").strip().lower() or "low",
+        "case_needs_review": bool(case_needs_review),
+        "case_risk_not_used_for_document_priority": bool((str(case_risk or "low").strip().lower() in {"medium", "high", "critical"} or case_needs_review) and not (actionable_findings or mismatch_rows or intents)),
+    }
+
+
 def _build_document_agent_evidence_packet(
     *,
     report: dict[str, Any],
@@ -940,6 +1058,9 @@ def _build_document_agent_evidence_packet(
     comparisons: list[dict[str, str]],
     evidence_lines: list[str],
     document_review_intents: list[dict[str, Any]],
+    case_risk: str = "low",
+    case_needs_review: bool = False,
+    current_upload_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
     lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
@@ -993,6 +1114,9 @@ def _build_document_agent_evidence_packet(
         "deterministic_evidence": {
             "priority_floor": priority,
             "needs_review_floor": needs_review,
+            "case_reconciliation_risk": case_risk,
+            "case_needs_human_review": case_needs_review,
+            "current_upload_review": current_upload_review or {},
             "field_comparisons": comparisons,
             "readable_evidence_lines": evidence_lines,
             "findings": findings,
@@ -1121,6 +1245,18 @@ def _document_agent_review_is_quality_safe(packet: dict[str, Any], review: dict[
             return False
     raw_evidence = packet.get("deterministic_evidence")
     evidence: dict[str, Any] = raw_evidence if isinstance(raw_evidence, dict) else {}
+    current_upload_review = evidence.get("current_upload_review") if isinstance(evidence.get("current_upload_review"), dict) else {}
+    no_current_upload_action = not any(
+        int(current_upload_review.get(key) or 0) > 0
+        for key in ("actionable_finding_count", "mismatch_count", "review_intent_count")
+    )
+    agent_escalates = (
+        str(review.get("decision") or "").strip().lower() in {"manual_review", "queue_review_card"}
+        or str(review.get("priority") or "").strip().lower() in {"high", "critical"}
+        or bool(review.get("needs_review"))
+    )
+    if no_current_upload_action and agent_escalates:
+        return False
     no_actionable_evidence = not any(
         evidence.get(key)
         for key in ("field_comparisons", "readable_evidence_lines", "findings", "safe_tms_review_intents")
@@ -1163,7 +1299,8 @@ def _human_document_message(
     route = _route_hint(context)
     status = str(context.get("status") or "").strip()
     network = str(context.get("network") or context.get("mode") or "").strip()
-    context_bits = [bit for bit in (network, status, route) if bit]
+    customer_ref = str(context.get("customer_reference") or "").strip()
+    context_bits = [bit for bit in (network, status, route, f"Kundenref. {customer_ref}" if customer_ref else "") if bit]
     lage = f"Neuer Beleg geprüft: {label}. Ich habe ihn mit dem aktuellen TMS-Stand abgeglichen."
     if normalized_doc_type == "offer":
         lage = "Angebot geprüft. Ich habe Angebotsdaten und TMS-Kontext abgeglichen; daraus wurde keine automatische TMS-Korrektur abgeleitet."
@@ -1273,35 +1410,76 @@ def _human_document_message(
     ])
 
 
-def _queue_document_review_cards(
+def _existing_pending_review_card(root: Path, order_id: str, target: str, value: str) -> dict[str, Any] | None:
+    normalized_order_id = str(order_id or "").strip().upper()
+    if not re.fullmatch(r"(?:AN|BU)-[A-Z0-9_-]+", normalized_order_id):
+        return None
+    queue_path = root / "orders" / normalized_order_id / "teams" / "pending_tms_actions.jsonl"
+    if not queue_path.exists():
+        return None
+    try:
+        lines = queue_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    normalized_value = str(value or "").strip().upper()
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status") or "") != "pending_review":
+            continue
+        if str(row.get("order_id") or "").strip().upper() != normalized_order_id:
+            continue
+        if str(row.get("target") or "").strip() == target and str(row.get("value") or "").strip().upper() == normalized_value:
+            return row
+    return None
+
+
+def _duplicate_review_card_summary(card: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
+    target = str(card.get("target") or "").strip()
+    value = str(card.get("value") or "").strip()
+    return {
+        **card,
+        "action_id": None,
+        "existing_action_id": existing.get("action_id"),
+        "duplicate": True,
+        "summary": f"Review-Kachel existiert bereits: {target} {value}; keine zweite Kachel erstellt.",
+    }
+
+
+def _queue_document_review_card_results(
     *,
     storage_root: Path | None,
     order_id: str,
     intents: list[dict[str, Any]],
     event: dict[str, Any],
     max_cards: int = 3,
-) -> list[dict[str, Any]]:
-    """Queue safe document-derived TMS proposals as Teams approval cards.
+) -> dict[str, list[dict[str, Any]]]:
+    """Queue safe document-derived TMS proposals and report created vs duplicate cards.
 
-    This is intentionally still review-first: no TMS write happens here.  The
-    card lets the operator explicitly approve/reject the proposed field update.
+    Duplicates are not errors and must be visible to the operator-facing result:
+    an already-open pending_review card means the value was recognised again, but
+    no second Teams/TMS approval card should be created.
     """
+    result: dict[str, list[dict[str, Any]]] = {"created": [], "duplicates": []}
     if not intents:
-        return []
+        return result
     try:
         from .teams_reply_loop import record_agent_tms_update_intent
     except Exception:
-        return []
+        return result
     root = CaseStore(storage_root).root
     normalized_order = str(order_id or "").strip().upper()
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
     fallback_doc_label = _doc_type_label(metadata.get("document_type") or "Dokument")
     write_supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date"}
     activity_id = _activity_id(event)
-    queued_cards: list[dict[str, Any]] = []
     for intent in intents:
-        if len(queued_cards) >= max_cards:
-            break
         if not isinstance(intent, dict):
             continue
         target = str(intent.get("target") or "").strip()
@@ -1316,6 +1494,25 @@ def _queue_document_review_cards(
             f"TMS aktuell {previous}. Quelle: {doc_label}, Activity {activity_id or '-'}; "
             "keine automatische TMS-Änderung ohne Teams-Freigabe."
         )
+        card = {
+            "order_id": normalized_order,
+            "action_id": None,
+            "target": target,
+            "value": value,
+            "previous_value": previous,
+            "operator": "Hermes Dokumentmonitor",
+            "context_id": context_id,
+            "source": "document_activity_monitor",
+            "evidence": {"source": doc_label, "previous_value": previous, "document_value": value, "summary": text},
+            "write_supported": target in write_supported_targets,
+            "question": f"{label}: Dokumentwert {value} ins TMS übernehmen?" if target in write_supported_targets else f"{label}: Dokumentwert {value} fachlich bestätigen?",
+        }
+        existing_duplicate = _existing_pending_review_card(root, normalized_order, target, value)
+        if existing_duplicate:
+            result["duplicates"].append(_duplicate_review_card_summary(card, existing_duplicate))
+            continue
+        if len(result["created"]) >= max_cards:
+            continue
         queued = record_agent_tms_update_intent(
             root=root,
             order_id=normalized_order,
@@ -1339,20 +1536,30 @@ def _queue_document_review_cards(
             write_supported=target in write_supported_targets,
         )
         if queued.get("queued"):
-            queued_cards.append({
-                "order_id": normalized_order,
-                "action_id": queued.get("action_id"),
-                "target": target,
-                "value": value,
-                "previous_value": previous,
-                "operator": "Hermes Dokumentmonitor",
-                "context_id": context_id,
-                "source": "document_activity_monitor",
-                "evidence": {"source": doc_label, "previous_value": previous, "document_value": value, "summary": text},
-                "write_supported": target in write_supported_targets,
-                "question": f"{label}: Dokumentwert {value} ins TMS übernehmen?" if target in write_supported_targets else f"{label}: Dokumentwert {value} fachlich bestätigen?",
-            })
-    return queued_cards
+            card["action_id"] = queued.get("action_id")
+            result["created"].append(card)
+        elif queued.get("duplicate"):
+            duplicate_existing = {"action_id": queued.get("action_id")}
+            result["duplicates"].append(_duplicate_review_card_summary(card, duplicate_existing))
+    return result
+
+
+def _queue_document_review_cards(
+    *,
+    storage_root: Path | None,
+    order_id: str,
+    intents: list[dict[str, Any]],
+    event: dict[str, Any],
+    max_cards: int = 3,
+) -> list[dict[str, Any]]:
+    """Queue safe document-derived TMS proposals as Teams approval cards."""
+    return _queue_document_review_card_results(
+        storage_root=storage_root,
+        order_id=order_id,
+        intents=intents,
+        event=event,
+        max_cards=max_cards,
+    )["created"]
 
 
 def _section_from_message(message: str, label: str) -> str:
@@ -1389,7 +1596,19 @@ def _build_tms_update_review_intents_from_comparisons(
         return []
     activity_id = _activity_id(event)
     context_id = f"{order_id}:{activity_id}:document_monitor" if activity_id else f"{order_id}:document_monitor"
-    supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage"}
+    supported_targets = {
+        "mbl_number",
+        "container_number",
+        "hbl_number",
+        "hawb_number",
+        "customs_reference",
+        "estimated_delivery_date",
+        "actual_delivery_date",
+        "etd_main_carriage",
+        "atd_main_carriage",
+        "cargo_weight_kg",
+        "cargo_pieces",
+    }
     write_supported_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date"}
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
     filename = metadata.get("file_name") or metadata.get("filename") or event.get("field_name")
@@ -1553,23 +1772,27 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
     effective_doc_type_for_label = _uploaded_analysis_doc_type(doc_type, uploaded_for_label)
     if effective_doc_type_for_label and effective_doc_type_for_label != "unknown":
         doc_type = effective_doc_type_for_label
-    risk = str(reconciliation.get("risk") or "low").strip().lower()
-    needs_review = bool(reconciliation.get("needs_human_review"))
+    case_risk = str(reconciliation.get("risk") or "low").strip().lower()
+    case_needs_review = bool(reconciliation.get("needs_human_review"))
     raw_findings = reconciliation.get("findings")
     findings: list[Any] = raw_findings if isinstance(raw_findings, list) else []
     findings = _focus_findings_for_upload(findings, str(filename))
     findings = _normalize_uploaded_findings(findings, uploaded_for_label, str(filename))
     if findings is not raw_findings:
         reconciliation = {**reconciliation, "findings": findings}
-    priority = "high" if risk in {"high", "critical"} or _has_blocker_finding(findings) else ("medium" if needs_review or findings else "low")
     context = report.get("tms_context") if isinstance(report.get("tms_context"), dict) else {}
     comparisons = _build_document_field_comparison(report, str(filename))
     evidence_lines = _build_document_evidence_lines(report, str(filename))
-    if any(row.get("status") in {"diff", "missing_tms"} for row in comparisons):
-        needs_review = True
-        if priority == "low":
-            priority = "medium"
     document_review_intents = _build_tms_update_review_intents_from_comparisons(report=report, event=event, comparisons=comparisons, findings=findings)
+    current_upload_review = _current_upload_review_floor(
+        case_risk=case_risk,
+        case_needs_review=case_needs_review,
+        findings=findings,
+        comparisons=comparisons,
+        document_review_intents=document_review_intents,
+    )
+    priority = str(current_upload_review.get("priority") or "low")
+    needs_review = bool(current_upload_review.get("needs_review"))
     agent_evidence_packet = _build_document_agent_evidence_packet(
         report=report,
         event=event,
@@ -1582,6 +1805,9 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         comparisons=comparisons,
         evidence_lines=evidence_lines,
         document_review_intents=document_review_intents,
+        case_risk=case_risk,
+        case_needs_review=case_needs_review,
+        current_upload_review=current_upload_review,
     )
     agent_review = _run_document_agent_review(agent_evidence_packet)
     rejected_agent_review: dict[str, Any] | None = None
@@ -1668,6 +1894,9 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
             "field_comparison_count": len(comparisons),
             "document_evidence_count": len(evidence_lines),
             "review_intent_count": review_count,
+            "case_reconciliation_risk": case_risk,
+            "current_upload_priority": priority,
+            "current_upload_review": current_upload_review,
         },
         "side_effects": side_effects,
         "teams_tms_review_cards": [],
@@ -1743,21 +1972,47 @@ def run_document_activity_monitor(
                 trigger_event=event,
             )
             processor_result = _processor_result_from_report(report, event)
-            review_cards = _queue_document_review_cards(
+            raw_review_intents = processor_result.get("document_review_intents")
+            document_review_intents = raw_review_intents if isinstance(raw_review_intents, list) else []
+            review_card_result = _queue_document_review_card_results(
                 storage_root=storage_root,
                 order_id=order_id,
-                intents=processor_result.get("document_review_intents") if isinstance(processor_result.get("document_review_intents"), list) else [],
+                intents=document_review_intents,
                 event=event,
             )
+            review_cards = review_card_result.get("created") or []
+            duplicate_review_cards = review_card_result.get("duplicates") or []
             if review_cards:
                 processor_result["teams_tms_review_cards"] = review_cards
                 side_effects = processor_result.get("side_effects") if isinstance(processor_result.get("side_effects"), dict) else {}
                 side_effects["queued_tms_actions"] = len(review_cards)
                 processor_result["side_effects"] = side_effects
-                pending = processor_result.get("pending_action_summary") if isinstance(processor_result.get("pending_action_summary"), dict) else {}
+                pending_raw = processor_result.get("pending_action_summary")
+                pending = pending_raw if isinstance(pending_raw, dict) else {}
                 pending["review"] = max(int(pending.get("review", 0) or 0), len(review_cards))
+                pending["review_intents_detected"] = len(document_review_intents)
+                pending["review_cards_created"] = len(review_cards)
+                pending["review_cards_duplicate"] = len(duplicate_review_cards)
                 processor_result["pending_action_summary"] = pending
                 processor_result["document_decision"] = "TMS-Freigabe-Kachel erstellt; wartet auf Bestätigung/Ablehnung"
+            if duplicate_review_cards:
+                processor_result["duplicate_tms_review_cards"] = duplicate_review_cards
+                pending_raw = processor_result.get("pending_action_summary")
+                pending = pending_raw if isinstance(pending_raw, dict) else {}
+                pending["review"] = max(int(pending.get("review", 0) or 0), len(duplicate_review_cards))
+                pending["review_intents_detected"] = len(document_review_intents)
+                pending["review_cards_created"] = len(review_cards)
+                pending["review_cards_duplicate"] = len(duplicate_review_cards)
+                processor_result["pending_action_summary"] = pending
+                side_effects = processor_result.get("side_effects") if isinstance(processor_result.get("side_effects"), dict) else {}
+                processor_result["side_effects"] = side_effects
+                processor_result["open_review_cards_referenced"] = len(duplicate_review_cards)
+                duplicate_summary = "; ".join(str(card.get("summary") or "").strip() for card in duplicate_review_cards if isinstance(card, dict) and card.get("summary"))
+                if duplicate_summary:
+                    processor_result["message"] = f"{str(processor_result.get('message') or '').rstrip()}\nHinweis: {duplicate_summary}"
+                    processor_result["analysis_summary"] = processor_result["message"]
+                if not review_cards:
+                    processor_result["document_decision"] = "TMS-Freigabe-Kachel existiert bereits; keine zweite Kachel erstellt"
             notification_result: dict[str, Any] | None = None
             if notify_ops_webhook:
                 notification_result = send_manual_ops_notification(

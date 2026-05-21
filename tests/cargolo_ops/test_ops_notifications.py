@@ -195,6 +195,81 @@ def test_document_activity_notification_renders_operator_card(tmp_path):
     assert "color:#ffffff" in body["message_text"]
 
 
+def test_document_activity_notification_mentions_existing_duplicate_review_card(tmp_path):
+    report_path = tmp_path / "report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "order_id": "AN-11790",
+                "lifecycle": {"document_registry_path": str(tmp_path / "missing_registry.json")},
+                "tms_context": {"status": "customs_pending", "network": "sea"},
+                "reconciliation": {"risk": "medium", "needs_human_review": True, "findings": []},
+                "trigger_event": {"metadata": {"file_name": "HBL.pdf", "document_type": "house_bl"}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    body = build_manual_ops_notification_body(
+        run_type="document_activity_monitor",
+        payload={
+            "order_id": "AN-11790",
+            "activity_event": {"metadata": {"file_name": "HBL.pdf", "document_type": "house_bl"}},
+            "processor_result": {
+                "order_id": "AN-11790",
+                "status": "document_uploaded_checked",
+                "message": "\n".join([
+                    "Lage: AN-11790 · House-B/L wurde geprüft.",
+                    "Abgleich: TMS: Container nicht gepflegt, Dokument: XHCU2996441.",
+                    "Auffällig: Container fehlt im TMS.",
+                    "Empfehlung: Container prüfen lassen.",
+                    "Nächster Schritt: Hermes/Operator prüft die vorgeschlagenen TMS-Feldwerte.",
+                ]),
+                "document_monitoring_report_path": str(report_path),
+                "document_review_intents": [{"target": "container_number", "value": "XHCU2996441"}],
+                "teams_tms_review_cards": [],
+                "duplicate_tms_review_cards": [{"target": "container_number", "value": "XHCU2996441", "existing_action_id": "abc123"}],
+            },
+        },
+    )
+
+    assert "Keine neue Kachel erstellt" in body["message_text"]
+    assert "offene Review-Kachel existiert bereits" in body["message_text"]
+    assert "container_number XHCU2996441" in body["message_text"]
+
+
+def test_document_activity_notification_mentions_created_and_existing_review_cards(tmp_path):
+    body = build_manual_ops_notification_body(
+        run_type="document_activity_monitor",
+        payload={
+            "order_id": "AN-11790",
+            "activity_event": {"metadata": {"file_name": "HBL.pdf", "document_type": "house_bl"}},
+            "processor_result": {
+                "order_id": "AN-11790",
+                "status": "document_uploaded_checked",
+                "message": "\n".join([
+                    "Lage: AN-11790 · House-B/L wurde geprüft.",
+                    "Auffällig: Container und MBL prüfen.",
+                    "Empfehlung: Review-Karten prüfen.",
+                    "Nächster Schritt: Hermes/Operator prüft die vorgeschlagenen TMS-Feldwerte.",
+                ]),
+                "document_review_intents": [
+                    {"target": "mbl_number", "value": "MBL-1"},
+                    {"target": "container_number", "value": "XHCU2996441"},
+                ],
+                "teams_tms_review_cards": [{"target": "mbl_number", "value": "MBL-1", "action_id": "new"}],
+                "duplicate_tms_review_cards": [{"target": "container_number", "value": "XHCU2996441", "existing_action_id": "old"}],
+            },
+        },
+    )
+
+    assert "TMS-Freigabe-Kachel" in body["message_text"]
+    assert "Zusätzlich existiert bereits eine offene Review-Kachel" in body["message_text"]
+    assert "container_number XHCU2996441" in body["message_text"]
+    assert "Vorher wurde nichts im TMS geändert" in body["message_text"]
+
+
 def test_document_activity_notification_labels_generic_email_by_analyzed_offer_profile(tmp_path):
     analysis_path = tmp_path / "offer_analysis.json"
     registry_path = tmp_path / "registry.json"

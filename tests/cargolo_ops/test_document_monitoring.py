@@ -8,10 +8,11 @@ from unittest.mock import patch
 
 import pytest
 
-from plugins.cargolo_ops.document_monitoring import run_document_monitoring
+from plugins.cargolo_ops.document_monitoring import run_document_monitoring, _shipment_context
 from plugins.cargolo_ops.document_reconciliation import reconcile_documents
 from plugins.cargolo_ops.document_activity_monitor import (
     _processor_result_from_report,
+    _queue_document_review_card_results,
     _queue_document_review_cards,
     run_document_activity_monitor,
 )
@@ -167,6 +168,101 @@ def test_processor_resolves_archived_email_upload_to_latest_analyzed_attachment(
     assert "Embargoprüfung" not in message
     assert result["document_agent_evidence_packet"]["document"]["filename"] == "Transportauftrag-AN-13416.pdf"
     assert all(finding.get("filename") != "Angebot-AN-13416-V1.pdf" for finding in result["document_reconciliation"]["findings"])
+
+
+def test_processor_resolves_tms_mirror_upload_by_sha_and_writes_world_class_invoice_message(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_CMD", raising=False)
+    sha = "c3a89c1d34819aac9f1ad200ba59565185c0f2e36263bbb453e8d551d2eb7e59"
+    analysis_path = tmp_path / "ci.analysis.json"
+    registry_path = tmp_path / "registry.json"
+    snapshot_path = tmp_path / "snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": "CI.PDF",
+                "doc_type": "commercial_invoice",
+                "summary": "Handelsrechnung über Displays im Gesamtwert von 6.810 USD auf Basis EXW.",
+                "extracted_fields": {
+                    "document_type": "Commercial Invoice",
+                    "invoice_number": "20250402001",
+                    "document_number": "20250402001",
+                    "shipment_number": "AN-12258",
+                    "customer": "Fitness Nation GmbH",
+                    "incoterm_named_place": "EXW",
+                    "pieces": "12",
+                    "goods_description": "65-inch vertical advertising display",
+                    "goods_value": "6810",
+                    "currency": "USD",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    other_analysis_path = tmp_path / "packing.analysis.json"
+    other_analysis_path.write_text(
+        json.dumps({"filename": "PACKING LIST.PDF", "doc_type": "packing_list", "extracted_fields": {"pieces": "12"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "received_documents": [
+                    {"filename": "CI.PDF", "sha256": sha, "analysis_path": str(analysis_path), "analysis_doc_type": "commercial_invoice"},
+                    {"filename": "PACKING LIST.PDF", "sha256": "other-sha", "analysis_path": str(other_analysis_path), "analysis_doc_type": "packing_list"},
+                ],
+                "analyzed_documents": [
+                    {"filename": "CI.PDF", "analysis_path": str(analysis_path), "analysis_doc_type": "commercial_invoice"},
+                    {"filename": "PACKING LIST.PDF", "analysis_path": str(other_analysis_path), "analysis_doc_type": "packing_list"},
+                ],
+                "tms_documents": [
+                    {
+                        "tms_document_id": "f8d2221a-5598-4e63-9a06-b380ac2b6e42",
+                        "document_id": 60359,
+                        "filename": "CI(4).PDF",
+                        "sha256": sha,
+                        "analysis_path": str(analysis_path),
+                        "analysis_doc_type": "commercial_invoice",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(json.dumps({"detail": {"totals": {"total_pieces": 12}, "freight_details": {}, "transport_legs": []}}), encoding="utf-8")
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-12258",
+            "tms_context": {"status": "in_transit", "network": "rail", "destination_city": "Waltrop", "destination_country": "DE"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+            "trigger_event": {"metadata": {"file_name": "CI(4).PDF", "document_type": "commercial_invoice", "tms_document_id": "f8d2221a-5598-4e63-9a06-b380ac2b6e42"}},
+        },
+        {"id": 2020, "changed_at": "2026-05-21T09:47:00Z", "changed_by_name": "CARGOLO Admin", "metadata": {"file_name": "CI(4).PDF", "document_type": "commercial_invoice", "tms_document_id": "f8d2221a-5598-4e63-9a06-b380ac2b6e42"}},
+    )
+
+    message = result["message"]
+    assert result["latest_subject"] == "CI(4).PDF"
+    assert result["document_agent_evidence_packet"]["document"]["extracted_fields"]["invoice_number"] == "20250402001"
+    assert result["evidence_summary"]["document_evidence_count"] >= 4
+    assert "Rechnungsnr. 20250402001" in message
+    assert "Warenwert 6810 USD" in message
+    assert "Incoterm EXW" in message
+    assert "Packstücke passt" in message
+    assert "nicht auslesbar" not in message.lower()
+    assert "keine auslesbaren" not in message.lower()
+    assert result["analysis_priority"] == "low"
+    assert result["agent_review_required"] is False
+    assert result["pending_action_summary"]["review"] == 0
+
+
+def test_shipment_context_includes_customer_reference_for_document_cards():
+    context = _shipment_context({"detail": {"customer_reference": "AA2500432", "network": "rail", "status": "in_transit"}})
+
+    assert context["customer_reference"] == "AA2500432"
 
 
 def test_reconciliation_does_not_turn_missing_docs_alone_into_risk():
@@ -409,6 +505,140 @@ def test_processor_result_uses_tms_cargo_items_and_soft_currency_uncertainty(tmp
     assert "USD extrahiert" in result["document_reconciliation"]["findings"][0]["summary"]
 
 
+def test_processor_result_keeps_case_high_risk_out_of_current_packlist_priority(tmp_path):
+    filename = "R4-4-10-G01-packing list-RAIL.xls"
+    analysis_path = tmp_path / "packing_analysis.json"
+    registry_path = tmp_path / "registry.json"
+    snapshot_path = tmp_path / "tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": filename,
+                "doc_type": "packing_list",
+                "summary": "Packing list for rail shipment; 68 cartons and 2148 kg readable.",
+                "extracted_fields": {"pieces": "68", "gross_weight": "2148", "customer_reference": "AA2500432"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps({"analyzed_documents": [{"filename": filename, "analysis_path": str(analysis_path), "analysis_doc_type": "packing_list"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "network": "rail",
+                    "status": "in_transit",
+                    "customer_reference": "AA2500432",
+                    "totals": {"total_pieces": 68, "total_weight_kg": 2148},
+                    "freight_details": {},
+                    "transport_legs": [],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("plugins.cargolo_ops.document_activity_monitor._run_document_agent_review", return_value=None):
+        result = _processor_result_from_report(
+            {
+                "order_id": "AN-12374",
+                "tms_context": {"status": "in_transit", "network": "rail", "customer_reference": "AA2500432"},
+                "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+                "registry_summary": {},
+                "reconciliation": {
+                    "risk": "high",
+                    "needs_human_review": True,
+                    "findings": [
+                        {"type": "document_flag", "severity": "medium", "filename": filename, "summary": "Multi-PO-Hinweis; mehrere POs auf Packliste"},
+                        {"type": "document_open_question", "severity": "low", "filename": filename, "summary": "fehlende Dokumentnummer"},
+                    ],
+                },
+            },
+            {"id": 1998, "changed_at": "2026-05-21T08:00:00Z", "metadata": {"file_name": filename, "document_type": "packing_list"}},
+        )
+
+    assert result["analysis_priority"] == "low"
+    assert result["agent_review_required"] is False
+    assert result["pending_action_summary"]["review"] == 0
+    assert result["evidence_summary"]["case_reconciliation_risk"] == "high"
+    assert result["evidence_summary"]["current_upload_review"]["case_risk_not_used_for_document_priority"] is True
+    assert "Packstücke passt" in result["message"]
+    assert "Gewicht passt" in result["message"]
+    assert "Kundenref. AA2500432" in result["message"]
+    assert "fachlich/manuell prüfen" not in result["message"]
+    assert "Agent Review erforderlich" not in result["document_decision"]
+
+
+def test_processor_result_filters_stale_high_finding_from_other_document(tmp_path):
+    filename = "current_packlist.pdf"
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename=filename,
+        event_doc_type="packing_list",
+        analysis_doc_type="packing_list",
+        extracted_fields={},
+        freight_details={"pol_code": "", "pod_code": ""},
+        findings=[{"type": "mrn_mismatch", "severity": "high", "filename": "old_customs.pdf", "summary": "Alte MRN-Abweichung"}],
+    )
+
+    assert result["analysis_priority"] == "low"
+    assert result["agent_review_required"] is False
+    assert result["pending_action_summary"]["review"] == 0
+    assert result["document_reconciliation"]["findings"] == []
+    assert result["evidence_summary"]["current_upload_review"]["case_risk_not_used_for_document_priority"] is False
+
+
+def test_current_upload_review_flag_is_false_for_low_case_without_action(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="clean_packlist.pdf",
+        event_doc_type="packing_list",
+        analysis_doc_type="packing_list",
+        extracted_fields={},
+        freight_details={"pol_code": "", "pod_code": ""},
+    )
+
+    assert result["analysis_priority"] == "low"
+    assert result["evidence_summary"]["current_upload_review"]["case_risk_not_used_for_document_priority"] is False
+
+
+def test_external_agent_cannot_escalate_case_only_risk_without_current_upload_action(tmp_path):
+    agent_review = {
+        "mode": "external_agent",
+        "sections": {
+            "lage": "Packliste gelesen, aber Case ist insgesamt kritisch.",
+            "abgleich": "Packstücke und Gewicht passen; keine konkrete TMS-Korrektur.",
+            "auffaellig": "Wegen Case-Risiko bitte manuell prüfen.",
+            "empfehlung": "Fachlich/manuell prüfen.",
+            "naechster_schritt": "Im TMS gegenprüfen.",
+        },
+        "decision": "manual_review",
+        "priority": "high",
+        "needs_review": True,
+        "confidence": "medium",
+    }
+    with patch("plugins.cargolo_ops.document_activity_monitor._run_document_agent_review", return_value=agent_review):
+        result = _processor_result_for_uploaded_fields(
+            tmp_path,
+            filename="clean_packlist_agent.pdf",
+            event_doc_type="packing_list",
+            analysis_doc_type="packing_list",
+            extracted_fields={},
+            freight_details={"pol_code": "", "pod_code": ""},
+            findings=[{"type": "document_flag", "severity": "medium", "filename": "clean_packlist_agent.pdf", "summary": "Multi-PO-Hinweis"}],
+        )
+
+    assert result["document_agent_review"]["mode"] == "guardrailed_fallback"
+    assert result["analysis_priority"] == "low"
+    assert result["agent_review_required"] is False
+    assert "Case ist insgesamt kritisch" not in result["message"]
+
+
 def test_processor_result_prefers_populated_tms_totals_over_cargo_rows(tmp_path):
     filename = "invoice.pdf"
     analysis_path = tmp_path / "invoice_analysis.json"
@@ -464,6 +694,82 @@ def test_processor_result_prefers_populated_tms_totals_over_cargo_rows(tmp_path)
     message = result["message"]
     assert "Packstücke weicht ab: TMS (totals) 50, Dokument 52" in message
     assert "Gewicht weicht ab: TMS (totals) 900 kg, Dokument 852" in message
+
+
+def test_weight_and_piece_discrepancies_create_review_only_cards(tmp_path):
+    filename = "angebot.pdf"
+    analysis_path = tmp_path / "angebot_analysis.json"
+    registry_path = tmp_path / "registry.json"
+    snapshot_path = tmp_path / "tms_snapshot.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "filename": filename,
+                "doc_type": "offer",
+                "extracted_fields": {"pieces": "112", "gross_weight": "2.464 kg"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps({"analyzed_documents": [{"filename": filename, "analysis_path": str(analysis_path), "analysis_doc_type": "offer"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "detail": {
+                    "totals": {"total_pieces": 111, "total_weight_kg": 22},
+                    "freight_details": {},
+                    "transport_legs": [],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("plugins.cargolo_ops.document_activity_monitor._run_document_agent_review", return_value=None):
+        result = _processor_result_from_report(
+            {
+                "order_id": "AN-12354",
+                "tms_context": {"status": "in_transit", "network": "rail"},
+                "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+                "registry_summary": {},
+                "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+            },
+            {"id": 1895, "changed_at": "2026-05-21T07:14:00Z", "metadata": {"file_name": filename, "document_type": "offer"}},
+        )
+
+    comparisons = {row["label"]: row for row in result["document_field_comparison"]}
+    assert comparisons["Packstücke"]["target"] == "cargo_pieces"
+    assert comparisons["Gewicht"]["target"] == "cargo_weight_kg"
+    assert comparisons["Packstücke"]["status"] == "diff"
+    assert comparisons["Gewicht"]["status"] == "diff"
+    assert [(intent["target"], intent["value"], intent["guardrails"]["write_supported"], intent["guardrails"]["review_only"]) for intent in result["document_review_intents"]] == [
+        ("cargo_pieces", "112", False, True),
+        ("cargo_weight_kg", "2.464 kg", False, True),
+    ]
+
+    cards = _queue_document_review_cards(
+        storage_root=tmp_path,
+        order_id="AN-12354",
+        intents=result["document_review_intents"],
+        event={"id": 1895, "changed_at": "2026-05-21T07:14:00Z", "metadata": {"file_name": filename, "document_type": "offer"}},
+    )
+
+    assert [(card["target"], card["value"], card["write_supported"]) for card in cards] == [
+        ("cargo_pieces", "112", False),
+        ("cargo_weight_kg", "2.464 kg", False),
+    ]
+    pending_path = tmp_path / "orders" / "AN-12354" / "teams" / "pending_tms_actions.jsonl"
+    queue = [json.loads(line) for line in pending_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [(row["target"], row["value"], row["status"], row["write_policy"], row["write_supported"]) for row in queue] == [
+        ("cargo_pieces", "112", "pending_review", "no_auto_write_without_review", False),
+        ("cargo_weight_kg", "2.464 kg", "pending_review", "no_auto_write_without_review", False),
+    ]
+    assert not (tmp_path / "orders" / "AN-12354" / "teams" / "applied_tms_actions.jsonl").exists()
 
 
 def test_processor_result_rejects_generic_or_stale_external_review_for_unreadable_upload():
@@ -947,6 +1253,80 @@ def test_telex_release_with_explicit_container_queues_mbl_and_container_review_c
         ("container_number", "CICU9982440", "pending_review", "no_auto_write_without_review", True),
     ]
     assert not (tmp_path / "orders" / "AN-11790" / "teams" / "applied_tms_actions.jsonl").exists()
+
+
+def test_document_review_card_duplicate_is_reported_without_new_queue_entry(tmp_path):
+    intents = [
+        {
+            "target": "container_number",
+            "value": "XHCU2996441",
+            "current_tms_value": "nicht gepflegt",
+            "label": "Container",
+            "confidence": "document_field_comparison",
+            "context_id": "AN-11790:1994:document_monitor",
+            "guardrails": {"effective_document_type": "house_bill_of_lading"},
+        }
+    ]
+    event = {
+        "id": 1994,
+        "changed_at": "2026-05-21T08:45:02Z",
+        "metadata": {"file_name": "DC5226040340 HBL OBD.PDF", "document_type": "house_bl"},
+    }
+
+    first = _queue_document_review_card_results(storage_root=tmp_path, order_id="AN-11790", intents=intents, event=event)
+    second = _queue_document_review_card_results(storage_root=tmp_path, order_id="AN-11790", intents=intents, event=event)
+
+    assert [(card["target"], card["value"]) for card in first["created"]] == [("container_number", "XHCU2996441")]
+    assert first["duplicates"] == []
+    assert second["created"] == []
+    assert [(card["target"], card["value"], card["existing_action_id"]) for card in second["duplicates"]] == [
+        ("container_number", "XHCU2996441", first["created"][0]["action_id"])
+    ]
+    assert "Review-Kachel existiert bereits" in second["duplicates"][0]["summary"]
+
+    pending_path = tmp_path / "orders" / "AN-11790" / "teams" / "pending_tms_actions.jsonl"
+    queue = [json.loads(line) for line in pending_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [(row["target"], row["value"], row["status"]) for row in queue] == [
+        ("container_number", "XHCU2996441", "pending_review")
+    ]
+
+
+def test_document_review_card_duplicate_is_reported_after_new_card_cap(tmp_path):
+    pending_dir = tmp_path / "orders" / "AN-11790" / "teams"
+    pending_dir.mkdir(parents=True)
+    existing_action_id = "existing-container-review"
+    (pending_dir / "pending_tms_actions.jsonl").write_text(
+        json.dumps(
+            {
+                "action_id": existing_action_id,
+                "order_id": "AN-11790",
+                "target": "container_number",
+                "value": "XHCU2996441",
+                "status": "pending_review",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    intents = [
+        {"target": "mbl_number", "value": "MBL-1", "current_tms_value": "nicht gepflegt", "label": "MBL"},
+        {"target": "hbl_number", "value": "HBL-1", "current_tms_value": "nicht gepflegt", "label": "HBL"},
+        {"target": "hawb_number", "value": "HAWB-1", "current_tms_value": "nicht gepflegt", "label": "HAWB"},
+        {"target": "container_number", "value": "XHCU2996441", "current_tms_value": "nicht gepflegt", "label": "Container"},
+    ]
+    event = {"id": 1995, "metadata": {"document_type": "house_bl"}}
+
+    result = _queue_document_review_card_results(storage_root=tmp_path, order_id="AN-11790", intents=intents, event=event, max_cards=3)
+
+    assert [(card["target"], card["value"]) for card in result["created"]] == [
+        ("mbl_number", "MBL-1"),
+        ("hbl_number", "HBL-1"),
+        ("hawb_number", "HAWB-1"),
+    ]
+    assert [(card["target"], card["value"], card["existing_action_id"]) for card in result["duplicates"]] == [
+        ("container_number", "XHCU2996441", existing_action_id)
+    ]
 
 
 def test_telex_release_container_requires_explicit_container_provenance(tmp_path):

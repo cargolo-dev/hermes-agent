@@ -506,13 +506,34 @@ def _build_document_activity_text(payload: dict[str, Any], report: dict[str, Any
     naechster = _sanitize_teams_document_text(sections.get("naechster_schritt") or _section_from_hermes_message(hermes_message, "Nächster Schritt") or "")
     raw_review_intents = result.get("document_review_intents")
     review_intents: list[Any] = raw_review_intents if isinstance(raw_review_intents, list) else []
+    raw_duplicate_cards = result.get("duplicate_tms_review_cards")
+    duplicate_cards: list[Any] = raw_duplicate_cards if isinstance(raw_duplicate_cards, list) else []
     if review_intents:
         card_count = len(result.get("teams_tms_review_cards") if isinstance(result.get("teams_tms_review_cards"), list) else [])
-        naechster = (
-            f"Bitte die separate TMS-Freigabe-Kachel bestätigen oder ablehnen ({card_count} offen). Vorher wurde nichts im TMS geändert."
-            if card_count else
-            "Hermes/Operator prüft die vorgeschlagenen TMS-Feldwerte; es wurde nichts automatisch geändert."
-        )
+        duplicate_count = len(duplicate_cards)
+        if card_count:
+            duplicate_suffix = ""
+            if duplicate_count:
+                duplicate_bits = []
+                for card in duplicate_cards[:2]:
+                    if isinstance(card, dict):
+                        target = str(card.get("target") or "Feld").strip()
+                        value = str(card.get("value") or "").strip()
+                        duplicate_bits.append(f"{target} {value}".strip())
+                duplicate_text = ", ".join(bit for bit in duplicate_bits if bit)
+                duplicate_suffix = f" Zusätzlich existiert bereits eine offene Review-Kachel{f' ({duplicate_text})' if duplicate_text else ''}."
+            naechster = f"Bitte die separate TMS-Freigabe-Kachel bestätigen oder ablehnen ({card_count} offen).{duplicate_suffix} Vorher wurde nichts im TMS geändert."
+        elif duplicate_count:
+            duplicate_bits = []
+            for card in duplicate_cards[:2]:
+                if isinstance(card, dict):
+                    target = str(card.get("target") or "Feld").strip()
+                    value = str(card.get("value") or "").strip()
+                    duplicate_bits.append(f"{target} {value}".strip())
+            duplicate_text = ", ".join(bit for bit in duplicate_bits if bit)
+            naechster = f"Keine neue Kachel erstellt: offene Review-Kachel existiert bereits{f' ({duplicate_text})' if duplicate_text else ''}. Bitte bestehende Kachel bestätigen oder ablehnen."
+        else:
+            naechster = "Hermes/Operator prüft die vorgeschlagenen TMS-Feldwerte; es wurde nichts automatisch geändert."
 
     risk = str(model.get("risk") or "low").strip().lower() or "low"
     has_issue = bool(auffaellig and "keine fachlichen" not in auffaellig.lower())

@@ -79,8 +79,16 @@ def _shipment_context(tms_snapshot: dict[str, Any]) -> dict[str, Any]:
         or detail.get("customer_name")
         or detail.get("customer_company_name")
     )
+    customer_reference = (
+        detail.get("customer_reference")
+        or detail.get("customer_ref")
+        or detail.get("customer_order_number")
+        or detail.get("reference")
+        or detail.get("shipment_reference")
+    )
     return {
         "customer": customer_name,
+        "customer_reference": customer_reference,
         "status": tms_snapshot.get("status") or detail.get("status"),
         "network": detail.get("network") or detail.get("transport_mode") or tms_snapshot.get("network") or tms_snapshot.get("mode"),
         "origin_city": origin.get("city") or detail.get("origin_city"),
