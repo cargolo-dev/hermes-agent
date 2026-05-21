@@ -2286,7 +2286,7 @@ def test_document_activity_monitor_accepts_document_create_events(tmp_path):
 
 
 
-def test_cross_document_conflict_creates_review_only_cards_without_tms_write(tmp_path, monkeypatch):
+def test_cross_document_conflict_matching_current_tms_value_does_not_create_review_card(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_CMD", raising=False)
     current_filename = "packing-list.pdf"
     invoice_path = tmp_path / "invoice.analysis.json"
@@ -2333,12 +2333,8 @@ def test_cross_document_conflict_creates_review_only_cards_without_tms_write(tmp
     assert result["analysis_priority"] == "medium"
     assert result["agent_review_required"] is True
     assert result["evidence_summary"]["cross_document_comparison_count"] == 2
-    assert "Dokumente widersprechen sich" in result["message"]
     assert {row["type"] for row in result["document_cross_document_comparison"]} == {"cross_document_weight_mismatch", "cross_document_piece_mismatch"}
-    assert [(intent["target"], intent["value"], intent["guardrails"]["write_supported"], intent["guardrails"]["review_only"], intent["source"]) for intent in result["document_review_intents"]] == [
-        ("cargo_weight_kg", "896", False, True, "document_cross_document_comparison"),
-        ("cargo_pieces", "54", False, True, "document_cross_document_comparison"),
-    ]
+    assert result["document_review_intents"] == []
 
     cards = _queue_document_review_cards(
         storage_root=tmp_path,
@@ -2346,14 +2342,67 @@ def test_cross_document_conflict_creates_review_only_cards_without_tms_write(tmp
         intents=result["document_review_intents"],
         event={"id": 2555, "changed_at": "2026-05-21T12:00:00Z", "metadata": {"file_name": current_filename, "document_type": "packing_list"}},
     )
-    assert [(card["target"], card["value"], card["write_supported"]) for card in cards] == [
-        ("cargo_weight_kg", "896", False),
-        ("cargo_pieces", "54", False),
-    ]
-    queue_path = tmp_path / "orders" / "AN-55555" / "teams" / "pending_tms_actions.jsonl"
-    queued = [json.loads(line) for line in queue_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert all(row["status"] == "pending_review" and row["write_supported"] is False for row in queued)
+    assert cards == []
+    assert not (tmp_path / "orders" / "AN-55555" / "teams" / "pending_tms_actions.jsonl").exists()
     assert not (tmp_path / "orders" / "AN-55555" / "teams" / "applied_tms_actions.jsonl").exists()
+
+
+def test_cross_document_current_value_matching_tms_stays_case_context_without_card(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_CMD", raising=False)
+    current_filename = "angebot.pdf"
+    offer_path = tmp_path / "offer.analysis.json"
+    packing_path = tmp_path / "packing.analysis.json"
+    registry_path = tmp_path / "registry.json"
+    snapshot_path = tmp_path / "snapshot.json"
+    offer_path.write_text(
+        json.dumps({"filename": current_filename, "doc_type": "offer", "extracted_fields": {"pieces": "112", "gross_weight": "2464 kg"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    packing_path.write_text(
+        json.dumps({"filename": "packlist.pdf", "doc_type": "packing_list", "extracted_fields": {"pieces": "110", "gross_weight": "2391.4 kg"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    registry = {
+        "expected_types": [],
+        "received_types": ["offer", "packing_list"],
+        "received_documents": [
+            {"filename": current_filename, "analysis_status": "analyzed"},
+            {"filename": "packlist.pdf", "analysis_status": "analyzed"},
+        ],
+        "analyzed_documents": [
+            {"filename": current_filename, "analysis_path": str(offer_path), "analysis_doc_type": "offer"},
+            {"filename": "packlist.pdf", "analysis_path": str(packing_path), "analysis_doc_type": "packing_list"},
+        ],
+    }
+    registry_path.write_text(json.dumps(registry, ensure_ascii=False), encoding="utf-8")
+    tms_snapshot = {"detail": {"network": "rail", "totals": {"total_pieces": "112", "total_weight_kg": "22"}, "cargo": [{"id": "cargo-1", "quantity": 112, "weight_kg": 22}], "freight_details": {}, "transport_legs": []}}
+    snapshot_path.write_text(json.dumps(tms_snapshot, ensure_ascii=False), encoding="utf-8")
+    reconciliation = reconcile_documents(order_id="AN-12354", tms_snapshot=tms_snapshot, registry=registry)
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-12354",
+            "case_root": str(tmp_path / "orders" / "AN-12354"),
+            "tms_context": {"status": "in_transit", "network": "rail"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": reconciliation,
+        },
+        {"id": 2141, "changed_at": "2026-05-21T13:59:00Z", "metadata": {"file_name": current_filename, "document_type": "offer"}},
+    )
+
+    assert any(row["type"] == "cross_document_piece_mismatch" for row in result["document_cross_document_comparison"])
+    assert [(intent["target"], intent["value"], intent["source"]) for intent in result["document_review_intents"]] == [
+        ("cargo_weight_kg", "2464 kg", "document_activity_monitor"),
+    ]
+
+    cards = _queue_document_review_cards(
+        storage_root=tmp_path,
+        order_id="AN-12354",
+        intents=result["document_review_intents"],
+        event={"id": 2141, "changed_at": "2026-05-21T13:59:00Z", "metadata": {"file_name": current_filename, "document_type": "offer"}},
+    )
+    assert [(card["target"], card["value"]) for card in cards] == [("cargo_weight_kg", "2464 kg")]
 
 
 def test_cross_document_conflict_between_non_current_documents_stays_case_context(tmp_path, monkeypatch):

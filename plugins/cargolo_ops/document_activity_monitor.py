@@ -1794,7 +1794,14 @@ def _build_cross_document_review_intents(
         if not uploaded_doc:
             continue
         value = _format_cross_doc_value(uploaded_doc.get("normalized"))
-        dedupe_key = (target, _intent_dedupe_value(target, value))
+        current_tms_value = current_tms_by_target.get(target)
+        normalized_value = _intent_dedupe_value(target, value)
+        if current_tms_value and _intent_dedupe_value(target, current_tms_value) == normalized_value:
+            # A document-vs-document conflict is useful case context, but if the
+            # triggering upload already matches TMS for this target, there is no
+            # actionable field value to confirm in a separate review card.
+            continue
+        dedupe_key = (target, normalized_value)
         if not value or dedupe_key in seen:
             continue
         if not is_trusted_source_for_field(doc_type, target):
