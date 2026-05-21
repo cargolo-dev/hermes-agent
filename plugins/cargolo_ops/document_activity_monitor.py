@@ -1002,7 +1002,9 @@ def _build_document_field_comparison(report: dict[str, Any], filename: str) -> l
         if not tms_s and not doc_s:
             return
         if match is None:
-            if tms_s and doc_s:
+            if target in {"estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage"} and tms_s and doc_s:
+                status = "match" if _normalize_date_value(tms_s) == _normalize_date_value(doc_s) else "diff"
+            elif tms_s and doc_s:
                 status = "match" if _norm(tms_s) == _norm(doc_s) else "diff"
             elif doc_s and not tms_s:
                 status = "missing_tms"
@@ -1964,6 +1966,13 @@ def _build_tms_update_review_intents_from_comparisons(
         value = str(row.get("doc") or "").strip()
         if target in {"estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage"}:
             value = _normalize_date_value(value)
+            current_tms_value = _normalize_date_value(row.get("tms"))
+            if current_tms_value and current_tms_value == value:
+                continue
+        else:
+            current_tms_value = str(row.get("tms") or "").strip()
+            if target in {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference"} and current_tms_value and _norm(current_tms_value) == _norm(value):
+                continue
         if target not in supported_targets or not value or value == "nicht lesbar":
             continue
         effective_doc_type = _effective_trusted_doc_type(doc_type, uploaded, target, value)

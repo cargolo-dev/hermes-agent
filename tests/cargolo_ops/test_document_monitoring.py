@@ -31,6 +31,7 @@ def _processor_result_for_uploaded_fields(
     field_sources=None,
     findings=None,
     freight_details=None,
+    transport_legs=None,
 ):
     analysis_path = tmp_path / f"{filename}.analysis.json"
     registry_path = tmp_path / f"{filename}.registry.json"
@@ -65,7 +66,7 @@ def _processor_result_for_uploaded_fields(
             {
                 "detail": {
                     "freight_details": freight_details or {"pol_code": "CNNGB", "pod_code": "DEHAM", "mbl_number": "", "container_number": ""},
-                    "transport_legs": [],
+                    "transport_legs": transport_legs if transport_legs is not None else [],
                 }
             },
             ensure_ascii=False,
@@ -1069,6 +1070,22 @@ def test_processor_result_queues_eta_ata_date_cards_from_shipment_advice(tmp_pat
         ("estimated_delivery_date", "2026-06-20", True),
         ("actual_delivery_date", "2026-06-21", True),
     ]
+
+
+def test_processor_result_skips_etd_card_when_date_already_matches_tms(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="booking-confirmation.pdf",
+        event_doc_type="booking_confirmation",
+        analysis_doc_type="shipment_advice",
+        extracted_fields={"etd": "10.05.2026", "shipment_number": "AN-11790"},
+        transport_legs=[{"leg_type": "main_carriage", "etd": 1778371200000}],
+    )
+
+    etd_rows = [row for row in result["document_field_comparison"] if row["target"] == "etd_main_carriage"]
+    assert [(row["status"], row["tms"], row["doc"]) for row in etd_rows] == [("match", "2026-05-10", "10.05.2026")]
+    assert all(intent["target"] != "etd_main_carriage" for intent in result["document_review_intents"])
+    assert result["teams_tms_review_cards"] == []
 
 
 def test_processor_result_surfaces_etd_atd_as_review_only_cards(tmp_path):
