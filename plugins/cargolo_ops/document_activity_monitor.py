@@ -702,6 +702,14 @@ def _normalize_uploaded_findings(findings: list[Any], uploaded: dict[str, Any], 
 
 def _effective_trusted_doc_type(event_doc_type: Any, uploaded: dict[str, Any], target: str, value: Any) -> str:
     analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+    fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    transport_order_signals = [
+        fields.get("document_type"),
+        uploaded.get("filename"),
+        analysis.get("filename"),
+    ]
+    if any(re.search(r"transportauftrag|transport\s+order", str(candidate or ""), re.IGNORECASE) for candidate in transport_order_signals):
+        return "booking_confirmation"
     candidates = [
         analysis.get("doc_type"),
         uploaded.get("analysis_doc_type"),
@@ -963,8 +971,8 @@ def _build_document_field_comparison(report: dict[str, Any], filename: str) -> l
                 status = "diff"
         comparisons.append({"label": label, "tms": tms_s or "nicht gepflegt", "doc": doc_s or "nicht lesbar", "status": status, "target": target})
 
-    add("POL", freight.get("pol_code") or main_leg.get("origin"), fields.get("pol"), match=_same_location(freight.get("pol_code") or main_leg.get("origin"), fields.get("pol")), field="pol")
-    add("POD", freight.get("pod_code") or main_leg.get("destination"), fields.get("pod"), match=_same_location(freight.get("pod_code") or main_leg.get("destination"), fields.get("pod")), field="pod")
+    add("POL", freight.get("pol_code") or main_leg.get("origin"), fields.get("pol"), match=_same_location(freight.get("pol_code") or main_leg.get("origin"), fields.get("pol")), target="pol", field="pol")
+    add("POD", freight.get("pod_code") or main_leg.get("destination"), fields.get("pod"), match=_same_location(freight.get("pod_code") or main_leg.get("destination"), fields.get("pod")), target="pod", field="pod")
     add("ETD", _date_from_ms(main_leg.get("etd")) or _date_from_ms((detail.get("milestones") or {}).get("etd_main_carriage")), fields.get("etd"), target="etd_main_carriage", field="etd")
     add("ETA", dates.get("estimated_delivery_date") or _date_from_ms((detail.get("milestones") or {}).get("eta_main_carriage")), fields.get("eta"), target="estimated_delivery_date", field="eta")
     add("ATD", _date_from_ms(main_leg.get("atd")) or _date_from_ms((detail.get("milestones") or {}).get("atd_main_carriage")), fields.get("atd"), target="atd_main_carriage", field="atd")
@@ -1183,7 +1191,7 @@ def _build_document_agent_evidence_packet(
             "writes_allowed": False,
             "customer_messages_allowed": False,
             "safe_writeback_targets": ["mbl_number", "hbl_number", "hawb_number", "container_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date", "cargo_weight_kg", "cargo_pieces"],
-            "review_only_targets": ["etd_main_carriage", "atd_main_carriage"],
+            "review_only_targets": ["etd_main_carriage", "atd_main_carriage", "pol", "pod"],
             "agent_may_raise_priority": True,
             "agent_may_not_hide_safe_review_intents": True,
             "agent_may_not_downgrade_blockers": True,
@@ -1430,7 +1438,7 @@ def _human_document_message(
     auffaellig_items = problems + blocker_lines
     if auffaellig_items:
         auffaellig = " | ".join(auffaellig_items[:4])
-        supported_card_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage", "cargo_weight_kg", "cargo_pieces"}
+        supported_card_targets = {"mbl_number", "container_number", "hbl_number", "hawb_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage", "pol", "pod", "cargo_weight_kg", "cargo_pieces"}
         card_targets = [
             row.get("target") or row.get("label")
             for row in comparisons
@@ -1850,6 +1858,8 @@ def _build_tms_update_review_intents_from_comparisons(
         "actual_delivery_date",
         "etd_main_carriage",
         "atd_main_carriage",
+        "pol",
+        "pod",
         "cargo_weight_kg",
         "cargo_pieces",
     }
@@ -1865,6 +1875,10 @@ def _build_tms_update_review_intents_from_comparisons(
         if row.get("status") not in {"diff", "missing_tms"}:
             continue
         target = str(row.get("target") or "").strip()
+        if target in {"pol", "pod"} and row.get("status") != "missing_tms":
+            # Avoid creating location cards for code-vs-city formatting deltas
+            # (e.g. CNNGB vs Ningbo). POL/POD cards are only safe here when TMS is empty.
+            continue
         value = str(row.get("doc") or "").strip()
         if target in {"estimated_delivery_date", "actual_delivery_date", "etd_main_carriage", "atd_main_carriage"}:
             value = _normalize_date_value(value)

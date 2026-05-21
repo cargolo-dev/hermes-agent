@@ -25,7 +25,7 @@ _WRITE_SUPPORTED_TARGETS = {
     "estimated_delivery_date",
     "actual_delivery_date",
 }
-_REVIEW_ONLY_TARGETS = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code", "etd_main_carriage", "atd_main_carriage"}
+_REVIEW_ONLY_TARGETS = {"cargo_weight_kg", "cargo_pieces", "seal_number", "hs_code", "etd_main_carriage", "atd_main_carriage", "pol", "pod"}
 _SUPPORTED_TARGETS = _WRITE_SUPPORTED_TARGETS | _REVIEW_ONLY_TARGETS
 _TARGET_PRIORITY = {
     "cargo_weight_kg": 10,
@@ -37,6 +37,8 @@ _TARGET_PRIORITY = {
     "actual_delivery_date": 65,
     "etd_main_carriage": 66,
     "atd_main_carriage": 67,
+    "pol": 68,
+    "pod": 69,
     "container_number": 70,
     "customs_reference": 80,
 }
@@ -76,7 +78,7 @@ _FIELD_SPECS: dict[str, dict[str, Any]] = {
         "doc_keys": ("estimated_delivery_date", "delivery_date", "eta", "estimated_arrival_date"),
         "tms_paths": (("detail", "dates", "estimated_delivery_date"), ("dates", "estimated_delivery_date"), ("estimated_delivery_date",)),
         "kind": "date",
-        "trusted_doc_types": {"waybill", "delivery_note", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "shipment_advice"},
+        "trusted_doc_types": {"waybill", "delivery_note", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "booking_confirmation", "shipment_advice"},
     },
     "actual_delivery_date": {
         "label": "ATA/Actual Delivery Date",
@@ -98,6 +100,20 @@ _FIELD_SPECS: dict[str, dict[str, Any]] = {
         "tms_paths": (("detail", "milestones", "atd_main_carriage"), ("milestones", "atd_main_carriage"), ("detail", "transport_legs", "main_carriage", "atd")),
         "kind": "date",
         "trusted_doc_types": {"waybill", "bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "booking_confirmation", "shipment_advice"},
+    },
+    "pol": {
+        "label": "POL",
+        "doc_keys": ("pol", "port_of_loading", "loading_port", "origin_port"),
+        "tms_paths": (("detail", "freight_details", "pol_code"), ("freight_details", "pol_code"), ("detail", "transport_legs", "main_carriage", "origin")),
+        "kind": "text",
+        "trusted_doc_types": {"bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "booking_confirmation", "shipment_advice", "terminal_receipt"},
+    },
+    "pod": {
+        "label": "POD",
+        "doc_keys": ("pod", "port_of_discharge", "discharge_port", "destination_port"),
+        "tms_paths": (("detail", "freight_details", "pod_code"), ("freight_details", "pod_code"), ("detail", "transport_legs", "main_carriage", "destination")),
+        "kind": "text",
+        "trusted_doc_types": {"bill_of_lading", "master_bl", "house_bl", "master_bill_of_lading", "house_bill_of_lading", "booking_confirmation", "shipment_advice"},
     },
     "container_number": {
         "label": "Container",
@@ -487,13 +503,18 @@ def queue_agentic_tms_review_cards(
             value = _normalize_value(raw_doc, str(spec.get("kind") or "text"))
             if not value:
                 continue
-            tms_value = _normalize_value(_first_path(tms_snapshot, spec["tms_paths"]), str(spec.get("kind") or "text"))
+            raw_tms = _first_path(tms_snapshot, spec["tms_paths"])
+            tms_value = _normalize_value(raw_tms, str(spec.get("kind") or "text"))
+            if target in {"pol", "pod"} and tms_value:
+                # POL/POD from documents are safe as missing-TMS review hints; do not
+                # raise code-vs-city formatting deltas as actionable cards here.
+                continue
             if tms_value and _same_value(tms_value, value, str(spec.get("kind") or "text")):
                 continue
             raw_candidates.append({
                 "target": target,
                 "value": value,
-                "previous_value": tms_value or _first_path(tms_snapshot, spec["tms_paths"]) or "nicht gepflegt",
+                "previous_value": tms_value or raw_tms or "nicht gepflegt",
                 "label": spec.get("label") or target,
                 "evidence": f"{source_name} ({doc_type or 'Dokument'}): {spec.get('label') or target} = {value}",
                 "source": source_name,

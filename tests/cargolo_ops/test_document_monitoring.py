@@ -1086,6 +1086,42 @@ def test_processor_result_surfaces_etd_atd_as_review_only_cards(tmp_path):
     ]
 
 
+def test_processor_result_queues_pol_pod_eta_cards_from_transportauftrag_when_tms_missing(tmp_path):
+    result = _processor_result_for_uploaded_fields(
+        tmp_path,
+        filename="Transportauftrag-AN-12258.pdf",
+        event_doc_type="commercial_invoice",
+        analysis_doc_type="offer",
+        extracted_fields={
+            "document_type": "Transportauftrag",
+            "shipment_number": "AN-12258",
+            "pol": "Dongkeng",
+            "pod": "Waltrop",
+            "eta": "16.05.2026",
+            "pieces": "2",
+            "gross_weight": "910 kg",
+        },
+        freight_details={"mbl_number": "", "container_number": ""},
+    )
+
+    assert [(intent["target"], intent["value"], intent["guardrails"]["write_supported"], intent["guardrails"]["review_only"]) for intent in result["document_review_intents"]] == [
+        ("pol", "Dongkeng", False, True),
+        ("pod", "Waltrop", False, True),
+        ("estimated_delivery_date", "2026-05-16", True, False),
+    ]
+    cards = _queue_document_review_cards(
+        storage_root=tmp_path,
+        order_id="AN-11790",
+        intents=result["document_review_intents"],
+        event={"id": 9001, "changed_at": "2026-05-11T10:00:00Z", "metadata": {"file_name": "Transportauftrag-AN-12258.pdf", "document_type": "commercial_invoice"}},
+    )
+    assert [(card["target"], card["value"], card["write_supported"]) for card in cards] == [
+        ("pol", "Dongkeng", False),
+        ("pod", "Waltrop", False),
+        ("estimated_delivery_date", "2026-05-16", True),
+    ]
+
+
 def test_processor_result_offer_filename_overrides_false_billing_analysis(tmp_path):
     result = _processor_result_for_uploaded_fields(
         tmp_path,

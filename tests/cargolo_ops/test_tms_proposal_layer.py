@@ -187,6 +187,31 @@ def test_agentic_proposal_layer_queues_eta_and_ata_write_supported_dates(tmp_pat
     ]
 
 
+def test_agentic_proposal_layer_queues_transportauftrag_pol_pod_eta_when_tms_missing(tmp_path: Path) -> None:
+    from plugins.cargolo_ops.tms_proposal_layer import queue_agentic_tms_review_cards
+
+    _write_case(
+        tmp_path,
+        "AN-12258",
+        tms_snapshot={"detail": {"freight_details": {"pol_code": "", "pod_code": ""}, "dates": {"estimated_delivery_date": ""}}},
+        analyzed_documents=[
+            {
+                "filename": "Transportauftrag-AN-12258.pdf",
+                "doc_type": "booking_confirmation",
+                "extracted_fields": {"document_type": "Transportauftrag", "shipment_number": "AN-12258", "pol": "Dongkeng", "pod": "Waltrop", "eta": "16.05.2026"},
+            },
+        ],
+    )
+
+    cards = queue_agentic_tms_review_cards(root=tmp_path, order_id="AN-12258", max_cards=3)
+
+    assert [(card["target"], card["value"], card["write_supported"]) for card in cards] == [
+        ("estimated_delivery_date", "2026-05-16", True),
+        ("pol", "Dongkeng", False),
+        ("pod", "Waltrop", False),
+    ]
+
+
 def test_agentic_proposal_layer_surfaces_etd_and_atd_as_review_only_until_write_target_exists(tmp_path: Path) -> None:
     from plugins.cargolo_ops.tms_proposal_layer import queue_agentic_tms_review_cards
 

@@ -401,7 +401,7 @@ _SHORT_TO_FULL_TARGET: dict[str, str] = {
     "actual_delivery_date": "shipment.dates.actual_delivery_date",
 }
 _CARGO_WRITE_TARGETS = {"cargo_weight_kg", "cargo_pieces"}
-_REVIEW_ONLY_TARGETS = {"seal_number", "hs_code", "etd_main_carriage", "atd_main_carriage"}
+_REVIEW_ONLY_TARGETS = {"seal_number", "hs_code", "etd_main_carriage", "atd_main_carriage", "pol", "pod"}
 _SUPPORTED_INTENT_TARGETS = set(_SHORT_TO_FULL_TARGET) | _REVIEW_ONLY_TARGETS | _CARGO_WRITE_TARGETS
 
 

@@ -149,11 +149,17 @@ DOCUMENT_PROFILES: dict[str, DocumentProfile] = {
         relevant_fields=("document_number", "date", "issuer", "recipient", "shipment_number", "mrn", "loading_place", "unloading_place", "pieces", "gross_weight", "goods_description", "goods_value", "currency"),
         trusted_tms_update_fields=("mrn",),
     ),
+    "booking_confirmation": DocumentProfile(
+        "booking_confirmation",
+        aliases=("transportauftrag", "transport order", "booking confirmation", "booking_confirmation", "auftrag"),
+        relevant_fields=("document_number", "date", "issuer", "recipient", "customer", "shipment_number", "customer_reference", "booking_number", "eta", "etd", "ata", "atd", "pol", "pod", "loading_place", "unloading_place", "pieces", "gross_weight", "volume"),
+        trusted_tms_update_fields=("eta", "etd", "ata", "atd", "pol", "pod"),
+    ),
     "shipment_advice": DocumentProfile(
         "shipment_advice",
         aliases=("shipment advice", "versandavis", "shipping advice", "avis"),
-        relevant_fields=("document_number", "date", "issuer", "recipient", "customer", "shipment_number", "customer_reference", "booking_number", "eta", "etd", "ata", "atd", "loading_place", "unloading_place", "pieces", "gross_weight", "volume"),
-        trusted_tms_update_fields=("eta", "etd", "ata", "atd"),
+        relevant_fields=("document_number", "date", "issuer", "recipient", "customer", "shipment_number", "customer_reference", "booking_number", "eta", "etd", "ata", "atd", "pol", "pod", "loading_place", "unloading_place", "pieces", "gross_weight", "volume"),
+        trusted_tms_update_fields=("eta", "etd", "ata", "atd", "pol", "pod"),
     ),
     "terminal_receipt": DocumentProfile(
         "terminal_receipt",
