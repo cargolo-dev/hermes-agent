@@ -159,38 +159,98 @@ def _load_json(path_value: Any) -> dict[str, Any]:
     return {}
 
 
+def _is_archived_email_upload(filename: Any, metadata: dict[str, Any] | None = None) -> bool:
+    text = str(filename or "").strip().lower()
+    metadata = metadata or {}
+    doc_type = normalize_document_type(metadata.get("document_type"))
+    return doc_type == "email" or text.endswith(".msg") or text.endswith(".eml")
+
+
+def _parse_registry_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _received_document_lookup(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for row in registry.get("received_documents") or []:
+        if not isinstance(row, dict):
+            continue
+        for key_value in (row.get("filename"), row.get("sha256")):
+            key = _norm(key_value)
+            if key:
+                lookup[key] = row
+    return lookup
+
+
+def _enrich_analyzed_row(row: dict[str, Any], received_lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    received = received_lookup.get(_norm(row.get("filename"))) or received_lookup.get(_norm(row.get("sha256"))) or {}
+    analysis = _load_json(row.get("analysis_path") or received.get("analysis_path"))
+    enriched = {**received, **row, "analysis": analysis}
+    if not enriched.get("received_at") and received.get("received_at"):
+        enriched["received_at"] = received.get("received_at")
+    return enriched
+
+
+def _latest_analyzed_mail_attachment(registry: dict[str, Any]) -> dict[str, Any]:
+    received_lookup = _received_document_lookup(registry)
+    analyzed = [_enrich_analyzed_row(row, received_lookup) for row in registry.get("analyzed_documents") or [] if isinstance(row, dict)]
+    if not analyzed:
+        return {}
+
+    def sort_key(row: dict[str, Any]) -> tuple[datetime, str]:
+        received_at = _parse_registry_datetime(row.get("received_at")) or datetime.min.replace(tzinfo=timezone.utc)
+        return (received_at, str(row.get("filename") or ""))
+
+    return sorted(analyzed, key=sort_key)[-1]
+
+
 def _select_uploaded_analysis(report: dict[str, Any], filename: str) -> dict[str, Any]:
     lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
     registry = _load_json(lifecycle.get("document_registry_path"))
+    metadata = (report.get("trigger_event") or {}).get("metadata") if isinstance(report.get("trigger_event"), dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
     uploaded_norm = str(filename or "").strip().lower()
+    received_lookup = _received_document_lookup(registry)
     for row in registry.get("analyzed_documents") or []:
         if isinstance(row, dict) and str(row.get("filename") or "").strip().lower() == uploaded_norm:
-            analysis = _load_json(row.get("analysis_path"))
-            return {**row, "analysis": analysis}
+            return _enrich_analyzed_row(row, received_lookup)
     analyzed = [row for row in registry.get("analyzed_documents") or [] if isinstance(row, dict)]
+    if _is_archived_email_upload(filename, metadata):
+        return _latest_analyzed_mail_attachment(registry)
     if len(analyzed) == 1:
-        row = analyzed[0]
-        analysis = _load_json(row.get("analysis_path"))
-        return {**row, "analysis": analysis}
+        return _enrich_analyzed_row(analyzed[0], received_lookup)
     return {}
 
 
 def _infer_uploaded_filename(report: dict[str, Any], event: dict[str, Any]) -> str:
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
     explicit = metadata.get("file_name") or metadata.get("filename") or event.get("field_name")
-    if _clean(explicit):
+    explicit_is_email_archive = _is_archived_email_upload(explicit, metadata)
+    if _clean(explicit) and not explicit_is_email_archive:
         return str(explicit)
     lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
     registry = _load_json(lifecycle.get("document_registry_path"))
     invoice_number = _norm(metadata.get("invoice_number"))
     subject = _norm(metadata.get("email_subject"))
-    analyzed = [row for row in registry.get("analyzed_documents") or [] if isinstance(row, dict)]
+    received_lookup = _received_document_lookup(registry)
+    analyzed = [_enrich_analyzed_row(row, received_lookup) for row in registry.get("analyzed_documents") or [] if isinstance(row, dict)]
     for row in analyzed:
         filename = str(row.get("filename") or "")
         if invoice_number and invoice_number in _norm(filename):
             return filename
-        analysis = _load_json(row.get("analysis_path"))
-        fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+        raw_analysis = row.get("analysis")
+        analysis: dict[str, Any] = raw_analysis if isinstance(raw_analysis, dict) else {}
+        raw_fields = analysis.get("extracted_fields")
+        fields: dict[str, Any] = raw_fields if isinstance(raw_fields, dict) else {}
         if invoice_number and invoice_number in {_norm(fields.get("invoice_number")), _norm(fields.get("document_number"))}:
             return filename
         field_refs = {
@@ -203,6 +263,11 @@ def _infer_uploaded_filename(report: dict[str, Any], event: dict[str, Any]) -> s
             return filename
         if subject and filename and _norm(filename) in subject:
             return filename
+    if explicit_is_email_archive:
+        latest = _latest_analyzed_mail_attachment(registry)
+        latest_filename = str(latest.get("filename") or "").strip()
+        if latest_filename:
+            return latest_filename
     if len(analyzed) == 1 and str(analyzed[0].get("filename") or "").strip():
         return str(analyzed[0].get("filename") or "")
     received = [row for row in registry.get("received_documents") or [] if isinstance(row, dict)]
@@ -210,7 +275,7 @@ def _infer_uploaded_filename(report: dict[str, Any], event: dict[str, Any]) -> s
         filename = str(row.get("filename") or "")
         if invoice_number and invoice_number in _norm(filename):
             return filename
-    return "Dokument"
+    return str(explicit) if _clean(explicit) else "Dokument"
 
 
 def _clean(value: Any) -> str:
@@ -362,11 +427,27 @@ def _tms_cargo_reference(detail: dict[str, Any], totals: dict[str, Any], target:
         total_weight = _number_from_value(totals.get("total_weight_kg") or totals.get("weight_kg"))
         if total_weight is not None:
             return f"{_format_number(total_weight)} kg", "totals"
-        cargo_weight = _cargo_unit_value(rows, "weight_kg")
-        if cargo_weight is None:
+        cargo_weight = None
+        source = "cargo_items.weight_kg"
+        if len(rows) == 1:
+            row = rows[0]
+            unit_weight = _number_from_value(row.get("weight_kg"))
+            quantity = _number_from_value(row.get("quantity"))
+            row_total_weight = _number_from_value(row.get("total_weight_kg"))
+            if row_total_weight is not None and (unit_weight is None or row_total_weight <= unit_weight * 5):
+                cargo_weight = row_total_weight
+                source = "cargo_items.total_weight_kg"
+            elif unit_weight is not None:
+                cargo_weight = unit_weight
+                source = "cargo_items.weight_kg"
+            elif quantity is not None and row_total_weight is not None:
+                cargo_weight = row_total_weight
+                source = "cargo_items.total_weight_kg"
+        else:
             cargo_weight = _cargo_sum_value(rows, "weight_kg")
+            source = "cargo_items.weight_kg"
         if cargo_weight is not None:
-            return f"{_format_number(cargo_weight)} kg", "cargo_items.weight_kg"
+            return f"{_format_number(cargo_weight)} kg", source
         return "", ""
     return "", ""
 
@@ -470,6 +551,23 @@ def _has_blocker_finding(findings: list[Any]) -> bool:
     return False
 
 
+def _focus_findings_for_upload(findings: list[Any], filename: str) -> list[Any]:
+    uploaded_norm = str(filename or "").strip().lower()
+    if not uploaded_norm:
+        return findings
+    focused: list[Any] = []
+    for row in findings:
+        if not isinstance(row, dict):
+            focused.append(row)
+            continue
+        row_filename = str(row.get("filename") or "").strip().lower()
+        severity = str(row.get("severity") or "").strip().lower()
+        finding_type = str(row.get("type") or "").strip().lower()
+        if row_filename == uploaded_norm or (not row_filename and (severity in {"high", "critical", "blocker"} or "blocker" in finding_type)):
+            focused.append(row)
+    return focused if focused else findings
+
+
 def _normalize_uploaded_findings(findings: list[Any], uploaded: dict[str, Any], filename: str) -> list[Any]:
     analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
     fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
@@ -571,8 +669,17 @@ def _contains_reference(haystack: dict[str, Any], value: Any) -> bool:
 
 
 def _uploaded_analysis_doc_type(event_doc_type: Any, uploaded: dict[str, Any]) -> str:
-    analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
-    fields = analysis.get("extracted_fields") if isinstance(analysis.get("extracted_fields"), dict) else {}
+    raw_analysis = uploaded.get("analysis")
+    analysis: dict[str, Any] = raw_analysis if isinstance(raw_analysis, dict) else {}
+    raw_fields = analysis.get("extracted_fields")
+    fields: dict[str, Any] = raw_fields if isinstance(raw_fields, dict) else {}
+    transport_order_signals = [
+        fields.get("document_type"),
+        uploaded.get("filename"),
+        analysis.get("filename"),
+    ]
+    if any(re.search(r"transportauftrag|transport\s+order", str(value or ""), re.IGNORECASE) for value in transport_order_signals):
+        return "booking_confirmation"
     strong_offer_signals = [
         fields.get("document_type"),
         uploaded.get("filename"),
@@ -1414,6 +1521,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
     needs_review = bool(reconciliation.get("needs_human_review"))
     raw_findings = reconciliation.get("findings")
     findings: list[Any] = raw_findings if isinstance(raw_findings, list) else []
+    findings = _focus_findings_for_upload(findings, str(filename))
     findings = _normalize_uploaded_findings(findings, uploaded_for_label, str(filename))
     if findings is not raw_findings:
         reconciliation = {**reconciliation, "findings": findings}

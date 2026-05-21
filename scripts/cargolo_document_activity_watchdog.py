@@ -82,14 +82,23 @@ def _format_report(result: dict) -> str:
                 status_bits.append(f"Review-Intents={len(review_intents)}")
             if side_effects:
                 status_bits.append(f"TMS-Änderungen={side_effects.get('tms_updates', 0)}")
-            findings = reconciliation.get("findings") if isinstance(reconciliation.get("findings"), list) else []
-            first_finding = findings[0] if findings else None
-            if isinstance(first_finding, dict):
-                summary = first_finding.get("summary") or first_finding.get("type") or "fachlich prüfen"
-                filename = first_finding.get("filename") or "Dokument"
-                finding_text = f"; Auffällig: {filename}: {str(summary)[:120]}"
+            raw_sections = processor.get("document_message_sections") if isinstance(processor, dict) else {}
+            sections = raw_sections if isinstance(raw_sections, dict) else {}
+            auffaellig = str(sections.get("auffaellig") or "").strip()
+            abgleich = str(sections.get("abgleich") or "").strip()
+            summary_text = auffaellig or abgleich
+            if summary_text:
+                finding_text = f"; Kurz: {summary_text[:160]}"
             else:
-                finding_text = f"; Auffällig: {str(first_finding)[:120]}" if first_finding else ""
+                raw_findings = reconciliation.get("findings") if isinstance(reconciliation, dict) else []
+                findings = raw_findings if isinstance(raw_findings, list) else []
+                first_finding = findings[0] if findings else None
+                if isinstance(first_finding, dict):
+                    summary = first_finding.get("summary") or first_finding.get("type") or "fachlich prüfen"
+                    filename = first_finding.get("filename") or "Dokument"
+                    finding_text = f"; Kurz: {filename}: {str(summary)[:120]}"
+                else:
+                    finding_text = f"; Kurz: {str(first_finding)[:120]}" if first_finding else ""
             lines.append(
                 f"- {row.get('order_id') or '-'} / Activity {row.get('activity_id') or '-'} ({', '.join(status_bits)}){delivery}{finding_text}; Report: {_short_path(row.get('report_md_path') or row.get('report_json_path'))}"
             )

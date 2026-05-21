@@ -80,6 +80,91 @@ def _processor_result_for_uploaded_fields(
     )
 
 
+def test_processor_resolves_archived_email_upload_to_latest_analyzed_attachment(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_CMD", raising=False)
+    offer_analysis = tmp_path / "offer.analysis.json"
+    booking_analysis = tmp_path / "booking.analysis.json"
+    registry_path = tmp_path / "registry.json"
+    snapshot_path = tmp_path / "snapshot.json"
+    offer_analysis.write_text(
+        json.dumps(
+            {
+                "filename": "Angebot-AN-13416-V1.pdf",
+                "doc_type": "offer",
+                "extracted_fields": {"document_type": "Angebot", "document_number": "AN-13416-V1", "amount": "2380.99", "currency": "EUR"},
+                "operational_flags": ["Embargoprüfung erforderlich"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    booking_analysis.write_text(
+        json.dumps(
+            {
+                "filename": "Transportauftrag-AN-13416.pdf",
+                "doc_type": "offer",
+                "extracted_fields": {
+                    "document_type": "Transportauftrag",
+                    "document_number": "AN-13416",
+                    "shipment_number": "AN-13416",
+                    "customer_reference": "CGL-20260313-130927",
+                    "etd": "2026-05-31",
+                    "eta": "2026-06-20",
+                    "gross_weight": "1669,00",
+                    "volume": "7,4052",
+                },
+                "field_sources": {"etd": {"value": "2026-05-31", "label": "ETD", "confidence": "high", "raw_context": "ETD 31.05.2026"}},
+                "operational_flags": ["Bahnfracht (RAIL)", "Incoterm EXW bestätigt"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    registry_path.write_text(
+        json.dumps(
+            {
+                "received_documents": [
+                    {"filename": "Angebot-AN-13416-V1.pdf", "received_at": "2026-05-20T07:12:58Z", "analysis_path": str(offer_analysis)},
+                    {"filename": "Transportauftrag-AN-13416.pdf", "received_at": "2026-05-20T07:34:58Z", "analysis_path": str(booking_analysis)},
+                ],
+                "analyzed_documents": [
+                    {"filename": "Angebot-AN-13416-V1.pdf", "analysis_path": str(offer_analysis), "analysis_doc_type": "offer"},
+                    {"filename": "Transportauftrag-AN-13416.pdf", "analysis_path": str(booking_analysis), "analysis_doc_type": "offer"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    snapshot_path.write_text(json.dumps({"detail": {"transport_legs": [{"leg_type": "main_carriage", "etd": "2026-05-31"}]}}), encoding="utf-8")
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-13416",
+            "tms_context": {"status": "pickup_scheduled", "network": "rail"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {
+                "risk": "medium",
+                "needs_human_review": True,
+                "findings": [
+                    {"type": "document_flag", "severity": "medium", "filename": "Angebot-AN-13416-V1.pdf", "summary": "Embargoprüfung erforderlich"},
+                    {"type": "document_flag", "severity": "medium", "filename": "Transportauftrag-AN-13416.pdf", "summary": "Bahnfracht (RAIL)"},
+                ],
+            },
+            "trigger_event": {"metadata": {"file_name": "AW_ AN-13416 __ Neu Buchung Bahnfracht KW 21 .msg", "document_type": "email"}},
+        },
+        {"id": 1915, "changed_at": "2026-05-20T07:41:52Z", "metadata": {"file_name": "AW_ AN-13416 __ Neu Buchung Bahnfracht KW 21 .msg", "document_type": "email"}},
+    )
+
+    message = result["message"]
+    assert result["latest_subject"] == "Transportauftrag-AN-13416.pdf"
+    assert "nicht belastbar auslesbar" not in message
+    assert "Embargoprüfung" not in message
+    assert result["document_agent_evidence_packet"]["document"]["filename"] == "Transportauftrag-AN-13416.pdf"
+    assert all(finding.get("filename") != "Angebot-AN-13416-V1.pdf" for finding in result["document_reconciliation"]["findings"])
+
+
 def test_reconciliation_does_not_turn_missing_docs_alone_into_risk():
     report = reconcile_documents(
         order_id="AN-SEA",
