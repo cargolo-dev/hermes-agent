@@ -134,6 +134,9 @@ def _finding_text(row: Any) -> str:
     if not isinstance(row, dict):
         return str(row or "").strip()
     filename = str(row.get("filename") or "").strip()
+    if not filename and isinstance(row.get("filenames"), list):
+        filenames = [str(value or "").strip() for value in row.get("filenames") or [] if str(value or "").strip()]
+        filename = " ↔ ".join(filenames[:3])
     summary = str(row.get("summary") or row.get("type") or "Dokument fachlich prüfen.").strip()
     return f"{filename}: {summary}" if filename else summary
 
@@ -610,6 +613,24 @@ def _has_blocker_finding(findings: list[Any]) -> bool:
     return False
 
 
+def _finding_mentions_filename(row: dict[str, Any], filename: str) -> bool:
+    uploaded_norm = str(filename or "").strip().lower()
+    if not uploaded_norm:
+        return False
+    if str(row.get("filename") or "").strip().lower() == uploaded_norm:
+        return True
+    for key in ("filenames", "related_documents"):
+        values = row.get(key)
+        if isinstance(values, list) and any(str(value or "").strip().lower() == uploaded_norm for value in values):
+            return True
+    documents = row.get("documents")
+    if isinstance(documents, list):
+        for document in documents:
+            if isinstance(document, dict) and str(document.get("filename") or "").strip().lower() == uploaded_norm:
+                return True
+    return False
+
+
 def _focus_findings_for_upload(findings: list[Any], filename: str) -> list[Any]:
     uploaded_norm = str(filename or "").strip().lower()
     if not uploaded_norm:
@@ -622,7 +643,7 @@ def _focus_findings_for_upload(findings: list[Any], filename: str) -> list[Any]:
         row_filename = str(row.get("filename") or "").strip().lower()
         severity = str(row.get("severity") or "").strip().lower()
         finding_type = str(row.get("type") or "").strip().lower()
-        if row_filename == uploaded_norm or (not row_filename and (severity in {"high", "critical", "blocker"} or "blocker" in finding_type)):
+        if _finding_mentions_filename(row, uploaded_norm) or (not row_filename and (severity in {"high", "critical", "blocker"} or "blocker" in finding_type)):
             focused.append(row)
     return focused
 
@@ -1003,8 +1024,10 @@ def _document_finding_requires_operator_review(row: Any) -> bool:
     code = str(row.get("code") or "").strip().lower()
     if severity in {"blocker", "high", "critical"} or "blocker" in finding_type:
         return True
-    if finding_type in {"mrn_mismatch", "tms_document_weight_mismatch", "tms_document_piece_mismatch", "document_unreadable", "local_file_missing"}:
+    if finding_type in {"mrn_mismatch", "tms_document_weight_mismatch", "tms_document_piece_mismatch", "document_unreadable", "local_file_missing", "cross_document_weight_mismatch", "cross_document_piece_mismatch"}:
         return True
+    if finding_type.startswith("cross_document_"):
+        return False
     if code in {"proforma_invoice", "zero_value"}:
         return True
     # Observations that are useful to show, but should not by themselves create a
@@ -1061,6 +1084,7 @@ def _build_document_agent_evidence_packet(
     case_risk: str = "low",
     case_needs_review: bool = False,
     current_upload_review: dict[str, Any] | None = None,
+    cross_document_comparisons: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
     lifecycle = report.get("lifecycle") if isinstance(report.get("lifecycle"), dict) else {}
@@ -1121,12 +1145,13 @@ def _build_document_agent_evidence_packet(
             "readable_evidence_lines": evidence_lines,
             "findings": findings,
             "safe_tms_review_intents": document_review_intents,
+            "cross_document_comparisons": cross_document_comparisons or [],
         },
         "guardrails": {
             "writes_allowed": False,
             "customer_messages_allowed": False,
             "safe_writeback_targets": ["mbl_number", "hbl_number", "hawb_number", "container_number", "customs_reference", "estimated_delivery_date", "actual_delivery_date"],
-            "review_only_targets": ["etd_main_carriage", "atd_main_carriage"],
+            "review_only_targets": ["etd_main_carriage", "atd_main_carriage", "cargo_weight_kg", "cargo_pieces"],
             "agent_may_raise_priority": True,
             "agent_may_not_hide_safe_review_intents": True,
             "agent_may_not_downgrade_blockers": True,
@@ -1341,19 +1366,24 @@ def _human_document_message(
     blocker_lines = [_finding_text(row) for row in sorted(blocker_findings, key=_finding_rank)[:2]]
     uploaded_findings = [
         row for row in findings
-        if isinstance(row, dict) and str(row.get("filename") or "").strip().lower() == uploaded_norm
+        if isinstance(row, dict) and _finding_mentions_filename(row, uploaded_norm)
     ]
     review_topic_lines: list[str] = []
+    review_topics: list[dict[str, Any]] = []
     if not comparisons:
         blocker_lines.extend(_finding_text(row) for row in sorted(uploaded_findings, key=_finding_rank)[:3])
     elif not problems:
         # Keep the card focused on the new upload, but do not suppress concrete
-        # non-write review topics such as uncertain customs value currency just
-        # because pieces/weight matched.
+        # non-write review topics such as uncertain customs value currency or
+        # document-vs-document cargo conflicts just because the current TMS
+        # cargo values match this upload.
         review_topics = [
             row for row in uploaded_findings
             if _finding_rank(row)[0] <= 3
-            and re.search(r"währung|currency|warenwert|goods value|zollwert|customs value", str(row.get("summary") or ""), re.IGNORECASE)
+            and (
+                re.search(r"währung|currency|warenwert|goods value|zollwert|customs value", str(row.get("summary") or ""), re.IGNORECASE)
+                or str(row.get("type") or "").startswith("cross_document_")
+            )
         ]
         seen_topic_lines: set[str] = set()
         for row in sorted(review_topics, key=_finding_rank):
@@ -1378,7 +1408,14 @@ def _human_document_message(
             empfehlung = "Ich sehe einen konkreten TMS-Feldwert aus belastbarer Dokument-Evidenz. Bitte die Freigabe-Kachel bestätigen oder ablehnen; vorher wird im TMS nichts geändert."
             targets = card_targets
         else:
-            if review_topic_lines and not problems:
+            has_cross_doc_cargo_topic = any(
+                isinstance(row, dict) and str(row.get("type") or "") in {"cross_document_weight_mismatch", "cross_document_piece_mismatch"}
+                for row in review_topics
+            )
+            if has_cross_doc_cargo_topic and not problems:
+                empfehlung = "Packstücke/Gewicht zwischen den Dokumenten fachlich klären; Hermes hat keine TMS-Änderung und keinen Kundenkontakt ausgelöst."
+                targets = [row.get("target") or row.get("field") for row in review_topics if isinstance(row, dict) and str(row.get("type") or "").startswith("cross_document_")]
+            elif review_topic_lines and not problems:
                 empfehlung = "Währung/Warenwert fachlich für Zollwert prüfen; Hermes hat keine TMS-Änderung und keinen Kundenkontakt ausgelöst."
                 targets = []
             else:
@@ -1389,6 +1426,8 @@ def _human_document_message(
         target_text = ", ".join(str(x) for x in targets[:3] if x)
         if review_topic_lines and not problems and not target_text:
             naechster_schritt = "Zollwert/Währung bei der Zollprüfung bestätigen; keine automatische TMS-Korrektur nötig."
+        elif review_topic_lines and not problems and any("cross_document" in str(item) for item in targets):
+            naechster_schritt = f"Führenden Dokumentwert für {target_text} festlegen; Review-Kachel fachlich bestätigen/ablehnen, keine automatische TMS-Korrektur."
         else:
             naechster_schritt = f"Zu klären/korrigieren: {target_text}." if target_text else "Führenden Wert festlegen; bei TMS-Korrektur anschließend bewusst freigeben."
     else:
@@ -1494,6 +1533,10 @@ def _queue_document_review_card_results(
             f"TMS aktuell {previous}. Quelle: {doc_label}, Activity {activity_id or '-'}; "
             "keine automatische TMS-Änderung ohne Teams-Freigabe."
         )
+        explicit_write_supported = guardrails.get("write_supported")
+        if explicit_write_supported is None and "write_supported" in intent:
+            explicit_write_supported = intent.get("write_supported")
+        write_supported = target in write_supported_targets and explicit_write_supported is not False
         card = {
             "order_id": normalized_order,
             "action_id": None,
@@ -1504,8 +1547,8 @@ def _queue_document_review_card_results(
             "context_id": context_id,
             "source": "document_activity_monitor",
             "evidence": {"source": doc_label, "previous_value": previous, "document_value": value, "summary": text},
-            "write_supported": target in write_supported_targets,
-            "question": f"{label}: Dokumentwert {value} ins TMS übernehmen?" if target in write_supported_targets else f"{label}: Dokumentwert {value} fachlich bestätigen?",
+            "write_supported": write_supported,
+            "question": f"{label}: Dokumentwert {value} ins TMS übernehmen?" if write_supported else f"{label}: Dokumentwert {value} fachlich bestätigen?",
         }
         existing_duplicate = _existing_pending_review_card(root, normalized_order, target, value)
         if existing_duplicate:
@@ -1533,7 +1576,7 @@ def _queue_document_review_card_results(
                 "guardrails": guardrails,
             },
             previous_value=previous,
-            write_supported=target in write_supported_targets,
+            write_supported=write_supported,
         )
         if queued.get("queued"):
             card["action_id"] = queued.get("action_id")
@@ -1575,6 +1618,102 @@ def _case_root_from_report(report: dict[str, Any], order_id: str) -> Path | None
         if value:
             return Path(str(value))
     return None
+
+
+def _format_cross_doc_value(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        if float(value).is_integer():
+            return str(int(value))
+        return f"{float(value):.2f}".rstrip("0").rstrip(".")
+    return str(value or "").strip()
+
+
+def _intent_dedupe_value(target: str, value: Any) -> str:
+    text = str(value or "").strip()
+    if target in {"cargo_weight_kg", "cargo_pieces"}:
+        number = _number_from_value(text)
+        if number is not None:
+            return _format_number(number)
+    return text.upper()
+
+
+def _build_cross_document_review_intents(
+    *,
+    report: dict[str, Any],
+    event: dict[str, Any],
+    filename: str,
+    cross_document_comparisons: list[dict[str, Any]],
+    existing_intents: list[dict[str, Any]],
+    comparisons: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    order_id = str(report.get("order_id") or "").strip().upper()
+    if not order_id:
+        return []
+    uploaded_norm = str(filename or "").strip().lower()
+    if not uploaded_norm:
+        return []
+    uploaded = _select_uploaded_analysis(report, filename)
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    analysis = uploaded.get("analysis") if isinstance(uploaded.get("analysis"), dict) else {}
+    uploaded_names = {
+        str(value or "").strip().lower()
+        for value in (filename, uploaded.get("filename"), analysis.get("filename"))
+        if str(value or "").strip()
+    }
+    doc_type = _uploaded_analysis_doc_type(metadata.get("document_type"), uploaded)
+    activity_id = _activity_id(event)
+    context_id = f"{order_id}:{activity_id}:cross_document_review" if activity_id else f"{order_id}:cross_document_review"
+    current_tms_by_target = {str(row.get("target") or ""): row.get("tms") for row in comparisons if isinstance(row, dict)}
+    seen = {
+        (str(intent.get("target") or ""), _intent_dedupe_value(str(intent.get("target") or ""), intent.get("value") or intent.get("document_value")))
+        for intent in existing_intents
+        if isinstance(intent, dict)
+    }
+    intents: list[dict[str, Any]] = []
+    for row in cross_document_comparisons:
+        if not isinstance(row, dict) or row.get("status") != "conflict":
+            continue
+        target = str(row.get("target") or "").strip()
+        if target not in {"cargo_weight_kg", "cargo_pieces"}:
+            continue
+        documents = row.get("documents") if isinstance(row.get("documents"), list) else []
+        uploaded_doc = next((doc for doc in documents if isinstance(doc, dict) and str(doc.get("filename") or "").strip().lower() in uploaded_names), None)
+        if not uploaded_doc:
+            continue
+        value = _format_cross_doc_value(uploaded_doc.get("normalized"))
+        dedupe_key = (target, _intent_dedupe_value(target, value))
+        if not value or dedupe_key in seen:
+            continue
+        if not is_trusted_source_for_field(doc_type, target):
+            continue
+        label = "Gewicht" if target == "cargo_weight_kg" else "Packstücke"
+        intents.append({
+            "order_id": order_id,
+            "target": target,
+            "value": value,
+            "current_tms_value": current_tms_by_target.get(target) or "nicht gepflegt",
+            "document_value": value,
+            "label": label,
+            "source": "document_cross_document_comparison",
+            "requires_review": True,
+            "review_status": "agent_review_required",
+            "confidence": "cross_document_comparison",
+            "context_id": context_id,
+            "question": f"{label}: Dokumentwert {value} wegen widersprüchlicher Belege fachlich bestätigen?",
+            "guardrails": {
+                "trusted_source": True,
+                "effective_document_type": doc_type,
+                "valid_field_evidence": True,
+                "write_supported": False,
+                "review_only": True,
+                "cross_document_comparison": True,
+                "side_effects_created": False,
+                "conflicting_documents": row.get("filenames") or [],
+                "summary": row.get("summary"),
+            },
+        })
+        seen.add(dedupe_key)
+    return intents
 
 
 def _build_tms_update_review_intents_from_comparisons(
@@ -1782,8 +1921,18 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         reconciliation = {**reconciliation, "findings": findings}
     context = report.get("tms_context") if isinstance(report.get("tms_context"), dict) else {}
     comparisons = _build_document_field_comparison(report, str(filename))
+    raw_cross_document = reconciliation.get("cross_document_comparisons")
+    cross_document_comparisons = raw_cross_document if isinstance(raw_cross_document, list) else []
     evidence_lines = _build_document_evidence_lines(report, str(filename))
     document_review_intents = _build_tms_update_review_intents_from_comparisons(report=report, event=event, comparisons=comparisons, findings=findings)
+    document_review_intents.extend(_build_cross_document_review_intents(
+        report=report,
+        event=event,
+        filename=str(filename),
+        cross_document_comparisons=cross_document_comparisons,
+        existing_intents=document_review_intents,
+        comparisons=comparisons,
+    ))
     current_upload_review = _current_upload_review_floor(
         case_risk=case_risk,
         case_needs_review=case_needs_review,
@@ -1808,6 +1957,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         case_risk=case_risk,
         case_needs_review=case_needs_review,
         current_upload_review=current_upload_review,
+        cross_document_comparisons=cross_document_comparisons,
     )
     agent_review = _run_document_agent_review(agent_evidence_packet)
     rejected_agent_review: dict[str, Any] | None = None
@@ -1877,6 +2027,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
         "document_activity_document_type": str(doc_type),
         "document_registry_summary": registry,
         "document_field_comparison": comparisons,
+        "document_cross_document_comparison": cross_document_comparisons,
         "document_message_sections": document_message_sections,
         "document_agent_review": agent_review or {"mode": "guardrailed_fallback", "reason": "external_agent_review_not_configured_or_invalid", "rejected_agent_review": rejected_agent_review},
         "document_agent_evidence_packet": agent_evidence_packet,
@@ -1892,6 +2043,7 @@ def _processor_result_from_report(report: dict[str, Any], event: dict[str, Any])
             "history_sync_error": lifecycle.get("history_sync_error"),
             "last_email_at": lifecycle.get("last_email_at"),
             "field_comparison_count": len(comparisons),
+            "cross_document_comparison_count": len(cross_document_comparisons),
             "document_evidence_count": len(evidence_lines),
             "review_intent_count": review_count,
             "case_reconciliation_risk": case_risk,

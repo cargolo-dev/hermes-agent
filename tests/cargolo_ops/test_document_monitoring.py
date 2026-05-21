@@ -2199,3 +2199,128 @@ def test_document_activity_monitor_accepts_document_create_events(tmp_path):
     assert result["processed_count"] == 1
     assert result["processed"][0]["activity_id"] == 15
     mock_monitor.assert_called_once()
+
+
+
+def test_cross_document_conflict_creates_review_only_cards_without_tms_write(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_CMD", raising=False)
+    current_filename = "packing-list.pdf"
+    invoice_path = tmp_path / "invoice.analysis.json"
+    packing_path = tmp_path / "packing.analysis.json"
+    registry_path = tmp_path / "registry.json"
+    snapshot_path = tmp_path / "snapshot.json"
+    invoice_path.write_text(
+        json.dumps({"filename": "invoice.pdf", "doc_type": "commercial_invoice", "extracted_fields": {"pieces": "52", "gross_weight": "852"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    packing_path.write_text(
+        json.dumps({"filename": current_filename, "doc_type": "packing_list", "extracted_fields": {"pieces": "54", "gross_weight": "896"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    registry = {
+        "expected_types": [],
+        "received_types": ["commercial_invoice", "packing_list"],
+        "received_documents": [
+            {"filename": "invoice.pdf", "analysis_status": "analyzed"},
+            {"filename": current_filename, "analysis_status": "analyzed"},
+        ],
+        "analyzed_documents": [
+            {"filename": "invoice.pdf", "analysis_path": str(invoice_path), "analysis_doc_type": "commercial_invoice"},
+            {"filename": current_filename, "analysis_path": str(packing_path), "analysis_doc_type": "packing_list"},
+        ],
+    }
+    registry_path.write_text(json.dumps(registry, ensure_ascii=False), encoding="utf-8")
+    tms_snapshot = {"detail": {"network": "rail", "totals": {"total_pieces": "54", "total_weight_kg": "896"}, "freight_details": {}, "transport_legs": []}}
+    snapshot_path.write_text(json.dumps(tms_snapshot, ensure_ascii=False), encoding="utf-8")
+    reconciliation = reconcile_documents(order_id="AN-55555", tms_snapshot=tms_snapshot, registry=registry)
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-55555",
+            "case_root": str(tmp_path / "orders" / "AN-55555"),
+            "tms_context": {"status": "in_transit", "network": "rail"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": reconciliation,
+        },
+        {"id": 2555, "changed_at": "2026-05-21T12:00:00Z", "metadata": {"file_name": current_filename, "document_type": "packing_list"}},
+    )
+
+    assert result["analysis_priority"] == "medium"
+    assert result["agent_review_required"] is True
+    assert result["evidence_summary"]["cross_document_comparison_count"] == 2
+    assert "Dokumente widersprechen sich" in result["message"]
+    assert {row["type"] for row in result["document_cross_document_comparison"]} == {"cross_document_weight_mismatch", "cross_document_piece_mismatch"}
+    assert [(intent["target"], intent["value"], intent["guardrails"]["write_supported"], intent["guardrails"]["review_only"], intent["source"]) for intent in result["document_review_intents"]] == [
+        ("cargo_weight_kg", "896", False, True, "document_cross_document_comparison"),
+        ("cargo_pieces", "54", False, True, "document_cross_document_comparison"),
+    ]
+
+    cards = _queue_document_review_cards(
+        storage_root=tmp_path,
+        order_id="AN-55555",
+        intents=result["document_review_intents"],
+        event={"id": 2555, "changed_at": "2026-05-21T12:00:00Z", "metadata": {"file_name": current_filename, "document_type": "packing_list"}},
+    )
+    assert [(card["target"], card["value"], card["write_supported"]) for card in cards] == [
+        ("cargo_weight_kg", "896", False),
+        ("cargo_pieces", "54", False),
+    ]
+    queue_path = tmp_path / "orders" / "AN-55555" / "teams" / "pending_tms_actions.jsonl"
+    queued = [json.loads(line) for line in queue_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert all(row["status"] == "pending_review" and row["write_supported"] is False for row in queued)
+    assert not (tmp_path / "orders" / "AN-55555" / "teams" / "applied_tms_actions.jsonl").exists()
+
+
+def test_cross_document_conflict_between_non_current_documents_stays_case_context(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_CARGOLO_DOCUMENT_AGENT_REVIEW_CMD", raising=False)
+    reconciliation = {
+        "risk": "medium",
+        "needs_human_review": True,
+        "findings": [
+            {
+                "type": "cross_document_weight_mismatch",
+                "severity": "medium",
+                "scope": "cross_document_comparison",
+                "filenames": ["invoice.pdf", "packing-list.pdf"],
+                "summary": "Dokumente widersprechen sich bei Gewicht: invoice.pdf: 852 kg; packing-list.pdf: 896 kg.",
+                "documents": [
+                    {"filename": "invoice.pdf", "doc_type": "commercial_invoice", "normalized": 852},
+                    {"filename": "packing-list.pdf", "doc_type": "packing_list", "normalized": 896},
+                ],
+                "target": "cargo_weight_kg",
+                "review_only": True,
+                "write_supported": False,
+            }
+        ],
+        "cross_document_comparisons": [
+            {
+                "type": "cross_document_weight_mismatch",
+                "field": "gross_weight",
+                "target": "cargo_weight_kg",
+                "label": "Gewicht",
+                "status": "conflict",
+                "filenames": ["invoice.pdf", "packing-list.pdf"],
+                "documents": [
+                    {"filename": "invoice.pdf", "doc_type": "commercial_invoice", "normalized": 852},
+                    {"filename": "packing-list.pdf", "doc_type": "packing_list", "normalized": 896},
+                ],
+            }
+        ],
+    }
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-55556",
+            "tms_context": {"status": "in_transit", "network": "rail"},
+            "lifecycle": {},
+            "registry_summary": {},
+            "reconciliation": reconciliation,
+        },
+        {"id": 2556, "changed_at": "2026-05-21T12:00:00Z", "metadata": {"file_name": "delivery-note.pdf", "document_type": "delivery_note"}},
+    )
+
+    assert result["analysis_priority"] == "low"
+    assert result["agent_review_required"] is False
+    assert result["document_review_intents"] == []
+    assert result["evidence_summary"]["case_reconciliation_risk"] == "medium"
+    assert result["evidence_summary"]["current_upload_review"]["case_risk_not_used_for_document_priority"] is True

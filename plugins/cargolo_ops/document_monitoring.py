@@ -36,6 +36,12 @@ def _render_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- {row.get('severity', 'low')}: {row.get('type')} — {row.get('filename') or '-'} — {row.get('summary') or ''}")
     else:
         lines.append("- Keine present-document/TMS-Mirroring-Auffälligkeiten erkannt.")
+    cross_document = report["reconciliation"].get("cross_document_comparisons") or []
+    if cross_document:
+        lines.extend(["", "## Dokument-zu-Dokument-Abgleich"])
+        for row in cross_document[:5]:
+            if isinstance(row, dict):
+                lines.append(f"- {row.get('severity', 'medium')}: {row.get('label') or row.get('field')} — {row.get('summary') or ''}")
     raw_review_intents = report.get("document_review_intents")
     review_intents: list[Any] = raw_review_intents if isinstance(raw_review_intents, list) else []
     lines.extend([

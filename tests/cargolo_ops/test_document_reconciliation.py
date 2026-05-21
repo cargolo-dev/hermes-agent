@@ -186,3 +186,66 @@ def test_reconciliation_keeps_net_weight_zero_flag_on_non_packlist_spreadsheet(t
 
     assert report["risk"] == "medium"
     assert any(row.get("type") == "document_flag" and "nettogewicht" in row.get("summary", "").lower() for row in report["findings"])
+
+
+
+def _analysis_file(tmp_path, filename: str, doc_type: str, fields: dict[str, str]):
+    path = tmp_path / f"{filename}.analysis.json"
+    path.write_text(json.dumps({"filename": filename, "doc_type": doc_type, "extracted_fields": fields}, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_reconciliation_detects_cross_document_weight_and_piece_conflicts(tmp_path):
+    invoice_path = _analysis_file(tmp_path, "invoice.pdf", "commercial_invoice", {"gross_weight": "852", "pieces": "52"})
+    packing_path = _analysis_file(tmp_path, "packing-list.pdf", "packing_list", {"gross_weight": "896", "pieces": "54"})
+
+    report = reconcile_documents(
+        order_id="AN-XDOC",
+        tms_snapshot={"detail": {"network": "rail", "totals": {"total_weight_kg": "852", "total_pieces": "52"}}},
+        registry={
+            "expected_types": [],
+            "received_types": ["commercial_invoice", "packing_list"],
+            "received_documents": [
+                {"filename": "invoice.pdf", "analysis_status": "analyzed"},
+                {"filename": "packing-list.pdf", "analysis_status": "analyzed"},
+            ],
+            "analyzed_documents": [
+                {"filename": "invoice.pdf", "analysis_doc_type": "commercial_invoice", "analysis_path": str(invoice_path)},
+                {"filename": "packing-list.pdf", "analysis_doc_type": "packing_list", "analysis_path": str(packing_path)},
+            ],
+        },
+    )
+
+    assert report["risk"] == "medium"
+    assert report["needs_human_review"] is True
+    finding_types = {row.get("type") for row in report["findings"]}
+    assert "cross_document_weight_mismatch" in finding_types
+    assert "cross_document_piece_mismatch" in finding_types
+    cross = {row["type"]: row for row in report["cross_document_comparisons"]}
+    assert cross["cross_document_weight_mismatch"]["write_supported"] is False
+    assert cross["cross_document_weight_mismatch"]["review_only"] is True
+    assert set(cross["cross_document_weight_mismatch"]["filenames"]) == {"invoice.pdf", "packing-list.pdf"}
+    assert "852 kg" in cross["cross_document_weight_mismatch"]["summary"]
+    assert "896 kg" in cross["cross_document_weight_mismatch"]["summary"]
+
+
+def test_reconciliation_suppresses_cross_document_numeric_format_variants(tmp_path):
+    invoice_path = _analysis_file(tmp_path, "invoice.pdf", "commercial_invoice", {"gross_weight": "2.464 kg", "pieces": "112.0"})
+    packing_path = _analysis_file(tmp_path, "packing-list.pdf", "packing_list", {"gross_weight": "2464", "pieces": "112"})
+
+    report = reconcile_documents(
+        order_id="AN-XDOC",
+        tms_snapshot={"detail": {"network": "rail"}},
+        registry={
+            "expected_types": [],
+            "received_types": ["commercial_invoice", "packing_list"],
+            "received_documents": [],
+            "analyzed_documents": [
+                {"filename": "invoice.pdf", "analysis_doc_type": "commercial_invoice", "analysis_path": str(invoice_path)},
+                {"filename": "packing-list.pdf", "analysis_doc_type": "packing_list", "analysis_path": str(packing_path)},
+            ],
+        },
+    )
+
+    assert not any(str(row.get("type", "")).startswith("cross_document_") for row in report["findings"])
+    assert report["cross_document_comparisons"] == []

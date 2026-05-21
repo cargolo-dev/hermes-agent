@@ -37,11 +37,30 @@ def _number(value: Any) -> float | None:
     if value in (None, "", [], {}):
         return None
     text = str(value).strip().replace("\u202f", " ").replace("'", "")
-    match = re.search(r"\d+(?:[.,]\d+)?", text.replace(" ", ""))
+    match = re.search(r"[-+]?\d[\d .,_]*", text)
     if not match:
         return None
+    token = match.group(0).strip().replace(" ", "").replace("_", "")
+    if not token:
+        return None
+    comma = token.rfind(",")
+    dot = token.rfind(".")
+    if comma >= 0 and dot >= 0:
+        decimal_sep = "," if comma > dot else "."
+        thousand_sep = "." if decimal_sep == "," else ","
+        token = token.replace(thousand_sep, "").replace(decimal_sep, ".")
+    elif comma >= 0:
+        parts = token.split(",")
+        if len(parts[-1]) == 3 and all(part.isdigit() for part in parts):
+            token = "".join(parts)
+        else:
+            token = token.replace(",", ".")
+    elif dot >= 0:
+        parts = token.split(".")
+        if len(parts[-1]) == 3 and all(part.isdigit() for part in parts):
+            token = "".join(parts)
     try:
-        return float(match.group(0).replace(",", "."))
+        return float(token)
     except ValueError:
         return None
 
@@ -164,6 +183,120 @@ def _humanize_document_note(value: Any) -> str:
     }
     return replacements.get(text.lower(), text)
 
+
+
+
+def _cross_doc_value(row: dict[str, Any], field: str) -> Any:
+    fields = _field_dict(row)
+    if field == "gross_weight":
+        return _first_present(fields, "total_weight_kg", "weight_kg", "gross_weight_kg", "gross_weight", "weight")
+    if field == "pieces":
+        return _first_present(fields, "total_packages", "packages", "pieces", "total_pieces", "cartons")
+    if field == "volume":
+        return _first_present(fields, "total_volume_m3", "volume_m3", "volume", "cbm")
+    if field == "incoterm":
+        return _first_present(fields, "incoterm", "incoterms", "incoterm_named_place")
+    return None
+
+
+def _normalize_incoterm(value: Any) -> str:
+    text = str(value or "").upper()
+    match = re.search(r"\b(EXW|FCA|FAS|FOB|CFR|CIF|CPT|CIP|DAP|DPU|DAT|DDP)\b", text)
+    return match.group(1) if match else ""
+
+
+def _cross_doc_doc_type(row: dict[str, Any]) -> str:
+    analysis = _load_analysis(row.get("analysis_path"))
+    return str(row.get("analysis_doc_type") or row.get("doc_type") or analysis.get("doc_type") or "unknown").strip().lower()
+
+
+def _cross_doc_entry(row: dict[str, Any], field: str) -> dict[str, Any] | None:
+    raw = _cross_doc_value(row, field)
+    filename = str(row.get("filename") or "").strip()
+    if not filename or raw in (None, "", [], {}):
+        return None
+    if field in {"gross_weight", "pieces", "volume"}:
+        normalized = _number(raw)
+        if normalized is None:
+            return None
+        if field in {"pieces", "gross_weight", "volume"} and normalized <= 0:
+            return None
+        return {"filename": filename, "doc_type": _cross_doc_doc_type(row), "raw": str(raw), "normalized": normalized}
+    if field == "incoterm":
+        normalized = _normalize_incoterm(raw)
+        if not normalized:
+            return None
+        return {"filename": filename, "doc_type": _cross_doc_doc_type(row), "raw": str(raw), "normalized": normalized}
+    return None
+
+
+def _cross_doc_groups_conflict(field: str, entries: list[dict[str, Any]]) -> bool:
+    if len(entries) < 2:
+        return False
+    values = [entry.get("normalized") for entry in entries]
+    if field == "gross_weight":
+        low = min(float(value) for value in values)
+        high = max(float(value) for value in values)
+        return abs(high - low) > max(2.0, high * 0.02)
+    if field == "volume":
+        low = min(float(value) for value in values)
+        high = max(float(value) for value in values)
+        return abs(high - low) > max(0.1, high * 0.05)
+    return len({str(value) for value in values}) > 1
+
+
+def _append_cross_document_reconciliation(findings: list[dict[str, Any]], *, registry: dict[str, Any]) -> list[dict[str, Any]]:
+    analyzed = [row for row in registry.get("analyzed_documents", []) or [] if isinstance(row, dict)]
+    comparisons: list[dict[str, Any]] = []
+    rules = {
+        "gross_weight": {"type": "cross_document_weight_mismatch", "label": "Gewicht", "unit": "kg", "target": "cargo_weight_kg"},
+        "pieces": {"type": "cross_document_piece_mismatch", "label": "Packstücke", "unit": "", "target": "cargo_pieces"},
+        "incoterm": {"type": "cross_document_incoterm_mismatch", "label": "Incoterm", "unit": "", "target": "incoterms"},
+    }
+    for field, rule in rules.items():
+        entries = [entry for row in analyzed if (entry := _cross_doc_entry(row, field))]
+        # Same filename/doc can appear twice through mail and TMS mirror; keep one value per filename.
+        deduped: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            deduped.setdefault(str(entry.get("filename") or ""), entry)
+        entries = list(deduped.values())
+        if not _cross_doc_groups_conflict(field, entries):
+            continue
+        values_text = "; ".join(
+            f"{entry['filename']} ({entry.get('doc_type') or 'Dokument'}): {_fmt_number(float(entry['normalized'])) if isinstance(entry.get('normalized'), (int, float)) else entry.get('normalized')}{(' ' + rule['unit']) if rule.get('unit') and isinstance(entry.get('normalized'), (int, float)) else ''}"
+            for entry in entries[:5]
+        )
+        filenames = [str(entry.get("filename") or "") for entry in entries if entry.get("filename")]
+        comparison = {
+            "field": field,
+            "target": rule["target"],
+            "type": rule["type"],
+            "label": rule["label"],
+            "severity": "medium",
+            "status": "conflict",
+            "scope": "cross_document_comparison",
+            "review_only": field in {"gross_weight", "pieces"},
+            "write_supported": False,
+            "filenames": filenames,
+            "documents": entries,
+            "summary": f"Dokumente widersprechen sich bei {rule['label']}: {values_text}.",
+        }
+        comparisons.append(comparison)
+        findings.append({
+            "type": rule["type"],
+            "severity": "medium",
+            "scope": "cross_document_comparison",
+            "category": "case_context",
+            "filename": filenames[0] if len(filenames) == 1 else None,
+            "filenames": filenames,
+            "field": field,
+            "target": rule["target"],
+            "review_only": field in {"gross_weight", "pieces"},
+            "write_supported": False,
+            "summary": comparison["summary"],
+            "documents": entries,
+        })
+    return comparisons
 
 def _append_content_reconciliation(findings: list[dict[str, Any]], *, tms_snapshot: dict[str, Any], registry: dict[str, Any]) -> None:
     totals = _tms_totals(tms_snapshot)
@@ -300,6 +433,7 @@ def reconcile_documents(*, order_id: str, tms_snapshot: dict[str, Any], registry
             })
 
     _append_content_reconciliation(findings, tms_snapshot=tms_snapshot, registry=registry)
+    cross_document_comparisons = _append_cross_document_reconciliation(findings, registry=registry)
 
     max_severity = "low"
     if _has_blocker_finding(findings) or any(row.get("severity") in {"high", "critical"} for row in findings):
@@ -316,6 +450,7 @@ def reconcile_documents(*, order_id: str, tms_snapshot: dict[str, Any], registry
         "missing_types": missing,
         "missing_policy": MISSING_ONLY_NOTE,
         "findings": findings,
+        "cross_document_comparisons": cross_document_comparisons,
         "risk": max_severity,
         "needs_human_review": bool(findings),
     }
