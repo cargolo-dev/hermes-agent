@@ -2324,3 +2324,54 @@ def test_cross_document_conflict_between_non_current_documents_stays_case_contex
     assert result["document_review_intents"] == []
     assert result["evidence_summary"]["case_reconciliation_risk"] == "medium"
     assert result["evidence_summary"]["current_upload_review"]["case_risk_not_used_for_document_priority"] is True
+
+
+
+def test_archived_email_subject_version_selects_matching_offer_not_oldest(tmp_path):
+    registry_path = tmp_path / "registry.json"
+    snapshot_path = tmp_path / "snapshot.json"
+    analysis_paths = []
+    docs = []
+    for version, amount in (("V1", "585,83"), ("V2", "1.088,20")):
+        analysis_path = tmp_path / f"offer_{version}.json"
+        filename = f"Angebot-AN-13363-{version}.pdf"
+        analysis_path.write_text(
+            json.dumps(
+                {
+                    "filename": filename,
+                    "doc_type": "offer",
+                    "confidence": "high",
+                    "extracted_fields": {
+                        "document_type": "Angebot",
+                        "shipment_number": "AN-13363",
+                        "amount": amount,
+                        "currency": "EUR",
+                        "pieces": "20",
+                        "gross_weight": "160 kg",
+                        "incoterm_named_place": "EXW",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        analysis_paths.append(analysis_path)
+        docs.append({"filename": filename, "analysis_path": str(analysis_path), "analysis_doc_type": "offer", "received_at": f"2026-05-19T09:5{1 if version == 'V1' else 9}:00Z"})
+    registry_path.write_text(json.dumps({"analyzed_documents": docs, "received_documents": docs}, ensure_ascii=False), encoding="utf-8")
+    snapshot_path.write_text(json.dumps({"detail": {"totals": {"total_pieces": 20, "total_weight_kg": 160}, "freight_details": {}, "transport_legs": []}}, ensure_ascii=False), encoding="utf-8")
+
+    result = _processor_result_from_report(
+        {
+            "order_id": "AN-13363",
+            "case_root": str(tmp_path / "orders" / "AN-13363"),
+            "tms_context": {"status": "addresses_pending", "network": "air", "origin_city": "Dongguan", "origin_country": "CN", "destination_city": "Egling", "destination_country": "DE"},
+            "lifecycle": {"document_registry_path": str(registry_path), "tms_snapshot_path": str(snapshot_path)},
+            "registry_summary": {},
+            "reconciliation": {"risk": "low", "needs_human_review": False, "findings": []},
+        },
+        {"id": 2107, "changed_at": "2026-05-21T11:50:00Z", "metadata": {"file_name": "AW_ Ihr Luftfracht Transportangebot AN-13363-V2 ist bereit.msg", "document_type": "email", "email_subject": "AW: Ihr Luftfracht Transportangebot AN-13363-V2 ist bereit"}},
+    )
+
+    assert result.get("document_activity_filename") in (None, "Angebot-AN-13363-V2.pdf")
+    assert "1.088,20" in result["message"]
+    assert "585,83" not in result["message"]

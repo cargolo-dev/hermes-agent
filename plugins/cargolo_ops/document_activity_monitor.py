@@ -237,6 +237,26 @@ def _enrich_analyzed_row(row: dict[str, Any], received_lookup: dict[str, dict[st
     return _enrich_registry_document_row(row, received_lookup)
 
 
+def _subject_filename_match_score(filename: Any, subject: str) -> int:
+    if not subject:
+        return 0
+    filename_text = str(filename or "").strip()
+    if not filename_text:
+        return 0
+    normalized_subject = _norm(subject)
+    normalized_filename = _norm(filename_text)
+    normalized_stem = _norm(Path(filename_text).stem)
+    score = 0
+    if normalized_filename and normalized_filename in normalized_subject:
+        score = max(score, 100)
+    if normalized_stem and normalized_stem in normalized_subject:
+        score = max(score, 90)
+    version_match = re.search(r"AN[-_ ]?\d{4,6}[-_ ]?V\d+", filename_text, re.IGNORECASE)
+    if version_match and _norm(version_match.group(0)) in normalized_subject:
+        score = max(score, 80)
+    return score
+
+
 def _latest_analyzed_mail_attachment(registry: dict[str, Any]) -> dict[str, Any]:
     received_lookup = _received_document_lookup(registry)
     analyzed = [_enrich_analyzed_row(row, received_lookup) for row in registry.get("analyzed_documents") or [] if isinstance(row, dict)]
@@ -305,6 +325,16 @@ def _infer_uploaded_filename(report: dict[str, Any], event: dict[str, Any]) -> s
     subject = _norm(metadata.get("email_subject"))
     received_lookup = _received_document_lookup(registry)
     analyzed = [_enrich_analyzed_row(row, received_lookup) for row in registry.get("analyzed_documents") or [] if isinstance(row, dict)]
+    scored_subject_matches = [
+        (_subject_filename_match_score(row.get("filename"), subject), str(row.get("filename") or ""))
+        for row in analyzed
+        if str(row.get("filename") or "").strip()
+    ]
+    scored_subject_matches = [item for item in scored_subject_matches if item[0] > 0]
+    if scored_subject_matches:
+        scored_subject_matches.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+        return scored_subject_matches[0][1]
+
     for row in analyzed:
         filename = str(row.get("filename") or "")
         if invoice_number and invoice_number in _norm(filename):
