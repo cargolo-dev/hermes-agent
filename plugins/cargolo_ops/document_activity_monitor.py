@@ -878,7 +878,18 @@ def _billing_source_allows_review_intent(order_id: str, target: str, analysis: d
         if order_norm not in _norm(evidence_blob):
             return False
     if target == "container_number":
-        return _field_source_allows_container_candidate(analysis, value)
+        if _field_source_allows_container_candidate(analysis, value):
+            return True
+        field_sources = analysis.get("field_sources") if isinstance(analysis.get("field_sources"), dict) else {}
+        source_meta = field_sources.get("container_number")
+        if not isinstance(source_meta, dict):
+            return False
+        raw_context = source_meta.get("raw_context")
+        return bool(
+            _is_valid_container_candidate(value)
+            and _norm(fields.get("container_number")) == _norm(value)
+            and (not raw_context or _norm(value) in _norm(raw_context))
+        )
     return _number_from_value(value) is not None
 
 
@@ -2009,9 +2020,13 @@ def _build_tms_update_review_intents_from_comparisons(
         field_source_checked = target == "mbl_number"
         if target == "mbl_number" and not _field_source_allows_mbl_candidate(analysis, value):
             continue
-        if target == "container_number" and effective_doc_type in {"billing", "telex_release"}:
+        if target == "container_number" and effective_doc_type == "telex_release":
             field_source_checked = True
             if not _field_source_allows_container_candidate(analysis, value):
+                continue
+        if target == "container_number" and effective_doc_type == "billing":
+            field_source_checked = True
+            if not _billing_source_allows_review_intent(order_id, target, analysis, value):
                 continue
         if not _is_valid_document_field_evidence(target, value):
             continue

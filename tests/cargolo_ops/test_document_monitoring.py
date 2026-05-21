@@ -1091,7 +1091,7 @@ def test_processor_result_queues_billing_container_and_review_only_pieces_cards(
         field_sources={
             "container_number": {
                 "value": "PSXU5916391",
-                "label": "Container",
+                "label": "Shipment Reference",
                 "source": "document text",
                 "confidence": "high",
                 "raw_context": "PSXU5916391",
